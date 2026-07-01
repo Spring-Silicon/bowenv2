@@ -1,4 +1,4 @@
-//! Portable graph and candidate reference types.
+//! Portable graph and action reference types.
 
 use crate::{ActionSetHash, CandidateHash, EngineId, EngineVersion, GraphHash};
 use std::fmt;
@@ -61,29 +61,65 @@ impl PortableCandidateRef {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum PortableSearchActionRef {
+    Candidate(PortableCandidateRef),
+    Stop { context: ReplayGraphContext },
+}
+
+impl PortableSearchActionRef {
+    #[must_use]
+    pub const fn candidate(candidate: PortableCandidateRef) -> Self {
+        Self::Candidate(candidate)
+    }
+
+    #[must_use]
+    pub const fn stop(context: ReplayGraphContext) -> Self {
+        Self::Stop { context }
+    }
+
+    #[must_use]
+    pub const fn context(self) -> ReplayGraphContext {
+        match self {
+            Self::Candidate(candidate) => candidate.context,
+            Self::Stop { context } => context,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct SearchStepRef {
     pub before: ReplayGraphContext,
-    pub candidate: PortableCandidateRef,
+    pub action: PortableSearchActionRef,
     pub after: ReplayGraphContext,
 }
 
 impl SearchStepRef {
     pub fn new(
         before: ReplayGraphContext,
-        candidate: PortableCandidateRef,
+        action: PortableSearchActionRef,
         after: ReplayGraphContext,
     ) -> Result<Self, SearchStepRefError> {
-        if candidate.context != before {
-            return Err(SearchStepRefError::CandidateContextMismatch {
+        let action_context = action.context();
+
+        if action_context != before {
+            return Err(SearchStepRefError::ActionContextMismatch {
                 before: Box::new(before),
-                candidate_context: Box::new(candidate.context),
+                action_context: Box::new(action_context),
+            });
+        }
+
+        if matches!(action, PortableSearchActionRef::Stop { .. }) && after != before {
+            return Err(SearchStepRefError::StopAfterMismatch {
+                before: Box::new(before),
+                after: Box::new(after),
             });
         }
 
         Ok(Self {
             before,
-            candidate,
+            action,
             after,
         })
     }
@@ -91,17 +127,24 @@ impl SearchStepRef {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SearchStepRefError {
-    CandidateContextMismatch {
+    ActionContextMismatch {
         before: Box<ReplayGraphContext>,
-        candidate_context: Box<ReplayGraphContext>,
+        action_context: Box<ReplayGraphContext>,
+    },
+    StopAfterMismatch {
+        before: Box<ReplayGraphContext>,
+        after: Box<ReplayGraphContext>,
     },
 }
 
 impl fmt::Display for SearchStepRefError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CandidateContextMismatch { .. } => {
-                write!(f, "candidate context does not match step before context")
+            Self::ActionContextMismatch { .. } => {
+                write!(f, "action context does not match step before context")
+            }
+            Self::StopAfterMismatch { .. } => {
+                write!(f, "stop action after context does not match before context")
             }
         }
     }
@@ -118,12 +161,12 @@ impl<'de> serde::Deserialize<'de> for SearchStepRef {
         #[derive(serde::Deserialize)]
         struct Unchecked {
             before: ReplayGraphContext,
-            candidate: PortableCandidateRef,
+            action: PortableSearchActionRef,
             after: ReplayGraphContext,
         }
 
         let unchecked = Unchecked::deserialize(deserializer)?;
-        Self::new(unchecked.before, unchecked.candidate, unchecked.after)
+        Self::new(unchecked.before, unchecked.action, unchecked.after)
             .map_err(serde::de::Error::custom)
     }
 }

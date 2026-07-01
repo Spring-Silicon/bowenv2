@@ -67,9 +67,9 @@ surface area.
 - `GraphEngine::measure` owns terminal measurement. Async scheduling belongs to
   the orchestrator or `EngineServer`.
 - Replay rows store portable identities such as `GraphHash` and
-  `CandidateHash`, not process-local handles.
-- First prove behavior with `FakeGraphEngine`, then `WhittleTestEngine`, then
-  future compiler adapters.
+  `PortableSearchActionRef`, not process-local handles.
+- Whittle is the first concrete engine adapter; `gz-engine-fake` is deferred
+  until search/orchestration tests need it.
 
 ---
 
@@ -218,9 +218,11 @@ Proceed without asking when:
 
 ```text
 specs/
-  ASYNC_PROCESS.md
   CODEBASE_OUTLINE.md
-  COMPILER_GRAPH_ENGINE_API.md
+  GZ_EVAL.md
+  GZ_ENGINE.md
+  GZ_ENGINE_WHITTLE.md
+  GZ_SEARCH.md
 ```
 
 Planned layout:
@@ -261,11 +263,17 @@ new rule. Write one concrete rule per line.
   separate runtime oracle unless the design is explicitly reopened.
 - Do not implement a learner before the async engine/search/measure/replay
   pipeline works.
-- Do not start with a compiler backend; validate the architecture with fake and
-  Whittle-backed engines first.
+- Do not start with a compiler backend; validate the architecture with the
+  Whittle-backed engine first.
+- Skip `gz-engine-fake` for now unless search/orchestration tests need a
+  smaller deterministic adapter.
 - Engineer GraphZero for maximum measured performance subject to correctness;
   avoid convenience designs that add avoidable overhead to hot paths.
 - Prefer simple, clean, concise syntax; avoid ceremony unless it improves
   clarity or correctness.
 - Avoid redundant tests and over-verification; verify the behavior and risk at
   the narrowest useful scope.
+- Architect `gz-search` around many parallel async-driven Gumbel-MCTS selfplay
+  workers; greedy search is only the first implementation slice.
+- Model STOP as a search-level action appended by `gz-search`, never as a
+  `GraphEngine` candidate.

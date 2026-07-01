@@ -30,6 +30,7 @@ pub use metadata::{
 };
 pub use options::{CandidateOptions, MeasureOptions, MeasureOptionsError};
 pub use refs::{
-    PortableCandidateRef, PortableGraphId, ReplayGraphContext, SearchStepRef, SearchStepRefError,
+    PortableCandidateRef, PortableGraphId, PortableSearchActionRef, ReplayGraphContext,
+    SearchStepRef, SearchStepRefError,
 };
 pub use traits::{BatchGraphEngine, EngineReplayResolver, GraphEngine};

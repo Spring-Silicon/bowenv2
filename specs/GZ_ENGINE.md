@@ -27,6 +27,7 @@ It owns:
 GraphEngine and BatchGraphEngine traits
 engine-neutral options and result structs
 portable graph/candidate/config/version identifiers
+portable search action references
 candidate metadata needed by policy/replay/logging
 measurement summaries produced by engines
 engine-neutral error categories
@@ -296,9 +297,14 @@ pub struct PortableCandidateRef {
     pub candidate_hash: CandidateHash,
 }
 
+pub enum PortableSearchActionRef {
+    Candidate(PortableCandidateRef),
+    Stop { context: ReplayGraphContext },
+}
+
 pub struct SearchStepRef {
     pub before: ReplayGraphContext,
-    pub candidate: PortableCandidateRef,
+    pub action: PortableSearchActionRef,
     pub after: ReplayGraphContext,
 }
 ```
@@ -310,14 +316,19 @@ PortableGraphId contains no engine-local Graph handle.
 PortableGraphId is pure graph identity: graph hash plus engine family/version.
 ReplayGraphContext adds the action-set semantics needed to interpret candidates.
 PortableCandidateRef is only meaningful with its graph/action context.
+PortableSearchActionRef::Candidate wraps an engine-owned candidate reference.
+PortableSearchActionRef::Stop is search-owned control flow at a graph context.
 Replay rows store portable refs and contexts, not E::Graph or E::Candidate.
 Cache keys that depend on graph semantics must include engine/version/config
 fields as needed.
 CandidateHash by itself is not a durable action reference.
+STOP has no CandidateHash and must not be passed to GraphEngine::apply().
 SearchStepRef is the portable transition shape for episode traces.
-SearchStepRef.candidate.context must equal SearchStepRef.before.
-SearchStepRef.after must identify the graph produced by applying candidate to
-before, or the rejected/no-op result recorded by the owning episode trace.
+SearchStepRef.action context must equal SearchStepRef.before.
+For Candidate actions, SearchStepRef.after identifies the graph produced by
+applying the candidate, or the rejected/no-op result recorded by the owning
+episode trace.
+For Stop actions, SearchStepRef.after must equal SearchStepRef.before.
 ```
 
 Portable references are identifiers, not resolvers. They do not guarantee that
@@ -665,6 +676,7 @@ apply result: PortableCandidateRef
 measure result: PortableGraphId + MeasureConfigHash
 feature cache: PortableGraphId + feature extractor config outside gz-engine
 replay row graph identity: ReplayGraphContext
+search action identity: PortableSearchActionRef
 ```
 
 If a cache key needs concrete engine state, the key does not belong in
@@ -886,13 +898,15 @@ Implement:
 PortableGraphId
 ReplayGraphContext
 PortableCandidateRef
+PortableSearchActionRef
 SearchStepRef
 ```
 
 Rules:
 
 ```text
-SearchStepRef constructor validates candidate.context == before
+SearchStepRef constructor validates action context == before
+SearchStepRef constructor validates Stop after == before
 SearchStepRef does not try to prove apply correctness
 all refs are Copy when their fields allow it
 all refs are stable map keys

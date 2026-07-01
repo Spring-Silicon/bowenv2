@@ -5,7 +5,7 @@ Status: draft
 Purpose: define the initial Rust workspace for an async selfplay/search
 pipeline built around a modular `GraphEngine`. The first implementation does
 not need an actual compiler backend. It should prove the engine/search/eval/
-measure/replay architecture with fake and Whittle-backed test engines first.
+measure/replay architecture with a Whittle-backed test engine first.
 
 ## Decisions
 
@@ -35,8 +35,9 @@ Compiler backend: future work
 4. Feature extraction is separate from the engine.
 5. Measurement is part of GraphEngine.
 6. Rows enter replay only after measurement succeeds or fails explicitly.
-7. Replay stores portable graph/candidate contexts, not process-local handles.
-8. Every module has fake tests before Whittle or compiler adapters are trusted.
+7. Replay stores portable graph/action contexts, not process-local handles.
+8. Whittle is the first concrete adapter; add a fake adapter later only when it
+   materially simplifies search/orchestration tests.
 9. GraphEngine is sync; async scheduling, queues, timeouts, and batching live
    in EngineServer/orchestrator layers.
 10. Rust selfplay/search never imports Python or PyTorch. Neural inference is
@@ -54,7 +55,6 @@ graphzero/
   Cargo.toml
   crates/
     gz-engine/
-    gz-engine-fake/
     gz-engine-whittle/
     gz-features/
     gz-search/
@@ -102,6 +102,7 @@ ModelVersion
 PortableGraphId
 ReplayGraphContext
 PortableCandidateRef
+PortableSearchActionRef
 SearchStepRef
 CandidateOptions
 MeasureOptions
@@ -156,7 +157,7 @@ pub trait BatchGraphEngine: GraphEngine {
 ```
 
 This crate owns engine-neutral interfaces, result types, options, hashes,
-portable graph/candidate contexts, errors, and contract tests. Small
+portable graph/candidate/action refs, errors, and contract tests. Small
 cross-pipeline identity newtypes like `ModelVersion` and `SearchConfigHash`
 live here only to avoid dependency cycles. Runtime/orchestration ids live in
 `gz-orchestrator`. Replay-specific ids and schemas live in `gz-replay`.
@@ -174,32 +175,10 @@ SearchActor
 Reasons:
 
 ```text
-fake and Whittle engines stay simple
+Whittle engine stays simple
 no async-trait or boxed future overhead in engine contracts
 batching/backpressure stay centralized
 process boundaries can be added later behind EngineClient
-```
-
-### `gz-engine-fake`
-
-Tiny deterministic engine for infrastructure tests.
-
-```text
-known small state graph
-deterministic candidates
-deterministic apply
-deterministic fake measure
-failure injection knobs
-```
-
-Use for:
-
-```text
-queue tests
-batch contract tests
-ratio-controller tests
-replay schema tests
-shutdown/restart tests
 ```
 
 ### `gz-engine-whittle`
@@ -207,11 +186,14 @@ shutdown/restart tests
 Adapter over existing Whittle game/search environment for the first non-fake
 engine.
 
+`GZ_ENGINE_WHITTLE.md` owns the detailed crate contract.
+
 Purpose:
 
 ```text
 test the abstract engine/search/eval/measure/replay pipeline on a real domain
 without waiting for a compiler backend
+match existing Whittle native rewrite semantics without Python in the hot path
 ```
 
 Responsibilities:
@@ -219,10 +201,12 @@ Responsibilities:
 ```text
 map Whittle state -> E::Graph
 map Whittle move/action -> E::Candidate
+generate random-walked Whittle training roots
 enumerate legal candidates through Whittle
 apply Whittle candidates
 measure Whittle states through Whittle domain logic
 provide CandidateInfo for policy/replay
+export/import Whittle graph artifacts for diagnostics and replay workflows
 ```
 
 This adapter exists to validate the architecture, not to become graphzero's
@@ -297,25 +281,34 @@ rewrite, Whittle move, or future compiler transform.
 
 ### `gz-eval`
 
-Neural or fake evaluator used by search.
+Policy/value evaluator used by search.
+
+`GZ_EVAL.md` owns the detailed crate contract.
+
+The first boundary is blocking and batch-first so serial Gumbel-MCTS can call it
+directly. Async batching and Python-backed inference can be added later without
+changing the action-aligned policy/value output shape.
 
 ```rust
-pub trait Evaluator<E: GraphEngine, F: FeatureExtractor<E>> {
-    async fn evaluate(&self, batch: F::Batch) -> EvalBatchOutput;
+pub trait Evaluator {
+    fn evaluate_batch(
+        &mut self,
+        requests: &[EvalRequest],
+        out: &mut Vec<EvalOutput>,
+    ) -> EvalResult<()>;
 }
 
-pub struct EvalBatchOutput {
+pub struct EvalOutput {
     pub model_version: ModelVersion,
-    pub policy_logits: Vec<Vec<f32>>,
-    pub value: Vec<f32>,
-    pub reward: Option<Vec<f32>>,
+    pub policy_logits: Vec<f32>,
+    pub value: f32,
 }
 ```
 
 Initial adapters:
 
 ```text
-RandomEvaluator
+RandomValueEvaluator
 RecordedEvaluator
 PythonProcessEvaluator once full-scale Exphormer is used
 ```
@@ -323,14 +316,15 @@ PythonProcessEvaluator once full-scale Exphormer is used
 Owns:
 
 ```text
-request queues
-batch formation
+action-aligned eval request/output records
+blocking evaluator trait
+output validation
+cheap deterministic evaluators
 model version tag
-eval cache if semantically safe
-checkpoint polling/reload client if backed by a Python process
 ```
 
-No learner yet.
+Does not own search trees, candidate enumeration, terminal measurement, replay,
+or training. No learner yet.
 
 ### `gz-replay`
 
@@ -361,9 +355,9 @@ for the row graph.
 pub struct ReplayRow {
     pub root: ReplayGraphContext,
     pub measured_graph: ReplayGraphContext,
-    pub action_history: Vec<PortableCandidateRef>,
-    pub legal_candidates: Vec<PortableCandidateRef>,
-    pub policy_target: Vec<(PortableCandidateRef, f32)>,
+    pub action_history: Vec<PortableSearchActionRef>,
+    pub legal_actions: Vec<PortableSearchActionRef>,
+    pub policy_target: Vec<(PortableSearchActionRef, f32)>,
     pub value_target: Option<f32>,
     pub reward_target: Option<f32>,
     pub measurement: MeasureSummary,
@@ -459,7 +453,8 @@ Hard boundary:
 gz-engine: no Python, no torch
 gz-search: no Python, no torch
 gz-replay: owns storage schema; Python samples through service API
-gz-eval: may implement PythonProcessEvaluator behind Evaluator/EvalClient
+gz-eval: default build has no Python or torch; a future adapter may implement
+PythonProcessEvaluator behind the Evaluator boundary
 ```
 
 Leaf eval flow:
@@ -519,7 +514,6 @@ Future compiler commands can be added after a compiler engine exists.
 
 ```text
 gz-engine
-  <- gz-engine-fake
   <- gz-engine-whittle
   <- gz-features
   <- gz-search
@@ -536,26 +530,25 @@ gz-search -> gz-engine-whittle
 gz-search -> gz-replay
 gz-engine -> gz-search
 gz-engine -> gz-replay
-gz-engine -> gz-engine-fake
 gz-engine -> gz-engine-whittle
 ```
 
 ## First Vertical Slice
 
 ```text
-FakeGraphEngine
-RandomEvaluator
-FakeFeatureExtractor
+WhittleTestEngine
+RandomValueEvaluator
+WhittleFeatureExtractor
 InMemoryReplay or temp RocksDB
 Orchestrator
-smoke-async CLI
+smoke-async --engine whittle
 ```
 
 Acceptance:
 
 ```text
-actors generate fake episodes
-engine measures selected fake graphs
+actors generate Whittle episodes
+engine measures selected Whittle graphs
 only measured rows enter replay
 mock consumer can read rows
 backpressure can throttle actors/consumer
@@ -565,11 +558,9 @@ all queues drain on shutdown
 ## Second Vertical Slice
 
 ```text
-WhittleTestEngine
-WhittleFeatureExtractor
-RandomEvaluator or tiny recorded evaluator
 RocksDB replay
-smoke-async --engine whittle
+recorded evaluator
+rollout/search smoke
 ```
 
 Acceptance:
@@ -595,9 +586,8 @@ actor model staleness policy
 
 ## Remaining Design Questions
 
-1. What exact Whittle surface should `gz-engine-whittle` wrap?
-2. Should RocksDB keys be episode-major or graph-hash-major first?
-3. Should feature caches live inside `FeatureExtractor` only, or can
+1. Should RocksDB keys be episode-major or graph-hash-major first?
+2. Should feature caches live inside `FeatureExtractor` only, or can
    `Orchestrator` own shared cross-actor feature caches?
-4. What should the fake engine model: tree game, DAG rewrite game, or tiny
+3. What should the fake engine model: tree game, DAG rewrite game, or tiny
    Whittle-like domain?
