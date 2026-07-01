@@ -1,0 +1,14 @@
+[package]
+name = "gz-engine"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_test = "1"
