@@ -80,6 +80,7 @@ impl TestEngine {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn unscored(mut self, graph: u8) -> Self {
         self.measures.insert(
             graph,

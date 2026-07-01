@@ -1,14 +1,13 @@
 [package]
-name = "gz-engine-whittle"
+name = "gz-orchestrator"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-blake3 = "1.8.5"
 gz-engine = { path = "../gz-engine" }
-rand = "0.10.1"
-rand_chacha = "0.10.0"
-
-[dev-dependencies]
 gz-eval = { path = "../gz-eval" }
 gz-search = { path = "../gz-search" }
+
+[dev-dependencies]
+gz-engine-whittle = { path = "../gz-engine-whittle" }
+gz-eval-whittle = { path = "../gz-eval-whittle" }

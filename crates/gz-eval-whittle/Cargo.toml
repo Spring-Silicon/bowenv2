@@ -1,9 +1,9 @@
 [package]
-name = "gz-search"
+name = "gz-eval-whittle"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-blake3 = "1.8.5"
 gz-engine = { path = "../gz-engine" }
+gz-engine-whittle = { path = "../gz-engine-whittle" }
 gz-eval = { path = "../gz-eval" }

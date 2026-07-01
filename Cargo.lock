@@ -102,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "gz-engine",
+ "gz-eval",
  "gz-search",
  "rand",
  "rand_chacha",
@@ -116,11 +117,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "gz-eval-whittle"
+version = "0.1.0"
+dependencies = [
+ "gz-engine",
+ "gz-engine-whittle",
+ "gz-eval",
+]
+
+[[package]]
+name = "gz-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "gz-engine",
+ "gz-engine-whittle",
+ "gz-eval",
+ "gz-eval-whittle",
+ "gz-search",
+]
+
+[[package]]
 name = "gz-search"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "gz-engine",
+ "gz-eval",
 ]
 
 [[package]]

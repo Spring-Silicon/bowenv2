@@ -3,9 +3,10 @@
 Status: draft
 
 Purpose: define the search crate for GraphZero. The first implementations are
-deterministic measured greedy rollout and deterministic measured beam search,
-but the crate must be shaped for its main future use: many parallel Gumbel-MCTS
-selfplay workers driven by an async orchestrator.
+deterministic measured greedy rollout, deterministic measured beam search,
+random rollout, and serial Gumbel-MCTS. The crate must stay shaped for its main
+future use: many parallel Gumbel-MCTS selfplay workers driven by an async
+orchestrator.
 
 `gz-search` exists to prove that search can drive an engine without knowing the
 engine's graph body, candidate structure, or domain semantics, while keeping
@@ -28,6 +29,8 @@ greedy rollout configuration
 greedy rollout execution
 beam search configuration
 beam search execution
+random rollout execution
+serial Gumbel-MCTS execution
 search stop reasons
 search config hashing
 private test engines for search tests
@@ -122,10 +125,10 @@ Each worker owns its tree/path state, scratch buffers, and RNG state.
 All cross-worker batching belongs outside gz-search.
 ```
 
-The first greedy and beam implementations may be run-to-completion over a
-mutable `GraphEngine`. Later Gumbel-MCTS should be able to use a
-step/state-machine driver so the orchestrator can batch leaf expansion,
-evaluation, apply, and measurement requests across many workers.
+The first greedy, beam, random, and serial Gumbel-MCTS implementations may be
+run-to-completion over a mutable `GraphEngine`. Later async/wave Gumbel-MCTS
+should be able to use a step/state-machine driver so the orchestrator can batch
+leaf expansion, evaluation, apply, and measurement requests across many workers.
 
 Do not add the full state-machine API for greedy alone. Do keep shared records,
 hashing, scratch ownership, and dependency boundaries compatible with that
@@ -134,9 +137,14 @@ future API.
 ## Gumbel-MCTS Direction
 
 Gumbel-MCTS is the expected primary algorithm once feature extraction and eval
-exist. The first greedy and beam code must not make that path harder.
+exist. Greedy, beam, and random code must not make that path harder.
 
-Future Gumbel-MCTS search state will likely need:
+The serial Gumbel-MCTS contract is specified in `GZ_SEARCH_GUMBEL_MCTS.md`.
+That spec defines the root sequential-halving math, completed-Q policy target,
+STOP semantics, episode loop, and opponent-trajectory eval context. The serial
+implementation follows that spec without async or wave search.
+
+Gumbel-MCTS search state needs:
 
 ```text
 worker-local tree arena
@@ -174,20 +182,22 @@ handles.
 Do not bake synchronous run-to-completion as the only possible search shape.
 ```
 
-Deferred Gumbel-MCTS details:
+Gumbel-MCTS details owned by `GZ_SEARCH_GUMBEL_MCTS.md`:
 
 ```text
 tree policy formula
 root gumbel sampling
 sequential halving schedule
 value backup rules
-virtual loss or in-flight leaf handling
-search/eval state-machine integration
-batched tree stepping API
+opponent trajectory indexing
+serial search/eval integration
 ```
 
-Those details should be specified when the serial Gumbel-MCTS behavior and the
-future `gz-features` boundary are clear enough to implement without guessing.
+The poll/resume work protocol that hosts async and wave execution is owned
+by `GZ_ORCHESTRATOR.md`; the protocol types and Gumbel task state machines
+live in `gz-search` per that spec. Wave tree math (virtual visits, in-flight
+bookkeeping, halving barriers) remains deferred until the serial task
+implementation matches the run-to-completion goldens.
 
 ## Implemented Algorithms
 
@@ -250,7 +260,7 @@ Planned later algorithms:
 
 ```text
 policy rollout
-Gumbel-MCTS
+async/wave Gumbel-MCTS
 tree-parallel async search
 ```
 
@@ -432,8 +442,8 @@ GreedySearch and BeamSearch must not inspect graph or candidate handles.
 
 `SearchEpisode` and `SearchStep` are algorithm-neutral selected-transition
 records. `BeamEpisode.layers` records the retained beam frontier at each depth.
-Future Gumbel-MCTS output may add algorithm-specific root statistics, visit
-counts, value estimates, and policy targets alongside these records.
+`GumbelRootResult` and `GumbelEpisode` add algorithm-specific root statistics,
+visit-derived values, and policy targets alongside these records.
 
 `SearchAction::Candidate` wraps an engine-owned candidate handle.
 `SearchAction::Stop` is search-owned control flow and must never be passed to
@@ -748,16 +758,14 @@ Python tensors
 ```
 
 Replay projection is a later crate concern. The selected-transition output is
-sufficient to record the final selected path. It is not a policy-target record;
-policy target data should be added explicitly when `gz-eval`/Gumbel-MCTS needs
-it.
+sufficient to record the final selected path for greedy, beam, and random.
+Gumbel-MCTS exposes policy targets explicitly in its own result type.
 
 Whether to store one replay row per step or only the final graph belongs to
 `gz-replay` / `gz-orchestrator`, not `gz-search`.
 
-Future Gumbel-MCTS output may derive policy targets from visit counts or
-sequential-halving winners. That target projection should be explicit data in
-the Gumbel-MCTS result, not inferred from greedy or beam fields.
+Gumbel-MCTS policy targets are explicit data in the Gumbel-MCTS result, not
+inferred from greedy or beam fields.
 
 ## Error Handling
 

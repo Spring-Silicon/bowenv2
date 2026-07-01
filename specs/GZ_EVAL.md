@@ -127,10 +127,35 @@ pub trait Evaluator {
 }
 ```
 
-The production-facing evaluator API does not receive `&E` or `E::Graph`.
-Cross-worker eval batching cannot assume a shared `GraphEngine`, and engine
-local graph handles are worker-local. Feature-backed evaluators should consume
-portable contexts and feature rows once `gz-features` exists.
+The portable evaluator API does not receive `&E` or `E::Graph`. Cross-worker
+eval batching cannot assume a shared `GraphEngine`, and engine-local graph
+handles are worker-local. Feature-backed evaluators should consume portable
+contexts and feature rows once `gz-features` exists.
+
+Serial search still needs one engine-aware boundary until `gz-orchestrator`
+owns eval dispatch. That boundary lives in `gz-eval`, not `gz-search`:
+
+```rust
+pub struct EngineEvalRequest<'a, E: GraphEngine> {
+    pub graph: E::Graph,
+    pub candidates: &'a [E::Candidate],
+    pub request: &'a EvalRequest,
+    pub measure_options: MeasureOptions,
+}
+
+pub trait EngineEvaluator<E: GraphEngine> {
+    fn evaluate(
+        &mut self,
+        engine: &mut E,
+        input: EngineEvalRequest<'_, E>,
+    ) -> EngineResult<EvalOutput>;
+}
+```
+
+Any `Evaluator` automatically implements `EngineEvaluator<E>` by ignoring
+engine-local fields and evaluating `input.request`. Engine-specific evaluators
+that need graph or candidate handles implement `EngineEvaluator<E>` directly in
+their domain eval crate.
 
 Request records:
 
@@ -138,6 +163,7 @@ Request records:
 pub struct EvalRequest {
     pub context: ReplayGraphContext,
     pub actions: Vec<EvalAction>,
+    pub position: EvalPositionContext,
 }
 
 pub struct EvalAction {
@@ -233,6 +259,43 @@ Value is a scalar estimate in the same orientation as `MeasureResult` reward:
 higher is better. It is not required to be measured, calibrated, or
 replay-eligible.
 
+## Search Position Context
+
+Serial Gumbel-MCTS needs eval rows to know where the leaf sits in the current
+root search, especially when value is conditioned on an opponent trajectory.
+`EvalRequest` therefore carries a small position context.
+
+```rust
+pub struct EvalPositionContext {
+    pub root_step: u32,
+    pub leaf_depth: u32,
+    pub budget_fraction: f32,
+    pub budget_step: f32,
+    pub opponent: Option<EvalOpponentContext>,
+}
+
+pub struct EvalOpponentContext {
+    pub trajectory_id: u64,
+    pub row_count: u32,
+}
+```
+
+Rules:
+
+```text
+root_step is the learner episode step for the root being searched
+leaf_depth is the depth from that root to the evaluated graph
+budget_fraction is the root budget fraction
+budget_step is subtracted once per leaf depth
+opponent_row = min(root_step + leaf_depth, row_count - 1)
+```
+
+`EvalPositionContext` must stay small and copyable. It should identify context;
+it must not carry graph bodies, opponent graph handles, or encoded opponent
+feature rows. Serial evaluators may hold an opponent table directly. Future
+orchestrator batchers can resolve `trajectory_id + opponent_row` while collating
+model batches.
+
 ## Measurement Boundary
 
 `gz-eval` predictions are not measurements.
@@ -241,12 +304,15 @@ Rules:
 
 ```text
 Evaluator::evaluate_batch has no GraphEngine access and must not measure.
+EngineEvaluator may call GraphEngine only for evaluator-owned behavior.
 Search may back up EvalOutput.value inside MCTS.
 Replay rows still require GraphEngine::measure for the recorded graph.
 Measured reward and eval value must remain separate fields.
 ```
 
 This prevents cheap/random/neural values from being mistaken for runtime reward.
+Concrete measurement-backed diagnostic evaluators belong in domain eval crates
+such as `gz-eval-whittle`, not in `gz-search`.
 
 ## Blocking And Batching
 

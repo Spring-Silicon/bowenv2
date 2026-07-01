@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/gz-engine", "crates/gz-engine-whittle", "crates/gz-search", "crates/gz-eval"]
+members = [
+    "crates/gz-engine",
+    "crates/gz-engine-whittle",
+    "crates/gz-search",
+    "crates/gz-eval",
+    "crates/gz-eval-whittle",
+    "crates/gz-orchestrator",
+]
 resolver = "3"
 
 [workspace.package]

@@ -17,7 +17,7 @@ Foundation crate: gz-engine, not gz-core
 Measurement: GraphEngine::measure
 Features: separate FeatureExtractor<E>
 Candidates: fully engine-owned abstraction
-Engine trait: sync GraphEngine, async EngineServer wrapper
+Engine trait: sync GraphEngine; orchestrator-owned engine lanes, inline or queued
 Learner: Python trainer sidecar later; no Rust learner crate initially
 Neural eval: EvalClient boundary; Python evaluator sidecar allowed
 Replay storage: RocksDB + compact binary row encoding
@@ -39,7 +39,7 @@ Compiler backend: future work
 8. Whittle is the first concrete adapter; add a fake adapter later only when it
    materially simplifies search/orchestration tests.
 9. GraphEngine is sync; async scheduling, queues, timeouts, and batching live
-   in EngineServer/orchestrator layers.
+   in gz-orchestrator engine lanes and eval routing.
 10. Rust selfplay/search never imports Python or PyTorch. Neural inference is
     accessed through EvalClient.
 11. Python trainer never owns replay storage format directly. It samples through
@@ -59,6 +59,7 @@ graphzero/
     gz-features/
     gz-search/
     gz-eval/
+    gz-eval-whittle/
     gz-replay/
     gz-orchestrator/
     gz-cli/
@@ -83,8 +84,8 @@ Foundational crate for engine traits and engine-boundary types.
 `GZ_ENGINE.md` owns the detailed crate contract.
 
 `GraphEngine` is intentionally sync. It defines deterministic graph operations,
-not scheduling. Async behavior comes from an `EngineServer` wrapper owned by the
-orchestrator.
+not scheduling. Async behavior comes from orchestrator-owned engine lanes; see
+`GZ_ORCHESTRATOR.md`.
 
 Owns:
 
@@ -162,23 +163,24 @@ cross-pipeline identity newtypes like `ModelVersion` and `SearchConfigHash`
 live here only to avoid dependency cycles. Runtime/orchestration ids live in
 `gz-orchestrator`. Replay-specific ids and schemas live in `gz-replay`.
 
-The async wrapper shape belongs outside this crate:
+The suspension mechanism belongs outside this crate:
 
 ```rust
-SearchActor
-  -> async EngineClient request
-  -> EngineServer task
+SearchTask
+  -> SearchWork request from poll()
+  -> engine lane driver (inline for cheap engines, queued for expensive ones)
   -> sync GraphEngine call
-  -> async reply
+  -> resume(token, result)
 ```
 
 Reasons:
 
 ```text
-Whittle engine stays simple
+Whittle engine stays simple and never pays for a queue
 no async-trait or boxed future overhead in engine contracts
-batching/backpressure stay centralized
-process boundaries can be added later behind EngineClient
+batching/backpressure stay centralized in lane drivers
+expensive compiler apply/measure can be queued, limited, and batched
+process boundaries can be added later behind a process lane
 ```
 
 ### `gz-engine-whittle`
@@ -251,11 +253,14 @@ feature schema metadata exported to evaluator/trainer
 
 Search algorithms over `GraphEngine`.
 
+`GZ_SEARCH.md` owns the crate contract. `GZ_SEARCH_GUMBEL_MCTS.md` owns the
+serial Gumbel-MCTS algorithm contract.
+
 ```text
 random rollout
 greedy policy rollout
 beam search
-Gumbel MCTS
+serial Gumbel-MCTS
 async/tree-parallel MCTS later
 ```
 
@@ -309,7 +314,6 @@ Initial adapters:
 
 ```text
 RandomValueEvaluator
-RecordedEvaluator
 PythonProcessEvaluator once full-scale Exphormer is used
 ```
 
@@ -325,6 +329,27 @@ model version tag
 
 Does not own search trees, candidate enumeration, terminal measurement, replay,
 or training. No learner yet.
+
+### `gz-eval-whittle`
+
+Whittle-specific policy/value evaluators.
+
+Owns:
+
+```text
+WhittleMeasureEvaluator
+future Whittle neural evaluator adapters
+```
+
+Allowed deps:
+
+```text
+gz-engine
+gz-eval
+gz-engine-whittle
+```
+
+`gz-search` must still depend only on `gz-eval`, not this crate.
 
 ### `gz-replay`
 
@@ -398,13 +423,15 @@ stable sampling API.
 
 Async supervisor and backpressure controller.
 
+`GZ_ORCHESTRATOR.md` owns the detailed crate contract.
+
 Owns:
 
 ```text
-actor pool
+worker pool
 eval service lifecycle
-engine server lifecycle
-measure queue
+engine lane lifecycle
+measure concurrency limits
 replay writer
 ratio/backpressure controller
 metrics
@@ -427,9 +454,9 @@ The long-term full-scale Exphormer setup has four concurrent roles:
 
 ```text
 Rust selfplay/orchestrator process
-  runs many MCTS/search actors
-  calls EngineServer for candidates/apply/measure
-  calls EvalClient for leaf evals
+  runs many MCTS/search tasks
+  routes expand/apply/measure work to engine lanes
+  routes eval work to the eval batcher
   appends measured rows to replay
 
 Python evaluator process
@@ -460,12 +487,12 @@ PythonProcessEvaluator behind the Evaluator boundary
 Leaf eval flow:
 
 ```text
-SearchActor[0..N]
-  -> EvalClient.evaluate(...)
+SearchTask[0..N]
+  -> EvalWork request from poll()
   -> Rust eval batcher queue
   -> Python evaluator batch request
   -> PyTorch/Exphormer forward
-  -> batch response routed back to actors
+  -> batch response resumes matching (worker, token) pairs
 ```
 
 Do not call Python one leaf at a time. The Rust side owns batching,
@@ -518,6 +545,7 @@ gz-engine
   <- gz-features
   <- gz-search
   <- gz-eval
+      <- gz-eval-whittle
   <- gz-replay
   <- gz-orchestrator
       <- gz-cli

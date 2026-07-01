@@ -223,6 +223,7 @@ specs/
   GZ_ENGINE.md
   GZ_ENGINE_WHITTLE.md
   GZ_SEARCH.md
+  GZ_SEARCH_GUMBEL_MCTS.md
 ```
 
 Planned layout:
@@ -277,3 +278,5 @@ new rule. Write one concrete rule per line.
   workers; greedy search is only the first implementation slice.
 - Model STOP as a search-level action appended by `gz-search`, never as a
   `GraphEngine` candidate.
+- Use same-index opponent trajectory alignment only; root_step equals the
+  learner episode step.

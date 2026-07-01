@@ -1,6 +1,7 @@
 use crate::{EvalError, EvalResult};
 use gz_engine::{
-    CandidateKindId, CandidateTags, ModelVersion, PortableCandidateRef, PortableSearchActionRef,
+    CandidateKindId, CandidateTags, EngineError, EngineResult, ErrorCode, ErrorMessage,
+    GraphEngine, MeasureOptions, ModelVersion, PortableCandidateRef, PortableSearchActionRef,
     ReplayGraphContext,
 };
 
@@ -8,11 +9,25 @@ use gz_engine::{
 pub struct EvalRequest {
     pub context: ReplayGraphContext,
     pub actions: Vec<EvalAction>,
+    pub position: EvalPositionContext,
 }
 
 impl EvalRequest {
     pub fn new(context: ReplayGraphContext, actions: Vec<EvalAction>) -> EvalResult<Self> {
-        Self { context, actions }.validate()
+        Self::with_position(context, actions, EvalPositionContext::default())
+    }
+
+    pub fn with_position(
+        context: ReplayGraphContext,
+        actions: Vec<EvalAction>,
+        position: EvalPositionContext,
+    ) -> EvalResult<Self> {
+        Self {
+            context,
+            actions,
+            position,
+        }
+        .validate()
     }
 
     #[must_use]
@@ -84,6 +99,42 @@ impl EvalRequest {
 
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EvalPositionContext {
+    pub root_step: u32,
+    pub leaf_depth: u32,
+    pub budget_fraction: f32,
+    pub budget_step: f32,
+    pub opponent: Option<EvalOpponentContext>,
+}
+
+impl EvalPositionContext {
+    #[must_use]
+    pub fn opponent_row(self) -> Option<u32> {
+        let opponent = self.opponent?;
+        let last = opponent.row_count.checked_sub(1)?;
+        Some(self.root_step.saturating_add(self.leaf_depth).min(last))
+    }
+}
+
+impl Default for EvalPositionContext {
+    fn default() -> Self {
+        Self {
+            root_step: 0,
+            leaf_depth: 0,
+            budget_fraction: 1.0,
+            budget_step: 0.0,
+            opponent: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct EvalOpponentContext {
+    pub trajectory_id: u64,
+    pub row_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +229,47 @@ pub trait Evaluator {
         }
 
         Ok(out.pop().expect("length checked"))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EngineEvalRequest<'a, E: GraphEngine> {
+    pub graph: E::Graph,
+    pub candidates: &'a [E::Candidate],
+    pub request: &'a EvalRequest,
+    pub measure_options: MeasureOptions,
+}
+
+pub trait EngineEvaluator<E: GraphEngine> {
+    fn evaluate(
+        &mut self,
+        engine: &mut E,
+        input: EngineEvalRequest<'_, E>,
+    ) -> EngineResult<EvalOutput>;
+}
+
+impl<E, V> EngineEvaluator<E> for V
+where
+    E: GraphEngine,
+    V: Evaluator,
+{
+    fn evaluate(
+        &mut self,
+        _engine: &mut E,
+        input: EngineEvalRequest<'_, E>,
+    ) -> EngineResult<EvalOutput> {
+        self.evaluate_one(input.request)
+            .map_err(eval_error_to_engine_error)
+    }
+}
+
+#[must_use]
+pub fn eval_error_to_engine_error(error: EvalError) -> EngineError {
+    let message = ErrorMessage::new(format!("eval failed: {error}"))
+        .unwrap_or_else(|_| ErrorMessage::new("eval failed").unwrap());
+    EngineError::Internal {
+        code: ErrorCode::new(2),
+        message,
     }
 }
 
