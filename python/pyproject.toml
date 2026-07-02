@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphzero"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+torch = ["torch", "safetensors"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gz*"]
