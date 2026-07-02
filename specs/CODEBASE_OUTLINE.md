@@ -535,6 +535,14 @@ If those tags disagree, the evaluator or trainer must fail fast.
 
 Human entry points.
 
+Implemented:
+
+```bash
+graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]
+```
+
+Future diagnostics:
+
 ```bash
 graphzero smoke-async --engine fake
 graphzero smoke-async --engine whittle
@@ -575,29 +583,29 @@ gz-engine -> gz-engine-whittle
 ```text
 WhittleTestEngine
 RandomValueEvaluator
-WhittleFeatureExtractor
-InMemoryReplay or temp RocksDB
-Orchestrator
-smoke-async --engine whittle
+threaded Gumbel-MCTS orchestrator
+RocksDB ReplayStore
+graphzero selfplay --replay-dir PATH
 ```
 
 Acceptance:
 
 ```text
-actors generate Whittle episodes
-engine measures selected Whittle graphs
-only measured rows enter replay
-mock consumer can read rows
-backpressure can throttle actors/consumer
-all queues drain on shutdown
+generate Whittle roots
+run parallel threaded Gumbel-MCTS workers
+batch eval requests through gz-eval
+measure final episode graphs
+write only eligible measured rows to RocksDB replay
+support root, greedy, beam, random, or no reference labels
+report episode, row, label, and eval batching counters
 ```
 
 ## Second Vertical Slice
 
 ```text
-RocksDB replay
-recorded evaluator
-rollout/search smoke
+ReplaySampleService boundary
+trainer-facing sampling batches
+recorded evaluator or process-backed evaluator smoke
 ```
 
 Acceptance:

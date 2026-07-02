@@ -337,25 +337,27 @@ Keep it small; do not mirror rocksdb's error surface.
 
 ## Projection Contract (gz-orchestrator side)
 
-Not implemented in this crate, but fixed here so the schema and the
-producer cannot drift:
+Implemented in `gz-orchestrator`, not in this crate. The contract lives here
+so the schema and producer cannot drift:
 
 ```text
-projection input: a completed GumbelEpisode plus outcome inputs (reference
-kind and reference reward)
+projection input: a completed GumbelEpisode plus an optional Reference
 one ReplayRow per GumbelStep; the final graph produces no row of its own
 row.state = step_ref.before context; selected_action = step.selected_action
 legal_actions/policy_target come from the step's root search, in the exact
 eval order (candidates then STOP)
 episodes whose final measure is unmeasured or invalid are not projected
+reference = None stores policy-only rows with value_target = None
+reference = Some(r) stores ReplayReference metadata and value_target =
+sign(learner_reward - r.final_reward) on every row
+reward_target = Some(learner_reward) on every row
+action_history contains prior selected actions from the same episode
 ```
 
-Prerequisite in `gz-search` (one field, mirrors the earlier root_context
-addition): `GumbelRootResult` and `GumbelStep` must expose
-`legal_actions: Vec<PortableSearchActionRef>` — the root node's ordered
-action refs. Today those refs die with the tree, so projection cannot pair
-the policy target with its actions. Golden fingerprints do not include the
-new field, so goldens are unaffected.
+`GumbelRootResult` and `GumbelStep` expose
+`legal_actions: Vec<PortableSearchActionRef>`, the root node's ordered action
+refs. Projection copies those refs into rows so the policy target remains
+action-aligned after engine-local handles are gone.
 
 ## Crate Shape
 
@@ -412,8 +414,8 @@ value_target validation accepts only -1/0/+1
 6. Implement row_index and sample_rows with the internal seeded RNG.
 7. Tests per the strategy above.
 8. Wire the orchestrator side separately (projection + replay sink +
-   RootBaseline/algorithmic reference plumbing); that work order belongs
-   with gz-orchestrator, not this crate.
+   RootBaseline/algorithmic reference plumbing); that work belongs with
+   `gz-orchestrator`.
 9. Update CODEBASE_OUTLINE and AGENTS.md; run fmt, test --all, clippy.
 
 ## Deferred

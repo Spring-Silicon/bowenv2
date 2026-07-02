@@ -3,9 +3,10 @@
 Status: draft
 
 Purpose: define the execution crate that drives GraphZero search workers,
-routes their engine and eval work, and batches that work across many
-concurrent selfplay workers. The first implementation is serial and boring,
-but the worker protocol is designed for the two regimes that dominate later:
+routes their engine and eval work, batches that work across many concurrent
+selfplay workers, and hands measured episodes to replay. The first
+implementations are serial and threaded single-process drivers, but the
+worker protocol is designed for the two regimes that dominate later:
 
 ```text
 wave Gumbel-MCTS workers with many in-flight simulations per tree
@@ -71,8 +72,8 @@ work routing for engine and eval requests
 engine lane ownership and task-to-lane assignment
 single-process eval batching
 measure concurrency limits later
-replay sink driving later
-ratio/backpressure gating later
+replay sink driving
+minimal replay admission backpressure gating
 bounded eval queues for the threaded single-process driver
 shutdown and cancellation later
 ```
@@ -100,6 +101,7 @@ Default allowed:
 std
 gz-engine
 gz-eval
+gz-replay
 gz-search
 ```
 
@@ -114,7 +116,6 @@ Allowed later behind explicit features:
 
 ```text
 tokio or another async runtime
-gz-replay
 gz-features
 process-backed eval clients
 metrics backend
@@ -124,7 +125,7 @@ Forbidden in the default crate:
 
 ```text
 torch/Python bindings
-rocksdb
+direct rocksdb use outside gz-replay
 gz-engine-whittle
 future concrete compiler adapters
 trainer code
@@ -588,15 +589,14 @@ Later async pieces:
 ```text
 queued engine lane driver
 measure concurrency limiter
-ReplaySink
-ratio controller
+full ratio controller
 CancellationToken
 Metrics
 ```
 
-The single-process worker pool and bounded eval batcher now exist. Queued
-engine lanes, replay, ratio control, cancellation, and metrics remain later
-work.
+The single-process worker pool, bounded eval batcher, replay sink, and
+minimal admission backpressure gate now exist. Queued engine lanes, full
+ratio control, cancellation, and metrics remain later work.
 
 ## Measurement And Replay Boundary
 
@@ -612,8 +612,9 @@ The serial orchestrator may return measured episodes but does not define a
 replay row schema.
 ```
 
-`gz-replay` will own durable row types and storage. `gz-orchestrator` will
-eventually feed a replay sink; it must not duplicate replay schemas.
+`gz-replay` owns durable row types and storage. `gz-orchestrator` projects
+measured episodes into those portable records and feeds the replay sink; it
+must not duplicate replay schemas.
 
 ## Determinism
 
@@ -688,6 +689,10 @@ serial orchestrator increments episode ids
 serial orchestrator routes eval work through the configured evaluator
 Blocked in the serial driver is reported as an internal error
 Whittle integration works with WhittleEngine + WhittleMeasureEvaluator
+reference providers produce root baseline, greedy, beam, and random labels
+projection writes store-valid replay records
+threaded replay integration appends eligible episodes and obeys the
+admission backpressure gate
 ```
 
 Use Whittle only as a dev-dependency integration test. The crate itself
@@ -728,8 +733,7 @@ async runtime choice
 queued engine lanes
 process lanes
 measure concurrency limiter
-replay sink
-ratio/backpressure controller
+full ratio/backpressure controller
 worker supervision
 shutdown/cancellation
 metrics
