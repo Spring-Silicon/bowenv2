@@ -30,13 +30,13 @@ The decisions this spec fixes (review before implementation):
 ```text
 1. New crate gz-eval-service owns the protocol: framing, handshake, the
    client, process spawn/lifecycle, and the stub model's Rust reference
-   implementation. It depends on gz-features and gz-engine only. The
-   orchestrator gains default deps on gz-features and gz-eval-service
-   (amending GZ_ORCHESTRATOR.md, same precedent as gz-replay).
+   implementation. It depends on gz-features and gz-engine only.
 
-2. The evaluator is a child process of the orchestrator. Spawned, health-
-   checked via PING, killed on drop. Fail-fast on handshake mismatch or
-   crash; restart policy is deferred.
+2. The evaluator is a child process of the orchestrator. Spawned, connected
+   once with connect-retry plus handshake on that same connection, killed on
+   drop if still running. PING is a live-connection health check, not a
+   readiness probe, because the v1 Python server accepts one client and exits
+   after that connection closes.
 
 3. The payload IS the gz-features encoding. EVAL frames carry GZFB batch
    bytes verbatim; results carry GZFO bytes verbatim. The service layer
@@ -81,10 +81,9 @@ It owns:
 ```text
 the wire protocol: frame format, types, handshake, error frames
 the blocking client (connect, handshake, eval round trip, ping)
-evaluator child-process spawn, readiness probe, and kill-on-drop
+evaluator child-process spawn, connect retry, and kill-on-drop
 the stub model reference implementation (Rust)
 the FeatureEvalBackend trait and its two v1 backends
-the synthetic load generator
 ```
 
 It does not own:
@@ -102,7 +101,7 @@ retry/restart policy (fail-fast v1)
 `gz-eval-service` (Rust):
 
 ```text
-allowed: std, gz-engine, gz-eval (EvalOutput), gz-features
+allowed: std, gz-engine, gz-features
 forbidden: tokio, torch/Python bindings, serde, gz-search, gz-replay,
 gz-orchestrator, engine adapters
 transport is std::os::unix::net; this crate is unix-only, which is
@@ -117,8 +116,9 @@ forbidden in this work order: torch, any framework, any pip-only dependency
 (numpy and pytest are installed as system packages)
 ```
 
-`gz-orchestrator` amendments: gz-features and gz-eval-service move to
-default dependencies (update GZ_ORCHESTRATOR.md's dependency contract).
+`gz-orchestrator` integration is work order C. This crate exposes
+`RowOutput` values and `ModelVersion`; conversion into `EvalOutput` belongs
+to the orchestrator-side featurized path.
 
 ## Wire Protocol
 
@@ -155,24 +155,27 @@ pub struct EvaluatorProcess { /* child + socket path; kill on drop */ }
 
 impl EvaluatorProcess {
     pub fn spawn(config: EvaluatorProcessConfig) -> ServiceResult<Self>;
-    pub fn connect(&self, hello: Hello) -> ServiceResult<ProcessBackend>;
+    pub fn connect(&mut self, hello: &Hello) -> ServiceResult<ProcessBackend>;
 }
 
 pub struct EvaluatorProcessConfig {
     pub python: PathBuf,           // default "python3"
-    pub module: String,            // default "evaluator"
-    pub working_dir: PathBuf,      // default "python/"
+    pub module: String,            // default "gz.evaluator"
+    pub working_dir: PathBuf,      // caller resolves; no default guessing
     pub socket_path: PathBuf,
     pub ready_timeout: Duration,   // default 10s
+    pub io_timeout: Duration,      // default 30s
 }
 ```
 
 Rules:
 
 ```text
-spawn starts the child with --socket <path>, inherits stderr, then probes
-readiness: retry connect + PING until ready_timeout, else kill + error.
-connect performs the handshake and returns a ready backend.
+spawn starts the child with --socket <path>, inherits stdout/stderr, and
+does not probe readiness.
+connect retries UnixStream::connect on the configured socket path until
+ready_timeout, then sends HELLO on that same connection and requires
+HELLO_ACK.
 Drop for EvaluatorProcess kills and reaps the child; no orphans.
 ProcessBackend::eval writes one EVAL frame and blocks for its EVAL_RESULT;
 ERROR frames or connection loss map to ServiceError::Backend and are
@@ -188,6 +191,8 @@ implementation now lives under the `gz` package, with protocol code in
 in `gz.evaluator`.
 
 ## Orchestrator Featurized Path
+
+Work order C scope; not implemented by Work Order A.
 
 The existing portable-Evaluator paths (`run`, `run_with_replay`) are
 untouched. New alongside them:
