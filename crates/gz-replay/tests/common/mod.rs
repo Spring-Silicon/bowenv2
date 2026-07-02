@@ -123,6 +123,8 @@ pub fn episode_with_rows(row_count: usize) -> (ReplayEpisodeRecord, Vec<ReplayRo
                 reward: 4.0,
                 final_graph: None,
                 trajectory_id: None,
+                search_config_hash: None,
+                model_version: None,
             }),
         },
         search_config_hash: search_hash(),

@@ -135,12 +135,17 @@ pub struct ReplayReference {
     pub reward: f32,
     pub final_graph: Option<ReplayGraphContext>,
     pub trajectory_id: Option<u64>,
+    pub search_config_hash: Option<SearchConfigHash>,
+    pub model_version: Option<ModelVersion>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayReferenceKind {
-    OpponentFinal,
     RootBaseline,
+    Greedy,
+    Beam,
+    Random,
+    Gumbel,
 }
 
 pub struct ReplayRow {
@@ -186,10 +191,11 @@ Defined here, computed by the orchestrator during projection:
 learner_reward = episode final_measure.scalar_reward (admission guarantees
 it exists and is finite)
 reference kinds:
-  OpponentFinal: the opponent trajectory's final measured reward; one
-  measurement per opponent trajectory, reusable across comparisons
   RootBaseline: the root graph's measured reward; one measurement per root,
   amortized across every episode from that root
+  Greedy/Beam/Random: algorithmic reference trajectories for cheap-measure
+  engines; their search_config_hash records the reference kernel config
+  Gumbel: future frozen-checkpoint opponent trajectory reference
 value_target = sign(learner_reward - reference.reward): +1.0 win, -1.0
 loss, 0.0 exact tie
 no reference configured, or reference measurement missing/invalid:
@@ -224,6 +230,10 @@ simply not replay-eligible and is dropped or logged); they are never stored
 rows.
 
 ## Storage Layout
+
+Schema version: 2. Version 2 records the reference provider kind plus
+optional reference search_config_hash/model_version so mixed reference pools
+can be distinguished. Version 1 stores fail to open with SchemaMismatch.
 
 ```text
 RocksDB, one database directory, column families:
@@ -402,7 +412,7 @@ value_target validation accepts only -1/0/+1
 6. Implement row_index and sample_rows with the internal seeded RNG.
 7. Tests per the strategy above.
 8. Wire the orchestrator side separately (projection + replay sink +
-   RootBaseline/OpponentFinal reference plumbing); that work order belongs
+   RootBaseline/algorithmic reference plumbing); that work order belongs
    with gz-orchestrator, not this crate.
 9. Update CODEBASE_OUTLINE and AGENTS.md; run fmt, test --all, clippy.
 

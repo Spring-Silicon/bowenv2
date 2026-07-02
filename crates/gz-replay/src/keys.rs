@@ -1,4 +1,4 @@
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 pub(crate) const CF_META: &str = "meta";
 pub(crate) const CF_EPISODES: &str = "episodes";

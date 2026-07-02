@@ -46,12 +46,17 @@ pub struct ReplayReference {
     pub reward: f32,
     pub final_graph: Option<ReplayGraphContext>,
     pub trajectory_id: Option<u64>,
+    pub search_config_hash: Option<SearchConfigHash>,
+    pub model_version: Option<ModelVersion>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ReplayReferenceKind {
-    OpponentFinal,
     RootBaseline,
+    Greedy,
+    Beam,
+    Random,
+    Gumbel,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
