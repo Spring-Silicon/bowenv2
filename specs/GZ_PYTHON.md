@@ -189,6 +189,9 @@ config files are TOML read with stdlib tomllib; no yaml dependency.
 dev install: pip install -e python/. Entry points are module mains:
 python -m gz.evaluator --socket PATH
 python -m gz.trainer --config PATH
+module mains resolve with python/ as the working directory (the Rust
+spawner's default) or after installation; they do not resolve from the
+repo root. pytest works from anywhere via tests/conftest.py.
 logging: stderr only; nothing on the eval hot path. Startup, swaps, and
 errors are one-line events.
 ```

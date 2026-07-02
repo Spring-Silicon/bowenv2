@@ -80,6 +80,9 @@ def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
                 else:
                     raise ProtocolError(ERROR_PROTOCOL, "unexpected frame type")
             finally:
+                # read_buf cannot grow while a memoryview references it
+                # (bytearray.extend raises BufferError), so the payload view
+                # must be dropped before the next read_frame.
                 del payload
     except ProtocolError as error:
         _send_error(conn, write_buf, error.code, error.message)
