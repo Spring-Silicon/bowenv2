@@ -7,6 +7,7 @@ mod bench;
 mod ids;
 mod lanes;
 mod pool;
+pub mod project;
 pub mod reference;
 mod root;
 mod serial;
