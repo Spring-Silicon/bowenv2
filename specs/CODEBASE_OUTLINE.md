@@ -59,6 +59,7 @@ graphzero/
     gz-engine/
     gz-engine-whittle/
     gz-features/
+    gz-eval-service/
     gz-search/
     gz-eval/
     gz-eval-whittle/
@@ -308,6 +309,26 @@ engine.apply(...)
 
 Search does not care whether a candidate is a site-level rewrite, family-level
 rewrite, Whittle move, or future compiler transform.
+
+### `gz-eval-service`
+
+Process-backed feature batch evaluator protocol and blocking client.
+
+`GZ_EVAL_SERVICE.md` owns the crate role. `GZ_EVAL_PROTOCOL.md` owns the
+wire contract.
+
+Owns:
+
+```text
+Unix socket framing and handshake
+EvaluatorProcess spawn/connect/drop lifecycle
+ProcessBackend blocking eval round trip
+in-process stub backend reference implementation
+Rust/Python stub conformance tests
+```
+
+Does not own feature extraction, search, replay, torch/checkpoints, or
+orchestrator routing.
 
 ### `gz-eval`
 
@@ -583,6 +604,7 @@ Future compiler commands can be added after a compiler engine exists.
 gz-engine
   <- gz-engine-whittle
   <- gz-features
+      <- gz-eval-service
   <- gz-search
   <- gz-eval
       <- gz-eval-whittle

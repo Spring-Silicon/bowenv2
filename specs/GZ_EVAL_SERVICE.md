@@ -158,6 +158,16 @@ impl EvaluatorProcess {
     pub fn connect(&mut self, hello: &Hello) -> ServiceResult<ProcessBackend>;
 }
 
+impl ProcessBackend {
+    pub fn connect_stream(
+        stream: UnixStream,
+        hello: &Hello,
+        io_timeout: Duration,
+    ) -> ServiceResult<Self>;
+    pub fn ping(&mut self) -> ServiceResult<()>;
+    pub fn model_version(&self) -> ModelVersion;
+}
+
 pub struct EvaluatorProcessConfig {
     pub python: PathBuf,           // default "python3"
     pub module: String,            // default "gz.evaluator"

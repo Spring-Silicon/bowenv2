@@ -128,58 +128,67 @@ impl FeatureCollator {
         bytes: &[u8],
         action_counts: &[u32],
     ) -> FeatureResult<Vec<RowOutput>> {
-        if bytes.len() < OUTPUT_HEADER_LEN {
-            return Err(FeatureError::InvalidEncoding("output header truncated"));
-        }
-        if &bytes[0..4] != OUTPUT_MAGIC {
-            return Err(FeatureError::InvalidEncoding("bad output magic"));
-        }
-        let version = read_u32_at(bytes, 4)?;
-        if version != ENCODING_VERSION {
-            return Err(FeatureError::InvalidEncoding("unsupported output version"));
-        }
-        let row_count = read_u32_at(bytes, 8)? as usize;
-        if row_count != action_counts.len() {
-            return Err(FeatureError::InvalidEncoding("output row count mismatch"));
-        }
-        let max_actions = read_u32_at(bytes, 12)? as usize;
+        let max_actions = output_max_actions(bytes)?;
         if max_actions != self.schema.config().max_actions as usize {
             return Err(FeatureError::InvalidEncoding(
                 "output action width mismatch",
             ));
         }
-        let capacity = self.batch_capacity.get();
-        let expected_len = OUTPUT_HEADER_LEN + capacity * 4 + capacity * max_actions * 4;
-        if bytes.len() != expected_len {
+        let capacity = output_capacity(bytes, action_counts.len(), max_actions)?;
+        if capacity != self.batch_capacity.get() {
             return Err(FeatureError::InvalidEncoding("bad output length"));
         }
+        decode_outputs(bytes, action_counts)
+    }
+}
 
-        let values = OUTPUT_HEADER_LEN;
-        let policy = values + capacity * 4;
-        let mut rows = Vec::with_capacity(row_count);
-        for (row_index, &action_count) in action_counts.iter().enumerate() {
-            let action_count = action_count as usize;
-            if action_count > max_actions {
-                return Err(FeatureError::ActionOverflow {
-                    max: max_actions as u32,
-                    actual: action_count,
-                });
-            }
-            let value = read_f32_at(bytes, values + row_index * 4)?;
-            let mut policy_logits = Vec::with_capacity(action_count);
-            for action_index in 0..action_count {
-                policy_logits.push(read_f32_at(
-                    bytes,
-                    policy + (row_index * max_actions + action_index) * 4,
-                )?);
-            }
-            rows.push(RowOutput {
-                policy_logits,
-                value,
+pub fn decode_outputs(bytes: &[u8], action_counts: &[u32]) -> FeatureResult<Vec<RowOutput>> {
+    if bytes.len() < OUTPUT_HEADER_LEN {
+        return Err(FeatureError::InvalidEncoding("output header truncated"));
+    }
+    if &bytes[0..4] != OUTPUT_MAGIC {
+        return Err(FeatureError::InvalidEncoding("bad output magic"));
+    }
+    let version = read_u32_at(bytes, 4)?;
+    if version != ENCODING_VERSION {
+        return Err(FeatureError::InvalidEncoding("unsupported output version"));
+    }
+    let row_count = read_u32_at(bytes, 8)? as usize;
+    if row_count != action_counts.len() {
+        return Err(FeatureError::InvalidEncoding("output row count mismatch"));
+    }
+    let max_actions = read_u32_at(bytes, 12)? as usize;
+    let capacity = output_capacity(bytes, row_count, max_actions)?;
+    let expected_len = OUTPUT_HEADER_LEN + capacity * 4 + capacity * max_actions * 4;
+    if bytes.len() != expected_len {
+        return Err(FeatureError::InvalidEncoding("bad output length"));
+    }
+
+    let values = OUTPUT_HEADER_LEN;
+    let policy = values + capacity * 4;
+    let mut rows = Vec::with_capacity(row_count);
+    for (row_index, &action_count) in action_counts.iter().enumerate() {
+        let action_count = action_count as usize;
+        if action_count > max_actions {
+            return Err(FeatureError::ActionOverflow {
+                max: max_actions as u32,
+                actual: action_count,
             });
         }
-        Ok(rows)
+        let value = read_f32_at(bytes, values + row_index * 4)?;
+        let mut policy_logits = Vec::with_capacity(action_count);
+        for action_index in 0..action_count {
+            policy_logits.push(read_f32_at(
+                bytes,
+                policy + (row_index * max_actions + action_index) * 4,
+            )?);
+        }
+        rows.push(RowOutput {
+            policy_logits,
+            value,
+        });
     }
+    Ok(rows)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -473,4 +482,28 @@ fn read_position_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult
         ]);
     }
     Ok(out)
+}
+
+fn output_max_actions(bytes: &[u8]) -> FeatureResult<usize> {
+    read_u32_at(bytes, 12).map(|value| value as usize)
+}
+
+fn output_capacity(bytes: &[u8], row_count: usize, max_actions: usize) -> FeatureResult<usize> {
+    let body_len = bytes
+        .len()
+        .checked_sub(OUTPUT_HEADER_LEN)
+        .ok_or(FeatureError::InvalidEncoding("output header truncated"))?;
+    let row_width = (1 + max_actions)
+        .checked_mul(4)
+        .ok_or(FeatureError::InvalidEncoding("output length overflow"))?;
+    if max_actions == 0 || row_width == 0 || body_len % row_width != 0 {
+        return Err(FeatureError::InvalidEncoding("bad output length"));
+    }
+    let capacity = body_len / row_width;
+    if row_count > capacity {
+        return Err(FeatureError::InvalidEncoding(
+            "output row count exceeds capacity",
+        ));
+    }
+    Ok(capacity)
 }

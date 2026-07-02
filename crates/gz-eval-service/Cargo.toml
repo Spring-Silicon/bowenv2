@@ -1,0 +1,8 @@
+[package]
+name = "gz-eval-service"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gz-engine = { path = "../gz-engine" }
+gz-features = { path = "../gz-features" }
