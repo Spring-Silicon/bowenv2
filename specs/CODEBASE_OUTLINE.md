@@ -68,8 +68,9 @@ graphzero/
   python/
     pyproject.toml
     gz/
-      common/ proto/ codec/ model/ checkpoints/ evaluator/ trainer/
+      common/ proto/ codec/ model/ evaluator/
     tests/
+    benches/
   configs/
   specs/
   tests/
@@ -491,15 +492,15 @@ Rust selfplay/orchestrator process
   appends measured rows to replay
 
 Python evaluator process
-  loads current PyTorch/Exphormer checkpoint
-  receives batched leaf eval requests
-  returns policy/value/reward with ModelVersion
-  hot-swaps model versions after trainer publishes checkpoints
+  receives batched leaf eval requests over the GZ eval protocol
+  decodes GZFB batches through python/gz/codec
+  serves the deterministic numpy stub today
+  later loads current PyTorch/Exphormer checkpoints and hot-swaps versions
 
 Python trainer process
-  requests batches from Rust ReplaySampleService
-  runs optimizer steps
-  publishes versioned checkpoints
+  pending
+  will request batches from Rust ReplaySampleService
+  will run optimizer steps and publish versioned checkpoints
 
 Replay/checkpoint storage
   stores measured rows, sampling indexes, and model artifacts
