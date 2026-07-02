@@ -56,7 +56,7 @@ where
                     context,
                     next_episode_id: &mut next_episode_id,
                 };
-                roots_exhausted = pool.admit(&mut self.engine, roots, &mut admission)?;
+                roots_exhausted = pool.admit(&mut self.engine, roots, &mut admission)?.1;
             }
 
             episodes.extend(pool.drive(&mut self.engine, "batched driver blocked")?);

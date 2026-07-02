@@ -20,7 +20,8 @@ pub use bench::{
 };
 pub use ids::{EpisodeId, WorkerId};
 pub use lanes::{
-    LaneEpisodes, ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig, ThreadedRun,
+    LaneEpisodes, ReplayBackpressure, ReplayRuntime, ThreadedGumbelOrchestrator,
+    ThreadedOrchestratorConfig, ThreadedReplayRun, ThreadedRun,
 };
 pub use root::{CountedRoots, RootSource};
 pub use serial::{OrchestratedEpisode, SerialEpisode, SerialGumbelOrchestrator};

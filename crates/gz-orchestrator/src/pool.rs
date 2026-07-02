@@ -103,22 +103,25 @@ where
         engine: &mut E,
         roots: &mut R,
         admission: &mut Admission<'_>,
-    ) -> EngineResult<bool>
+    ) -> EngineResult<(Vec<(EpisodeId, G)>, bool)>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
         R: RootSource<E>,
     {
+        let mut admitted = Vec::new();
+
         for slot in &mut self.slots {
             if !matches!(slot.state, SlotState::Idle) {
                 continue;
             }
 
             let Some(root) = roots.next_root(engine)? else {
-                return Ok(true);
+                return Ok((admitted, true));
             };
 
             let episode_id = EpisodeId::new(*admission.next_episode_id);
             *admission.next_episode_id += 1;
+            admitted.push((episode_id, root));
             slot.state = SlotState::Running(ActiveEpisode {
                 task: GumbelEpisodeTask::new(
                     admission.search,
@@ -130,7 +133,7 @@ where
             });
         }
 
-        Ok(false)
+        Ok((admitted, false))
     }
 
     pub(crate) fn drive<E>(
