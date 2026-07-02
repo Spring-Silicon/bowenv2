@@ -43,12 +43,24 @@ def read_frame(sock: socket.socket, buf: bytearray) -> tuple[int, memoryview]:
 
 
 def write_frame(sock: socket.socket, frame_type: int, *parts: bytes | memoryview) -> None:
+    out = bytearray()
+    write_frame_into(sock, out, frame_type, *parts)
+
+
+def write_frame_into(
+    sock: socket.socket,
+    out: bytearray,
+    frame_type: int,
+    *parts: bytes | memoryview,
+) -> None:
     if frame_type not in _KNOWN_TYPES:
         raise ProtocolError(ERROR_PROTOCOL, "unknown frame type")
     body_len = 1 + sum(len(part) for part in parts)
     if body_len > MAX_FRAME:
         raise ProtocolError(ERROR_PROTOCOL, "frame exceeds maximum size")
-    out = bytearray(4 + body_len)
+    frame_len = 4 + body_len
+    if len(out) < frame_len:
+        out.extend(b"\x00" * (frame_len - len(out)))
     struct.pack_into("<I", out, 0, body_len)
     out[4] = frame_type
     cursor = 5
@@ -56,7 +68,7 @@ def write_frame(sock: socket.socket, frame_type: int, *parts: bytes | memoryview
         part_len = len(part)
         out[cursor : cursor + part_len] = part
         cursor += part_len
-    sock.sendall(out)
+    sock.sendall(memoryview(out)[:frame_len])
 
 
 def _read_exact(sock: socket.socket, buf: bytearray, size: int) -> None:

@@ -32,7 +32,7 @@ from gz.proto import (
     ProtocolError,
     encode_error,
     read_frame,
-    write_frame,
+    write_frame_into,
 )
 
 
@@ -66,28 +66,29 @@ def serve(socket_path: str | Path, backend: StubBackend, *, ready_event: Event |
 
 
 def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
-    buf = bytearray()
+    read_buf = bytearray()
+    write_buf = bytearray()
     try:
-        state = _handshake(conn, buf)
+        state = _handshake(conn, read_buf, write_buf)
         while True:
-            frame_type, payload = read_frame(conn, buf)
+            frame_type, payload = read_frame(conn, read_buf)
             try:
                 if frame_type == FRAME_PING:
-                    _handle_ping(conn, payload)
+                    _handle_ping(conn, write_buf, payload)
                 elif frame_type == FRAME_EVAL:
-                    _handle_eval(conn, backend, state, payload)
+                    _handle_eval(conn, write_buf, backend, state, payload)
                 else:
                     raise ProtocolError(ERROR_PROTOCOL, "unexpected frame type")
             finally:
                 del payload
     except ProtocolError as error:
-        _send_error(conn, error.code, error.message)
+        _send_error(conn, write_buf, error.code, error.message)
     except EncodingError as error:
-        _send_error(conn, ERROR_ENCODING, str(error))
+        _send_error(conn, write_buf, ERROR_ENCODING, str(error))
 
 
-def _handshake(conn: socket.socket, buf: bytearray) -> _ConnectionState:
-    frame_type, payload = read_frame(conn, buf)
+def _handshake(conn: socket.socket, read_buf: bytearray, write_buf: bytearray) -> _ConnectionState:
+    frame_type, payload = read_frame(conn, read_buf)
     if frame_type != FRAME_HELLO:
         raise ProtocolError(ERROR_PROTOCOL, "expected HELLO")
     hello = Hello.decode(payload)
@@ -97,8 +98,9 @@ def _handshake(conn: socket.socket, buf: bytearray) -> _ConnectionState:
         raise ProtocolError(ERROR_ENCODING, "encoding version mismatch")
     if hello.batch_capacity == 0:
         raise ProtocolError(ERROR_CAPACITY, "zero batch capacity")
-    write_frame(
+    write_frame_into(
         conn,
+        write_buf,
         FRAME_HELLO_ACK,
         HelloAck(PROTOCOL_VERSION, STUB_MODEL_VERSION).encode(),
     )
@@ -111,14 +113,15 @@ def _handshake(conn: socket.socket, buf: bytearray) -> _ConnectionState:
     )
 
 
-def _handle_ping(conn: socket.socket, payload: memoryview) -> None:
+def _handle_ping(conn: socket.socket, write_buf: bytearray, payload: memoryview) -> None:
     if len(payload) != 8:
         raise ProtocolError(ERROR_MALFORMED, "bad PING length")
-    write_frame(conn, FRAME_PONG, payload)
+    write_frame_into(conn, write_buf, FRAME_PONG, payload)
 
 
 def _handle_eval(
     conn: socket.socket,
+    write_buf: bytearray,
     backend: StubBackend,
     state: _ConnectionState,
     payload: memoryview,
@@ -135,8 +138,9 @@ def _handle_eval(
     if batch.batch_capacity != state.batch_capacity:
         raise ProtocolError(ERROR_CAPACITY, "batch capacity mismatch")
     result = backend.eval(batch)
-    write_frame(
+    write_frame_into(
         conn,
+        write_buf,
         FRAME_EVAL_RESULT,
         struct.pack("<Q", batch_id),
         bytes(result.model_version),
@@ -144,8 +148,8 @@ def _handle_eval(
     )
 
 
-def _send_error(conn: socket.socket, code: int, message: str) -> None:
+def _send_error(conn: socket.socket, write_buf: bytearray, code: int, message: str) -> None:
     try:
-        write_frame(conn, FRAME_ERROR, encode_error(code, message))
+        write_frame_into(conn, write_buf, FRAME_ERROR, encode_error(code, message))
     except OSError:
         pass

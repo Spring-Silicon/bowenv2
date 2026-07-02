@@ -21,6 +21,7 @@ from gz.proto.frames import (
     PROTOCOL_VERSION,
     read_frame,
     write_frame,
+    write_frame_into,
 )
 from gz.proto.hello import Hello, HelloAck
 
@@ -47,4 +48,5 @@ __all__ = [
     "encode_error",
     "read_frame",
     "write_frame",
+    "write_frame_into",
 ]
