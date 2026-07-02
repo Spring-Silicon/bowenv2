@@ -1,0 +1,16 @@
+[package]
+name = "gz-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "graphzero"
+path = "src/main.rs"
+
+[dependencies]
+gz-engine = { path = "../gz-engine" }
+gz-engine-whittle = { path = "../gz-engine-whittle" }
+gz-eval = { path = "../gz-eval" }
+gz-orchestrator = { path = "../gz-orchestrator" }
+gz-replay = { path = "../gz-replay" }
+gz-search = { path = "../gz-search" }
