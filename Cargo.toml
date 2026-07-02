@@ -6,6 +6,7 @@ members = [
     "crates/gz-eval",
     "crates/gz-eval-whittle",
     "crates/gz-orchestrator",
+    "crates/gz-replay",
 ]
 resolver = "3"
 

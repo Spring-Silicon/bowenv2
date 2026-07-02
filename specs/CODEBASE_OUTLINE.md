@@ -34,7 +34,9 @@ Compiler backend: future work
 3. Candidate semantics are engine-owned; search never assumes site/family shape.
 4. Feature extraction is separate from the engine.
 5. Measurement is part of GraphEngine.
-6. Rows enter replay only after measurement succeeds or fails explicitly.
+6. Episodes enter replay only after their final graph measurement succeeds;
+   rows inherit episode admission. Row graphs are never individually
+   measured.
 7. Replay stores portable graph/action contexts, not process-local handles.
 8. Whittle is the first concrete adapter; add a fake adapter later only when it
    materially simplifies search/orchestration tests.
@@ -355,6 +357,8 @@ gz-engine-whittle
 
 Durable measured-row store.
 
+`GZ_REPLAY.md` owns the detailed crate contract.
+
 Storage decision:
 
 ```text
@@ -373,19 +377,24 @@ durable enough for long runs
 lower overhead than SQLite for high-volume row blobs
 ```
 
-Rows enter replay only after `GraphEngine::measure` returns a `MeasureResult`
-for the row graph.
+Episodes enter replay only after `GraphEngine::measure` returns a valid
+`MeasureResult` for the episode's final graph. Rows are per-step and inherit
+episode admission; labels are episode-level win/loss outcomes from comparing
+the learner's final measured reward against a reference (opponent trajectory
+final or root baseline). One expensive measurement per episode.
 
 ```rust
 pub struct ReplayRow {
+    pub step_index: u32,
     pub root: ReplayGraphContext,
-    pub measured_graph: ReplayGraphContext,
+    pub state: ReplayGraphContext,
     pub action_history: Vec<PortableSearchActionRef>,
     pub legal_actions: Vec<PortableSearchActionRef>,
-    pub policy_target: Vec<(PortableSearchActionRef, f32)>,
+    pub policy_target: Vec<f32>,
+    pub selected_action: PortableSearchActionRef,
     pub value_target: Option<f32>,
     pub reward_target: Option<f32>,
-    pub measurement: MeasureSummary,
+    pub final_measure: MeasureSummary,
     pub model_version: Option<ModelVersion>,
     pub search_config_hash: SearchConfigHash,
 }
@@ -614,8 +623,9 @@ actor model staleness policy
 
 ## Remaining Design Questions
 
-1. Should RocksDB keys be episode-major or graph-hash-major first?
-2. Should feature caches live inside `FeatureExtractor` only, or can
+1. Should feature caches live inside `FeatureExtractor` only, or can
    `Orchestrator` own shared cross-actor feature caches?
-3. What should the fake engine model: tree game, DAG rewrite game, or tiny
+2. What should the fake engine model: tree game, DAG rewrite game, or tiny
    Whittle-like domain?
+
+RocksDB key layout is decided: episode-major (`GZ_REPLAY.md`).
