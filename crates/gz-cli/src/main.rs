@@ -13,7 +13,7 @@ fn main() {
     let result = match command.as_str() {
         "selfplay" => parse_selfplay(args.collect()).and_then(run).map(|summary| {
             println!(
-                "episodes appended={} dropped={} rows={} labels win/loss/tie={}/{}/{} eval_batches={} mean_batch={:.3} counters produced={} consumed={}",
+                "episodes appended={} dropped={} rows={} labels win/loss/tie={}/{}/{} eval_batches={} mean_batch={:.3} evaluator={} model_version={} counters produced={} consumed={}",
                 summary.episodes_appended,
                 summary.episodes_dropped,
                 summary.rows_produced,
@@ -22,6 +22,10 @@ fn main() {
                 summary.ties,
                 summary.eval_batch_count,
                 summary.mean_eval_batch_size,
+                summary.evaluator.as_str(),
+                summary
+                    .model_version
+                    .map_or_else(|| "-".to_owned(), |version| version.to_string()),
                 summary.counters.produced_rows,
                 summary.counters.consumed_rows,
             );
@@ -55,6 +59,8 @@ fn parse_selfplay(args: Vec<String>) -> Result<SelfplayConfig, String> {
             "--lanes" => config.lanes = parse_usize(flag, value)?,
             "--workers-per-lane" => config.workers_per_lane = parse_usize(flag, value)?,
             "--reference" => config.reference = value.parse()?,
+            "--evaluator" => config.evaluator = value.parse()?,
+            "--python-dir" => config.python_dir = Some(PathBuf::from(value)),
             "--seed" => config.seed = parse_u64(flag, value)?,
             "--max-steps" => config.max_steps = parse_usize(flag, value)?,
             "--simulations" => config.simulations = parse_usize(flag, value)?,
@@ -81,5 +87,5 @@ fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]"
+    "usage: graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--evaluator random|stub|process-stub] [--python-dir PATH] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]"
 }

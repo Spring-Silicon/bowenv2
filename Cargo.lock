@@ -228,6 +228,8 @@ dependencies = [
  "gz-engine",
  "gz-engine-whittle",
  "gz-eval",
+ "gz-eval-service",
+ "gz-features",
  "gz-orchestrator",
  "gz-replay",
  "gz-search",
@@ -294,7 +296,9 @@ dependencies = [
  "gz-engine",
  "gz-engine-whittle",
  "gz-eval",
+ "gz-eval-service",
  "gz-eval-whittle",
+ "gz-features",
  "gz-replay",
  "gz-search",
 ]

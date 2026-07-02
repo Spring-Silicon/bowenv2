@@ -4,6 +4,7 @@ use crate::service::{internal, service_engine_work};
 use crate::{EpisodeId, WorkerId};
 use gz_engine::{EngineResult, GraphEngine};
 use gz_eval::{EvalOutput, EvalRequest};
+use gz_features::{FeatureExtractor, FeatureRow, PositionFeatures};
 use gz_search::{
     EngineIdentity, GumbelEpisodeTask, GumbelMcts, SearchPoll, SearchWork, SearchWorkResult,
     WorkToken,
@@ -19,6 +20,8 @@ pub(crate) struct ParkedEval {
     pub slot: usize,
     pub token: WorkToken,
     pub request: EvalRequest,
+    pub row: Option<FeatureRow>,
+    pub action_count: u32,
 }
 
 pub(crate) struct Admission<'a> {
@@ -46,6 +49,8 @@ enum SlotState<G, C> {
         episode: ActiveEpisode<G, C>,
         token: WorkToken,
         request: EvalRequest,
+        row: Option<FeatureRow>,
+        action_count: u32,
         sent: bool,
     },
 }
@@ -140,6 +145,7 @@ where
         &mut self,
         engine: &mut E,
         blocked_message: &'static str,
+        mut extractor: Option<&mut dyn FeatureExtractor<E>>,
     ) -> EngineResult<Vec<OrchestratedEpisode<G, C>>>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
@@ -160,10 +166,25 @@ where
                         let SearchWork::Eval(work) = work else {
                             return Err(internal("unsupported search work"));
                         };
+                        let action_count = u32::try_from(work.request.actions.len())
+                            .map_err(|_| internal("action count overflow"))?;
+                        let row = match extractor.as_deref_mut() {
+                            Some(extractor) => {
+                                let position = position_features(work.request.position);
+                                Some(
+                                    extractor
+                                        .extract(engine, work.graph, &work.candidates, position)
+                                        .map_err(|_| internal("feature extraction failed"))?,
+                                )
+                            }
+                            None => None,
+                        };
                         slot.state = SlotState::Parked {
                             episode,
                             token,
                             request: work.request,
+                            row,
+                            action_count,
                             sent: false,
                         };
                     }
@@ -190,10 +211,18 @@ where
             .iter()
             .enumerate()
             .filter_map(|(index, slot)| match &slot.state {
-                SlotState::Parked { token, request, .. } => Some(ParkedEval {
+                SlotState::Parked {
+                    token,
+                    request,
+                    row,
+                    action_count,
+                    ..
+                } => Some(ParkedEval {
                     slot: index,
                     token: *token,
                     request: request.clone(),
+                    row: row.clone(),
+                    action_count: *action_count,
                 }),
                 _ => None,
             })
@@ -208,6 +237,8 @@ where
                 SlotState::Parked {
                     token,
                     request,
+                    row,
+                    action_count,
                     sent,
                     ..
                 } if !*sent => {
@@ -216,6 +247,8 @@ where
                         slot: index,
                         token: *token,
                         request: request.clone(),
+                        row: row.clone(),
+                        action_count: *action_count,
                     })
                 }
                 _ => None,
@@ -264,5 +297,14 @@ where
 
     pub(crate) fn active(&self) -> bool {
         self.has_running() || self.has_parked()
+    }
+}
+
+const fn position_features(position: gz_eval::EvalPositionContext) -> PositionFeatures {
+    PositionFeatures {
+        root_step: position.root_step,
+        leaf_depth: position.leaf_depth,
+        budget_fraction: position.budget_fraction,
+        budget_step: position.budget_step,
     }
 }

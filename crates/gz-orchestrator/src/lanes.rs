@@ -7,6 +7,10 @@ use crate::serial::OrchestratedEpisode;
 use crate::service::internal;
 use gz_engine::{EngineResult, GraphEngine};
 use gz_eval::{EvalOutput, EvalRequest, Evaluator, eval_error_to_engine_error, validate_outputs};
+use gz_eval_service::{BackendOutputs, FeatureEvalBackend};
+use gz_features::{
+    FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaHash,
+};
 use gz_replay::{ReplayEpisodeRecord, ReplayError, ReplayRow, ReplayStore};
 use gz_search::{EngineIdentity, GumbelEpisodeContext, GumbelMcts, WorkToken};
 use std::collections::HashMap;
@@ -47,6 +51,11 @@ pub struct ReplayRuntime<'a, P> {
     pub backpressure: Option<ReplayBackpressure>,
 }
 
+pub struct FeaturizedRuntime<X, B> {
+    pub extractors: Vec<X>,
+    pub backend: B,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayBackpressure {
     pub max_row_backlog: NonZeroU64,
@@ -65,6 +74,14 @@ struct EvalJob {
     slot: usize,
     token: WorkToken,
     request: EvalRequest,
+}
+
+struct FeaturizedEvalJob {
+    lane: usize,
+    slot: usize,
+    token: WorkToken,
+    row: FeatureRow,
+    action_count: u32,
 }
 
 struct EvalReply {
@@ -111,6 +128,7 @@ where
         if root_sources.len() != lanes {
             return Err(internal("lane count mismatch"));
         }
+        validate_engine_identities(&self.engines)?;
 
         let workers_per_lane = self.config.workers_per_lane.get();
         let intake_capacity = lanes * workers_per_lane;
@@ -203,6 +221,7 @@ where
         if root_sources.len() != lanes || replay.providers.len() != lanes {
             return Err(internal("lane count mismatch"));
         }
+        validate_engine_identities(&self.engines)?;
 
         let workers_per_lane = self.config.workers_per_lane.get();
         let intake_capacity = lanes * workers_per_lane;
@@ -298,6 +317,234 @@ where
             episodes_dropped,
         })
     }
+
+    pub fn run_featurized<R, X, B>(
+        self,
+        root_sources: Vec<R>,
+        context: GumbelEpisodeContext,
+        featurized: FeaturizedRuntime<X, B>,
+    ) -> EngineResult<ThreadedRun<E::Graph, E::Candidate>>
+    where
+        R: RootSource<E> + Send,
+        X: FeatureExtractor<E> + Send,
+        B: FeatureEvalBackend + Send,
+    {
+        let lanes = self.engines.len();
+        if root_sources.len() != lanes || featurized.extractors.len() != lanes {
+            return Err(internal("lane count mismatch"));
+        }
+        validate_engine_identities(&self.engines)?;
+        let schema_hash = validate_feature_schemas::<E, X>(&featurized.extractors)?;
+
+        let workers_per_lane = self.config.workers_per_lane.get();
+        let intake_capacity = lanes * workers_per_lane;
+        let (intake_tx, intake_rx) = sync_channel(intake_capacity);
+        let mut reply_txs = Vec::with_capacity(lanes);
+        let mut reply_rxs = Vec::with_capacity(lanes);
+
+        for _ in 0..lanes {
+            let (tx, rx) = sync_channel(workers_per_lane);
+            reply_txs.push(tx);
+            reply_rxs.push(rx);
+        }
+
+        let config = self.config;
+        let search = &self.search;
+        let backend = featurized.backend;
+        let extractors = featurized.extractors;
+        let engines = self.engines;
+        let collator = FeatureCollator::new(
+            first_schema::<E, X>(&extractors, schema_hash)?,
+            config.max_batch,
+        );
+        validate_collator_capacity(&collator, config)?;
+        let _ = self.evaluator;
+
+        let (batch_result, lane_results) = std::thread::scope(|scope| {
+            let batch_handle = scope.spawn(move || {
+                run_featurized_batcher(backend, collator, intake_rx, reply_txs, config)
+            });
+            let mut lane_handles = Vec::with_capacity(lanes);
+
+            for (lane, (((engine, roots), extractor), reply_rx)) in engines
+                .into_iter()
+                .zip(root_sources)
+                .zip(extractors)
+                .zip(reply_rxs)
+                .enumerate()
+            {
+                let intake_tx = intake_tx.clone();
+                lane_handles.push(scope.spawn(move || {
+                    run_featurized_lane(
+                        engine,
+                        roots,
+                        extractor,
+                        FeaturizedLaneRuntime {
+                            lane,
+                            search,
+                            workers_per_lane: config.workers_per_lane,
+                            context,
+                            intake_tx,
+                            reply_rx,
+                        },
+                    )
+                }));
+            }
+
+            drop(intake_tx);
+
+            let lane_results = lane_handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(internal("worker blocked")))
+                })
+                .collect::<Vec<_>>();
+            let batch_result = batch_handle
+                .join()
+                .unwrap_or_else(|_| Err(internal("eval backend unavailable")));
+
+            (batch_result, lane_results)
+        });
+
+        let batch_sizes = batch_result?;
+        let mut lanes = Vec::with_capacity(lane_results.len());
+
+        for result in lane_results {
+            lanes.push(result?);
+        }
+
+        Ok(ThreadedRun { lanes, batch_sizes })
+    }
+
+    pub fn run_featurized_with_replay<R, X, B, P>(
+        self,
+        root_sources: Vec<R>,
+        context: GumbelEpisodeContext,
+        featurized: FeaturizedRuntime<X, B>,
+        replay: ReplayRuntime<'_, P>,
+    ) -> EngineResult<ThreadedReplayRun<E::Graph, E::Candidate>>
+    where
+        R: RootSource<E> + Send,
+        X: FeatureExtractor<E> + Send,
+        B: FeatureEvalBackend + Send,
+        P: ReferenceProvider<E> + Send,
+    {
+        let lanes = self.engines.len();
+        if root_sources.len() != lanes
+            || featurized.extractors.len() != lanes
+            || replay.providers.len() != lanes
+        {
+            return Err(internal("lane count mismatch"));
+        }
+        validate_engine_identities(&self.engines)?;
+        let schema_hash = validate_feature_schemas::<E, X>(&featurized.extractors)?;
+
+        let workers_per_lane = self.config.workers_per_lane.get();
+        let intake_capacity = lanes * workers_per_lane;
+        let (intake_tx, intake_rx) = sync_channel(intake_capacity);
+        let (replay_tx, replay_rx) = sync_channel(intake_capacity);
+        let mut reply_txs = Vec::with_capacity(lanes);
+        let mut reply_rxs = Vec::with_capacity(lanes);
+
+        for _ in 0..lanes {
+            let (tx, rx) = sync_channel(workers_per_lane);
+            reply_txs.push(tx);
+            reply_rxs.push(rx);
+        }
+
+        let config = self.config;
+        let search = &self.search;
+        let backend = featurized.backend;
+        let extractors = featurized.extractors;
+        let engines = self.engines;
+        let providers = replay.providers;
+        let store = replay.store;
+        let backpressure = replay.backpressure;
+        let collator = FeatureCollator::new(
+            first_schema::<E, X>(&extractors, schema_hash)?,
+            config.max_batch,
+        );
+        validate_collator_capacity(&collator, config)?;
+        let _ = self.evaluator;
+
+        let (batch_result, sink_result, lane_results) = std::thread::scope(|scope| {
+            let batch_handle = scope.spawn(move || {
+                run_featurized_batcher(backend, collator, intake_rx, reply_txs, config)
+            });
+            let sink_handle = scope.spawn(move || run_replay_sink(store, replay_rx));
+            let mut lane_handles = Vec::with_capacity(lanes);
+
+            for (lane, ((((engine, roots), extractor), provider), reply_rx)) in engines
+                .into_iter()
+                .zip(root_sources)
+                .zip(extractors)
+                .zip(providers)
+                .zip(reply_rxs)
+                .enumerate()
+            {
+                let intake_tx = intake_tx.clone();
+                let replay_tx = replay_tx.clone();
+                lane_handles.push(scope.spawn(move || {
+                    run_featurized_lane_with_replay(
+                        engine,
+                        roots,
+                        extractor,
+                        provider,
+                        FeaturizedReplayLaneRuntime {
+                            lane,
+                            search,
+                            workers_per_lane: config.workers_per_lane,
+                            context,
+                            intake_tx,
+                            reply_rx,
+                            replay_tx,
+                            store,
+                            backpressure,
+                        },
+                    )
+                }));
+            }
+
+            drop(intake_tx);
+            drop(replay_tx);
+
+            let lane_results = lane_handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(internal("worker blocked")))
+                })
+                .collect::<Vec<_>>();
+            let batch_result = batch_handle
+                .join()
+                .unwrap_or_else(|_| Err(internal("eval backend unavailable")));
+            let sink_result = sink_handle
+                .join()
+                .unwrap_or_else(|_| Err(internal("replay sink failed")));
+
+            (batch_result, sink_result, lane_results)
+        });
+
+        let batch_sizes = batch_result?;
+        let episodes_appended = sink_result?;
+        let mut lanes = Vec::with_capacity(lane_results.len());
+        let mut episodes_dropped = 0;
+
+        for result in lane_results {
+            let result = result?;
+            episodes_dropped += result.episodes_dropped;
+            lanes.push(result.lane);
+        }
+
+        Ok(ThreadedReplayRun {
+            run: ThreadedRun { lanes, batch_sizes },
+            episodes_appended,
+            episodes_dropped,
+        })
+    }
 }
 
 struct LaneRuntime<'a> {
@@ -315,6 +562,27 @@ struct ReplayLaneRuntime<'a> {
     workers_per_lane: NonZeroUsize,
     context: GumbelEpisodeContext,
     intake_tx: SyncSender<EvalJob>,
+    reply_rx: Receiver<EvalReply>,
+    replay_tx: SyncSender<ReplayJob>,
+    store: &'a ReplayStore,
+    backpressure: Option<ReplayBackpressure>,
+}
+
+struct FeaturizedLaneRuntime<'a> {
+    lane: usize,
+    search: &'a GumbelMcts,
+    workers_per_lane: NonZeroUsize,
+    context: GumbelEpisodeContext,
+    intake_tx: SyncSender<FeaturizedEvalJob>,
+    reply_rx: Receiver<EvalReply>,
+}
+
+struct FeaturizedReplayLaneRuntime<'a> {
+    lane: usize,
+    search: &'a GumbelMcts,
+    workers_per_lane: NonZeroUsize,
+    context: GumbelEpisodeContext,
+    intake_tx: SyncSender<FeaturizedEvalJob>,
     reply_rx: Receiver<EvalReply>,
     replay_tx: SyncSender<ReplayJob>,
     store: &'a ReplayStore,
@@ -353,7 +621,7 @@ where
             roots_exhausted = pool.admit(&mut engine, &mut roots, &mut admission)?.1;
         }
 
-        episodes.extend(pool.drive(&mut engine, "worker blocked")?);
+        episodes.extend(pool.drive(&mut engine, "worker blocked", None)?);
 
         for parked in pool.take_unsent_parked() {
             runtime
@@ -440,7 +708,7 @@ where
             }
         }
 
-        for completed in pool.drive(&mut engine, "worker blocked")? {
+        for completed in pool.drive(&mut engine, "worker blocked", None)? {
             let reference = references
                 .remove(&completed.episode_id)
                 .ok_or_else(|| internal("missing replay reference"))?;
@@ -495,6 +763,176 @@ where
                     }
                 }
             }
+        }
+    }
+}
+
+fn run_featurized_lane<E, R, X>(
+    mut engine: E,
+    mut roots: R,
+    mut extractor: X,
+    runtime: FeaturizedLaneRuntime<'_>,
+) -> EngineResult<LaneEpisodes<E::Graph, E::Candidate>>
+where
+    E: GraphEngine,
+    R: RootSource<E>,
+    X: FeatureExtractor<E>,
+{
+    let identity = EngineIdentity::from_engine(&engine);
+    let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
+    let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
+    let mut episodes = Vec::new();
+    let mut roots_exhausted = false;
+    let mut next_episode_id = (runtime.lane as u64) << 32;
+
+    loop {
+        if !roots_exhausted {
+            let mut admission = Admission {
+                search: runtime.search,
+                identity,
+                context: runtime.context,
+                next_episode_id: &mut next_episode_id,
+            };
+            roots_exhausted = pool.admit(&mut engine, &mut roots, &mut admission)?.1;
+        }
+
+        episodes.extend(pool.drive(&mut engine, "worker blocked", Some(&mut extractor))?);
+        send_featurized_parked(runtime.lane, &mut pool, &runtime.intake_tx)?;
+
+        if roots_exhausted && !pool.active() {
+            return Ok(LaneEpisodes {
+                lane: runtime.lane,
+                episodes,
+            });
+        }
+
+        if pool.has_parked() {
+            receive_replies(&mut pool, &runtime.reply_rx)?;
+        }
+    }
+}
+
+fn run_featurized_lane_with_replay<E, R, X, P>(
+    mut engine: E,
+    mut roots: R,
+    mut extractor: X,
+    mut provider: P,
+    runtime: FeaturizedReplayLaneRuntime<'_>,
+) -> EngineResult<ReplayLaneResult<E::Graph, E::Candidate>>
+where
+    E: GraphEngine,
+    R: RootSource<E>,
+    X: FeatureExtractor<E>,
+    P: ReferenceProvider<E>,
+{
+    let identity = EngineIdentity::from_engine(&engine);
+    let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
+    let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
+    let mut episodes = Vec::new();
+    let mut references = HashMap::<EpisodeId, Option<Reference<E::Graph>>>::new();
+    let mut roots_exhausted = false;
+    let mut next_episode_id = (runtime.lane as u64) << 32;
+    let mut episodes_dropped = 0;
+
+    loop {
+        if !roots_exhausted {
+            if replay_gate_open(runtime.store, runtime.backpressure) {
+                let mut admission = Admission {
+                    search: runtime.search,
+                    identity,
+                    context: runtime.context,
+                    next_episode_id: &mut next_episode_id,
+                };
+                let (admitted, exhausted) = pool.admit(&mut engine, &mut roots, &mut admission)?;
+                roots_exhausted = exhausted;
+
+                for (episode_id, root) in admitted {
+                    references.insert(episode_id, provider.reference(&mut engine, root)?);
+                }
+            } else if !pool.active()
+                && let Some(backpressure) = runtime.backpressure
+            {
+                std::thread::sleep(backpressure.gate_poll);
+            }
+        }
+
+        for completed in pool.drive(&mut engine, "worker blocked", Some(&mut extractor))? {
+            let reference = references
+                .remove(&completed.episode_id)
+                .ok_or_else(|| internal("missing replay reference"))?;
+
+            if let Some((record, rows)) = project_episode(&completed.episode, reference.as_ref()) {
+                runtime
+                    .replay_tx
+                    .send(ReplayJob { record, rows })
+                    .map_err(|_| internal("replay sink failed"))?;
+            } else {
+                episodes_dropped += 1;
+            }
+
+            episodes.push(completed);
+        }
+
+        send_featurized_parked(runtime.lane, &mut pool, &runtime.intake_tx)?;
+
+        if roots_exhausted && !pool.active() {
+            return Ok(ReplayLaneResult {
+                lane: LaneEpisodes {
+                    lane: runtime.lane,
+                    episodes,
+                },
+                episodes_dropped,
+            });
+        }
+
+        if pool.has_parked() {
+            receive_replies(&mut pool, &runtime.reply_rx)?;
+        }
+    }
+}
+
+fn send_featurized_parked<G, C>(
+    lane: usize,
+    pool: &mut WorkerPool<G, C>,
+    intake_tx: &SyncSender<FeaturizedEvalJob>,
+) -> EngineResult<()>
+where
+    G: Copy,
+    C: Copy,
+{
+    for parked in pool.take_unsent_parked() {
+        let row = parked.row.ok_or_else(|| internal("missing feature row"))?;
+        intake_tx
+            .send(FeaturizedEvalJob {
+                lane,
+                slot: parked.slot,
+                token: parked.token,
+                row,
+                action_count: parked.action_count,
+            })
+            .map_err(|_| internal("eval backend unavailable"))?;
+    }
+    Ok(())
+}
+
+fn receive_replies<G, C>(
+    pool: &mut WorkerPool<G, C>,
+    reply_rx: &Receiver<EvalReply>,
+) -> EngineResult<()>
+where
+    G: Copy,
+    C: Copy,
+{
+    let reply = reply_rx
+        .recv()
+        .map_err(|_| internal("eval backend unavailable"))?;
+    pool.resume(reply.slot, reply.token, reply.output)?;
+
+    loop {
+        match reply_rx.try_recv() {
+            Ok(reply) => pool.resume(reply.slot, reply.token, reply.output)?,
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => return Err(internal("eval backend unavailable")),
         }
     }
 }
@@ -560,6 +998,88 @@ where
     }
 }
 
+fn run_featurized_batcher<B>(
+    mut backend: B,
+    mut collator: FeatureCollator,
+    intake_rx: Receiver<FeaturizedEvalJob>,
+    reply_txs: Vec<SyncSender<EvalReply>>,
+    config: ThreadedOrchestratorConfig,
+) -> EngineResult<Vec<usize>>
+where
+    B: FeatureEvalBackend,
+{
+    let mut batch_sizes = Vec::new();
+    let mut batch = Vec::with_capacity(config.max_batch.get());
+    let mut routing = Vec::with_capacity(config.max_batch.get());
+    let mut rows = Vec::with_capacity(config.max_batch.get());
+    let mut action_counts = Vec::with_capacity(config.max_batch.get());
+    let mut bytes = Vec::new();
+
+    loop {
+        let first = match intake_rx.recv() {
+            Ok(job) => job,
+            Err(_) => return Ok(batch_sizes),
+        };
+        batch.clear();
+        batch.push(first);
+        let deadline = Instant::now() + config.flush_after;
+
+        while batch.len() < config.max_batch.get() {
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            match intake_rx.recv_timeout(remaining) {
+                Ok(job) => batch.push(job),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        routing.clear();
+        rows.clear();
+        action_counts.clear();
+        for job in batch.drain(..) {
+            routing.push((job.lane, job.slot, job.token, job.action_count));
+            action_counts.push(job.action_count);
+            rows.push(job.row);
+        }
+
+        collator
+            .collate_into(&rows, &mut bytes)
+            .map_err(|_| internal("feature collation failed"))?;
+        let outputs = backend
+            .eval(&bytes, &action_counts)
+            .map_err(|_| internal("feature eval backend failed"))?;
+        validate_backend_outputs(&outputs, &action_counts)?;
+        batch_sizes.push(routing.len());
+
+        for ((lane, slot, token, _), row) in routing.drain(..).zip(outputs.rows) {
+            let _ = reply_txs[lane].send(EvalReply {
+                slot,
+                token,
+                output: EvalOutput {
+                    model_version: outputs.model_version,
+                    policy_logits: row.policy_logits,
+                    value: row.value,
+                },
+            });
+        }
+    }
+}
+
+fn validate_backend_outputs(outputs: &BackendOutputs, action_counts: &[u32]) -> EngineResult<()> {
+    if outputs.rows.len() != action_counts.len() {
+        return Err(internal("eval output count mismatch"));
+    }
+    for (row, &action_count) in outputs.rows.iter().zip(action_counts) {
+        if row.policy_logits.len() != action_count as usize {
+            return Err(internal("eval output length mismatch"));
+        }
+        if !row.value.is_finite() || row.policy_logits.iter().any(|value| !value.is_finite()) {
+            return Err(internal("invalid eval output"));
+        }
+    }
+    Ok(())
+}
+
 fn run_replay_sink(store: &ReplayStore, replay_rx: Receiver<ReplayJob>) -> EngineResult<u64> {
     let mut episodes_appended = 0;
 
@@ -575,4 +1095,61 @@ fn run_replay_sink(store: &ReplayStore, replay_rx: Receiver<ReplayJob>) -> Engin
 
 fn map_replay_error(_error: ReplayError) -> gz_engine::EngineError {
     internal("replay sink failed")
+}
+
+fn validate_engine_identities<E>(engines: &[E]) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    let Some(first) = engines.first().map(EngineIdentity::from_engine) else {
+        return Ok(());
+    };
+    for engine in &engines[1..] {
+        if EngineIdentity::from_engine(engine) != first {
+            return Err(internal("engine identity mismatch"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_feature_schemas<E, X>(extractors: &[X]) -> EngineResult<FeatureSchemaHash>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let Some(first) = extractors.first() else {
+        return Err(internal("missing feature schema"));
+    };
+    let hash = first.schema().hash();
+    for extractor in &extractors[1..] {
+        if extractor.schema().hash() != hash {
+            return Err(internal("feature schema mismatch"));
+        }
+    }
+    Ok(hash)
+}
+
+fn first_schema<E, X>(extractors: &[X], hash: FeatureSchemaHash) -> EngineResult<FeatureSchema>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let schema = extractors
+        .first()
+        .ok_or_else(|| internal("missing feature schema"))?
+        .schema();
+    if schema.hash() != hash {
+        return Err(internal("feature schema mismatch"));
+    }
+    Ok(schema.clone())
+}
+
+fn validate_collator_capacity(
+    collator: &FeatureCollator,
+    config: ThreadedOrchestratorConfig,
+) -> EngineResult<()> {
+    if collator.batch_capacity() != config.max_batch {
+        return Err(internal("feature batch capacity mismatch"));
+    }
+    Ok(())
 }

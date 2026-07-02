@@ -59,7 +59,7 @@ where
                 roots_exhausted = pool.admit(&mut self.engine, roots, &mut admission)?.1;
             }
 
-            episodes.extend(pool.drive(&mut self.engine, "batched driver blocked")?);
+            episodes.extend(pool.drive(&mut self.engine, "batched driver blocked", None)?);
 
             if roots_exhausted && !pool.active() {
                 return Ok(BatchedRun {

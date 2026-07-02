@@ -71,6 +71,7 @@ search task driving
 work routing for engine and eval requests
 engine lane ownership and task-to-lane assignment
 single-process eval batching
+featurized eval batching through gz-eval-service
 measure concurrency limits later
 replay sink driving
 minimal replay admission backpressure gating
@@ -101,6 +102,8 @@ Default allowed:
 std
 gz-engine
 gz-eval
+gz-eval-service
+gz-features
 gz-replay
 gz-search
 ```
@@ -116,8 +119,6 @@ Allowed later behind explicit features:
 
 ```text
 tokio or another async runtime
-gz-features
-process-backed eval clients
 metrics backend
 ```
 

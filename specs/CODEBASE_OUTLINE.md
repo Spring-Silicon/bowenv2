@@ -582,7 +582,7 @@ Human entry points.
 Implemented:
 
 ```bash
-graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]
+graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--evaluator random|stub|process-stub] [--python-dir PATH] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]
 ```
 
 Future diagnostics:
@@ -639,6 +639,7 @@ Acceptance:
 generate Whittle roots
 run parallel threaded Gumbel-MCTS workers
 batch eval requests through gz-eval
+optionally route eval through gz-features + gz-eval-service
 measure final episode graphs
 write only eligible measured rows to RocksDB replay
 support root, greedy, beam, random, or no reference labels

@@ -12,17 +12,24 @@ use std::time::{Duration, Instant};
 fn python_process_matches_stub_backend_bit_for_bit() {
     require_numpy();
     let schema = make_schema("python-equivalence", 6);
-    let rows = vec![row(4, 3), row(1, 1), row(5, 4)];
-    let (batch, action_counts) = collate(schema.clone(), 5, &rows);
-    let expected = StubBackend.eval(&batch, &action_counts).unwrap();
+    let batches = [
+        vec![row(4, 3)],
+        vec![row(1, 1), row(5, 4)],
+        vec![row(2, 1), row(3, 2), row(4, 3), row(5, 4), row(6, 5)],
+        vec![row(7, 2), row(2, 1), row(5, 4)],
+    ];
     let (mut process, mut backend) = spawn_backend(&make_hello(&schema, 5));
 
     backend.ping().unwrap();
     assert_eq!(backend.model_version(), STUB_MODEL_VERSION);
-    let actual = backend.eval(&batch, &action_counts).unwrap();
+    for rows in batches {
+        let (batch, action_counts) = collate(schema.clone(), 5, &rows);
+        let expected = StubBackend.eval(&batch, &action_counts).unwrap();
+        let actual = backend.eval(&batch, &action_counts).unwrap();
 
-    assert_eq!(actual.model_version, STUB_MODEL_VERSION);
-    assert_outputs_equal_bits(&actual.rows, &expected.rows);
+        assert_eq!(actual.model_version, STUB_MODEL_VERSION);
+        assert_outputs_equal_bits(&actual.rows, &expected.rows);
+    }
     drop(backend);
     assert_child_exits(&mut process);
 }
@@ -83,6 +90,22 @@ fn python_process_rejects_bad_handshake_versions() {
     assert_child_exits(&mut process);
 }
 
+#[test]
+fn dropping_process_before_backend_kills_child_and_backend_fails() {
+    require_numpy();
+    let schema = make_schema("python-kill-order", 4);
+    let (process, mut backend) = spawn_backend(&make_hello(&schema, 2));
+    let pid = process.id();
+
+    backend.ping().unwrap();
+    drop(process);
+    assert_process_gone(pid);
+    assert!(matches!(
+        backend.ping(),
+        Err(ServiceError::Io(_) | ServiceError::Protocol(_))
+    ));
+}
+
 fn spawn_backend(
     hello: &gz_eval_service::Hello,
 ) -> (EvaluatorProcess, gz_eval_service::ProcessBackend) {
@@ -132,6 +155,18 @@ fn assert_child_exits(process: &mut EvaluatorProcess) {
             None => panic!("Python evaluator did not exit after backend dropped"),
         }
     }
+}
+
+fn assert_process_gone(pid: u32) {
+    let proc_path = PathBuf::from(format!("/proc/{pid}"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while proc_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !proc_path.exists(),
+        "Python evaluator process {pid} still exists"
+    );
 }
 
 fn require_numpy() {

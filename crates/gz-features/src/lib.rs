@@ -7,7 +7,9 @@ mod error;
 mod row;
 mod schema;
 
-pub use collator::{FeatureBatchView, FeatureCollator, RowOutput, decode_outputs};
+pub use collator::{
+    FeatureBatchView, FeatureCollator, RowOutput, decode_outputs, validate_batch_action_counts,
+};
 pub use error::{FeatureError, FeatureResult};
 pub use row::{ActionFeature, FeatureEdge, FeatureRow, PositionFeatures};
 pub use schema::{

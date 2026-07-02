@@ -191,6 +191,44 @@ pub fn decode_outputs(bytes: &[u8], action_counts: &[u32]) -> FeatureResult<Vec<
     Ok(rows)
 }
 
+/// Validates per-row action counts against an encoded batch without copying
+/// batch sections.
+pub fn validate_batch_action_counts(bytes: &[u8], expected: &[u32]) -> FeatureResult<()> {
+    let header = BatchHeader::parse(bytes)?;
+    if expected.len() != header.row_count as usize {
+        return Err(FeatureError::InvalidEncoding(
+            "action count length mismatch",
+        ));
+    }
+
+    let layout = BatchLayout::from_dims(
+        header.batch_capacity as usize,
+        header.max_nodes as usize,
+        header.max_edges as usize,
+        header.max_actions as usize,
+        header.max_subjects as usize,
+        header.node_attr_dim as usize,
+    );
+    if bytes.len() != layout.total_len {
+        return Err(FeatureError::InvalidEncoding("bad batch length"));
+    }
+
+    for (row_index, &expected) in expected.iter().enumerate() {
+        if expected > header.max_actions {
+            return Err(FeatureError::ActionOverflow {
+                max: header.max_actions,
+                actual: expected as usize,
+            });
+        }
+        let actual = read_u32_at(bytes, layout.action_count + row_index * 4)?;
+        if actual != expected {
+            return Err(FeatureError::InvalidEncoding("action count mismatch"));
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowOutput {
     pub policy_logits: Vec<f32>,
@@ -224,52 +262,29 @@ pub struct FeatureBatchView {
 
 impl FeatureBatchView {
     pub fn parse(bytes: &[u8]) -> FeatureResult<Self> {
-        if bytes.len() < BATCH_HEADER_LEN {
-            return Err(FeatureError::InvalidEncoding("batch header truncated"));
-        }
-        if &bytes[0..4] != BATCH_MAGIC {
-            return Err(FeatureError::InvalidEncoding("bad batch magic"));
-        }
-        let version = read_u32_at(bytes, 4)?;
-        if version != ENCODING_VERSION {
-            return Err(FeatureError::InvalidEncoding("unsupported batch version"));
-        }
-        let schema_hash = read_hash_at(bytes, 8)?;
-        let batch_capacity = read_u32_at(bytes, 40)?;
-        let row_count = read_u32_at(bytes, 44)?;
-        let max_nodes = read_u32_at(bytes, 48)?;
-        let max_edges = read_u32_at(bytes, 52)?;
-        let max_actions = read_u32_at(bytes, 56)?;
-        let max_subjects = read_u32_at(bytes, 60)?;
-        let node_attr_dim = read_u32_at(bytes, 64)?;
-        if batch_capacity == 0 {
-            return Err(FeatureError::InvalidEncoding("zero batch capacity"));
-        }
-        if row_count > batch_capacity {
-            return Err(FeatureError::InvalidEncoding("row count exceeds capacity"));
-        }
+        let header = BatchHeader::parse(bytes)?;
 
         let layout = BatchLayout::from_dims(
-            batch_capacity as usize,
-            max_nodes as usize,
-            max_edges as usize,
-            max_actions as usize,
-            max_subjects as usize,
-            node_attr_dim as usize,
+            header.batch_capacity as usize,
+            header.max_nodes as usize,
+            header.max_edges as usize,
+            header.max_actions as usize,
+            header.max_subjects as usize,
+            header.node_attr_dim as usize,
         );
         if bytes.len() != layout.total_len {
             return Err(FeatureError::InvalidEncoding("bad batch length"));
         }
 
         Ok(Self {
-            schema_hash,
-            batch_capacity,
-            row_count,
-            max_nodes,
-            max_edges,
-            max_actions,
-            max_subjects,
-            node_attr_dim,
+            schema_hash: header.schema_hash,
+            batch_capacity: header.batch_capacity,
+            row_count: header.row_count,
+            max_nodes: header.max_nodes,
+            max_edges: header.max_edges,
+            max_actions: header.max_actions,
+            max_subjects: header.max_subjects,
+            node_attr_dim: header.node_attr_dim,
             node_count: read_u32_vec(bytes, layout.node_count, layout.b)?,
             node_tokens: read_u16_vec(bytes, layout.node_tokens, layout.b * layout.n)?,
             node_attrs: read_f32_vec(bytes, layout.node_attrs, layout.b * layout.n * layout.d)?,
@@ -289,6 +304,50 @@ impl FeatureBatchView {
             )?,
             position: read_position_vec(bytes, layout.position, layout.b)?,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BatchHeader {
+    schema_hash: FeatureSchemaHash,
+    batch_capacity: u32,
+    row_count: u32,
+    max_nodes: u32,
+    max_edges: u32,
+    max_actions: u32,
+    max_subjects: u32,
+    node_attr_dim: u32,
+}
+
+impl BatchHeader {
+    fn parse(bytes: &[u8]) -> FeatureResult<Self> {
+        if bytes.len() < BATCH_HEADER_LEN {
+            return Err(FeatureError::InvalidEncoding("batch header truncated"));
+        }
+        if &bytes[0..4] != BATCH_MAGIC {
+            return Err(FeatureError::InvalidEncoding("bad batch magic"));
+        }
+        let version = read_u32_at(bytes, 4)?;
+        if version != ENCODING_VERSION {
+            return Err(FeatureError::InvalidEncoding("unsupported batch version"));
+        }
+        let header = Self {
+            schema_hash: read_hash_at(bytes, 8)?,
+            batch_capacity: read_u32_at(bytes, 40)?,
+            row_count: read_u32_at(bytes, 44)?,
+            max_nodes: read_u32_at(bytes, 48)?,
+            max_edges: read_u32_at(bytes, 52)?,
+            max_actions: read_u32_at(bytes, 56)?,
+            max_subjects: read_u32_at(bytes, 60)?,
+            node_attr_dim: read_u32_at(bytes, 64)?,
+        };
+        if header.batch_capacity == 0 {
+            return Err(FeatureError::InvalidEncoding("zero batch capacity"));
+        }
+        if header.row_count > header.batch_capacity {
+            return Err(FeatureError::InvalidEncoding("row count exceeds capacity"));
+        }
+        Ok(header)
     }
 }
 

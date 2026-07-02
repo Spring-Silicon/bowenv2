@@ -202,7 +202,7 @@ in `gz.evaluator`.
 
 ## Orchestrator Featurized Path
 
-Work order C scope; not implemented by Work Order A.
+Implemented by `GZ_ORCHESTRATOR_FEATURIZED_IMPL.md`.
 
 The existing portable-Evaluator paths (`run`, `run_with_replay`) are
 untouched. New alongside them:
@@ -243,7 +243,7 @@ the same value.
 
 CLI: `graphzero selfplay --evaluator random|stub|process-stub`. `random`
 is the existing default; `stub` uses StubBackend in-process; `process-stub`
-spawns the Python evaluator (flags `--python`, `--socket-dir` optional).
+spawns the Python evaluator (`--python-dir` optional).
 
 ## Test Strategy
 

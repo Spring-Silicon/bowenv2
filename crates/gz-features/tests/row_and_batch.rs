@@ -1,6 +1,6 @@
 use gz_features::{
     ActionFeature, FeatureBatchView, FeatureCollator, FeatureEdge, FeatureError, FeatureRow,
-    FeatureSchema, FeatureSchemaConfig, PositionFeatures,
+    FeatureSchema, FeatureSchemaConfig, PositionFeatures, validate_batch_action_counts,
 };
 use std::num::NonZeroUsize;
 
@@ -150,6 +150,38 @@ fn decode_outputs_truncates_policy_by_action_count() {
     assert_eq!(rows[0].policy_logits, vec![1.0, 2.0]);
     assert_eq!(rows[1].value, -0.25);
     assert_eq!(rows[1].policy_logits, vec![-1.0, -2.0, -3.0]);
+}
+
+#[test]
+fn validate_batch_action_counts_checks_lengths_mismatches_and_overflow() {
+    let schema = schema();
+    let mut collator = FeatureCollator::new(schema, NonZeroUsize::new(2).unwrap());
+    let rows = [row(), row()];
+    let mut bytes = Vec::new();
+
+    collator.collate_into(&rows, &mut bytes).unwrap();
+
+    validate_batch_action_counts(&bytes, &[2, 2]).unwrap();
+    assert!(matches!(
+        validate_batch_action_counts(&bytes, &[2]),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
+    assert!(matches!(
+        validate_batch_action_counts(&bytes, &[2, 2, 2]),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
+    assert!(matches!(
+        validate_batch_action_counts(&bytes, &[1, 2]),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
+    assert!(matches!(
+        validate_batch_action_counts(&bytes, &[2, 1]),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
+    assert!(matches!(
+        validate_batch_action_counts(&bytes, &[5, 2]),
+        Err(FeatureError::ActionOverflow { .. })
+    ));
 }
 
 fn fingerprint(bytes: &[u8]) -> String {

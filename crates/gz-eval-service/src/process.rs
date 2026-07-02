@@ -4,7 +4,7 @@ use crate::{
     ServiceResult, decode_error, read_frame, write_frame,
 };
 use gz_engine::ModelVersion;
-use gz_features::{FeatureBatchView, decode_outputs};
+use gz_features::{decode_outputs, validate_batch_action_counts};
 use std::io::ErrorKind;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -85,6 +85,11 @@ impl EvaluatorProcess {
 
         let stream = self.connect_stream()?;
         ProcessBackend::connect_stream(stream, hello, self.config.io_timeout)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn try_wait(&mut self) -> ServiceResult<Option<ExitStatus>> {
@@ -223,9 +228,8 @@ impl ProcessBackend {
 
 impl FeatureEvalBackend for ProcessBackend {
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
-        let view = FeatureBatchView::parse(batch_bytes)
+        validate_batch_action_counts(batch_bytes, action_counts)
             .map_err(|error| ServiceError::protocol(error.to_string()))?;
-        crate::backend::validate_action_counts(&view, action_counts)?;
 
         let batch_id = self.batch_id;
         self.batch_id = self.batch_id.wrapping_add(1);

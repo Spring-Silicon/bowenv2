@@ -1,4 +1,4 @@
-use gz_cli::selfplay::{ReferenceMode, SelfplayConfig, run};
+use gz_cli::selfplay::{EvaluatorMode, ReferenceMode, SelfplayConfig, run};
 use gz_replay::ReplayStore;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +43,8 @@ fn selfplay_run_writes_replay_rows() {
         max_steps: 2,
         simulations: 2,
         max_batch: 4,
+        evaluator: EvaluatorMode::Random,
+        python_dir: None,
     })
     .unwrap();
     let store = ReplayStore::open(dir.path()).unwrap();
@@ -52,4 +54,27 @@ fn selfplay_run_writes_replay_rows() {
     assert_eq!(summary.rows_produced, counters.produced_rows);
     assert_eq!(summary.episodes_appended + summary.episodes_dropped, 4);
     assert!(summary.rows_produced > 0);
+}
+
+#[test]
+fn selfplay_run_supports_stub_evaluator() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 2,
+        lanes: 1,
+        workers_per_lane: 2,
+        reference: ReferenceMode::Root,
+        seed: 4,
+        max_steps: 2,
+        simulations: 2,
+        max_batch: 2,
+        evaluator: EvaluatorMode::Stub,
+        python_dir: None,
+    })
+    .unwrap();
+
+    assert_eq!(summary.evaluator, EvaluatorMode::Stub);
+    assert!(summary.model_version.is_some());
+    assert_eq!(summary.episodes_appended + summary.episodes_dropped, 2);
 }
