@@ -228,6 +228,8 @@ specs/
   GZ_EVAL_SERVICE.md
   GZ_FEATURES.md
   GZ_ORCHESTRATOR_REPLAY_IMPL.md
+  GZ_PYTHON.md
+  GZ_PYTHON_FRAMEWORK_IMPL.md
   GZ_REPLAY.md
   GZ_SEARCH.md
   GZ_SEARCH_GUMBEL_MCTS.md
@@ -287,3 +289,5 @@ new rule. Write one concrete rule per line.
   `GraphEngine` candidate.
 - Use same-index opponent trajectory alignment only; root_step equals the
   learner episode step.
+- Keep Rust tests out of `src/` files; put tests in each crate's `tests/`
+  directory instead.

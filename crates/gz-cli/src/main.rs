@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
-mod selfplay;
-
-use selfplay::{SelfplayConfig, run};
+use gz_cli::selfplay::{SelfplayConfig, run};
 use std::path::PathBuf;
 
 fn main() {

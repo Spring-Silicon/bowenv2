@@ -576,16 +576,3 @@ fn run_replay_sink(store: &ReplayStore, replay_rx: Receiver<ReplayJob>) -> Engin
 fn map_replay_error(_error: ReplayError) -> gz_engine::EngineError {
     internal("replay sink failed")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::map_replay_error;
-    use gz_replay::ReplayError;
-
-    #[test]
-    fn replay_errors_map_to_sink_failure() {
-        let error = map_replay_error(ReplayError::InvalidRecord);
-
-        assert!(error.to_string().contains("replay sink failed"));
-    }
-}

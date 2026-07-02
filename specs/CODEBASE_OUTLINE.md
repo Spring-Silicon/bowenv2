@@ -66,8 +66,10 @@ graphzero/
     gz-orchestrator/
     gz-cli/
   python/
-    evaluator/
-    trainer/
+    pyproject.toml
+    gz/
+      common/ proto/ codec/ model/ checkpoints/ evaluator/ trainer/
+    tests/
   configs/
   specs/
   tests/
