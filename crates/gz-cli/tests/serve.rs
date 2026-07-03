@@ -489,3 +489,48 @@ fn replay_serve_reacks_a_repeated_hello_on_a_live_connection() {
     // The connection keeps sampling after the re-ack.
     sample_once(&mut stream, 1, 8);
 }
+
+#[test]
+fn serve_survives_a_failed_connection_and_accepts_the_next() {
+    let dir = TestDir::new();
+    let socket = dir.path().join("survive.sock");
+    let (store, engines, extractors, search) = live_setup(&dir, &socket);
+
+    let providers = vec![RootBaselineProvider::new(engines[0].measure_options())];
+    let orchestrator = ThreadedGumbelOrchestrator::new(
+        engines,
+        RandomValueEvaluator::new(RandomValueEvaluatorConfig::default()).unwrap(),
+        search,
+        ThreadedOrchestratorConfig {
+            workers_per_lane: NonZeroUsize::new(1).unwrap(),
+            max_batch: NonZeroUsize::new(1).unwrap(),
+            flush_after: Duration::from_millis(1),
+        },
+    );
+    orchestrator
+        .run_featurized_with_replay(
+            vec![generated_roots(2, 3)],
+            gz_search::GumbelEpisodeContext::default(),
+            FeaturizedRuntime {
+                extractors,
+                backend: StubBackend,
+            },
+            ReplayRuntime {
+                store: &store,
+                providers,
+                backpressure: None,
+            },
+        )
+        .unwrap();
+
+    // First client handshakes, then violates the protocol and dies.
+    let mut bad = wait_for_rows(&socket);
+    write_frame(&mut bad, 9, &[b"garbage"]);
+    let (frame_type, _) = read_frame(&mut bad);
+    assert_eq!(frame_type, 5);
+    drop(bad);
+
+    // The service keeps accepting: a fresh client samples normally.
+    let mut good = wait_for_rows(&socket);
+    sample_once(&mut good, 1, 3);
+}

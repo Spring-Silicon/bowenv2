@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 pub struct ReplayStore {
     db: Arc<DB>,
     write_lock: Mutex<()>,
+    next_episode_seq: AtomicU64,
     produced_rows: AtomicU64,
     consumed_rows: AtomicU64,
 }
@@ -40,6 +41,7 @@ impl ReplayStore {
         Ok(Self {
             db,
             write_lock: Mutex::new(()),
+            next_episode_seq: AtomicU64::new(next_episode_seq),
             produced_rows: AtomicU64::new(produced_rows),
             consumed_rows: AtomicU64::new(consumed_rows),
         })
@@ -59,8 +61,8 @@ impl ReplayStore {
             .map_err(|_| ReplayError::InvalidRecord)?;
         validate_episode(record, rows, feature_schema_hash)?;
 
-        let episode_seq = recover_next_episode_seq(&self.db)?;
-        let row_seq = recover_next_row_seq(&self.db)?;
+        let episode_seq = self.next_episode_seq.load(Ordering::Acquire);
+        let row_seq = self.produced_rows.load(Ordering::Acquire);
         let next_episode_seq = episode_seq
             .checked_add(1)
             .ok_or_else(|| ReplayError::storage("episode id overflow"))?;
@@ -94,6 +96,8 @@ impl ReplayStore {
         batch.put_cf(&meta, META_NEXT_EPISODE_SEQ, encode_u64(next_episode_seq));
         batch.put_cf(&meta, META_PRODUCED_ROWS, encode_u64(produced_rows));
         self.db.write(batch)?;
+        self.next_episode_seq
+            .store(next_episode_seq, Ordering::Release);
         self.produced_rows.store(produced_rows, Ordering::Release);
 
         Ok(id)
@@ -138,8 +142,9 @@ impl ReplayStore {
         &self,
         config: SampleConfig,
     ) -> ReplayResult<Vec<(ReplayEpisodeId, ReplayRow)>> {
-        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
-        let produced = recover_next_row_seq(&self.db)?;
+        // Lock-free against producers: appends commit their WriteBatch before
+        // publishing produced_rows, so every sampled row_seq is fully visible.
+        let produced = self.produced_rows.load(Ordering::Acquire);
 
         if produced == 0 {
             return Err(ReplayError::Empty);
@@ -173,12 +178,10 @@ impl ReplayStore {
 
         let consumed_rows = self
             .consumed_rows
-            .load(Ordering::Acquire)
+            .fetch_add(config.batch.get() as u64, Ordering::AcqRel)
             .checked_add(config.batch.get() as u64)
             .ok_or_else(|| ReplayError::storage("consumed row counter overflow"))?;
         write_meta_u64(&self.db, META_CONSUMED_ROWS, consumed_rows)?;
-        self.consumed_rows.store(consumed_rows, Ordering::Release);
-        self.produced_rows.store(produced, Ordering::Release);
 
         Ok(out)
     }

@@ -49,7 +49,11 @@ impl ReplayServeConfig {
 pub fn run(config: ReplayServeConfig) -> Result<(), String> {
     let mut server = ReplaySampleServer::bind(config)?;
     loop {
-        server.accept_one()?;
+        // A connection error (client vanished, socket timeout on an idle
+        // trainer) ends that connection, never the service.
+        if let Err(error) = server.accept_one() {
+            eprintln!("replay sample connection ended: {error}");
+        }
     }
 }
 
@@ -68,7 +72,11 @@ pub fn run_shared(
 ) -> Result<(), String> {
     let mut server = ReplaySampleServer::bind_shared(store, socket, max_batch)?;
     loop {
-        server.accept_one()?;
+        // Same rule as `run`: a per-connection error must never take down
+        // the producing selfplay process wrapped around this loop.
+        if let Err(error) = server.accept_one() {
+            eprintln!("replay sample connection ended: {error}");
+        }
     }
 }
 
