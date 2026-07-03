@@ -164,7 +164,9 @@ logit[b, a] = MLP(cat(
 Value:
 
 ```text
-value[b] = tanh(MLP(g_readout[b]))        # matches the [-1, 1] label scale
+value_raw[b] = MLP(g_readout[b])
+serving applies tanh(value_raw) before emitting GZFO values; the trainer
+consumes value_raw directly.
 g_readout = mean over K of final g
 ```
 

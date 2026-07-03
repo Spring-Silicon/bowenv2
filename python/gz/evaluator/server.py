@@ -72,6 +72,7 @@ def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
         while True:
             frame_type, payload = read_frame(conn, read_buf)
             try:
+                backend.apply_pending_swap()
                 if frame_type == FRAME_PING:
                     _handle_ping(conn, write_buf, payload)
                 elif frame_type == FRAME_EVAL:

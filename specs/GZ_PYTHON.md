@@ -174,6 +174,10 @@ Implemented in `python/gz/checkpoints`: local directory source, strict
 manifest parsing, safetensors save/load, atomic publish, latest
 resolution, and hash-verified weights.
 
+Implemented in `python/gz/evaluator/backends.py`: torch evaluator
+checkpoint polling, warm-then-swap loading, mismatch rejection, and
+between-frame model-version swaps.
+
 ## Version Tags
 
 The four-tag agreement rule (EngineVersion, ActionSetHash,

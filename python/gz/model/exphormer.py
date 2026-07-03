@@ -313,8 +313,8 @@ def _model_class():
             prior = batch.action_prior.unsqueeze(-1)
             readout = g_readout.unsqueeze(1).expand(-1, batch.action_kind.shape[1], -1)
             logits = self.policy(torch.cat((kind, prior, subject_pool, readout), dim=-1)).squeeze(-1)
-            values = torch.tanh(self.value(g_readout).squeeze(-1))
-            return values, logits
+            value_raw = self.value(g_readout).squeeze(-1)
+            return value_raw, logits
 
     class GraphLayer(nn.Module):
         def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
