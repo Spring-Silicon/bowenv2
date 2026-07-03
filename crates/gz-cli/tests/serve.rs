@@ -1,6 +1,9 @@
 use gz_cli::selfplay::{EvaluatorMode, ReferenceMode, SelfplayConfig, run as run_selfplay};
 use gz_cli::serve::{ReplayServeConfig, SAMPLE_PROTOCOL_VERSION, run_one};
-use gz_features::{ENCODING_VERSION, FeatureBatchView, TrainingTargetsView};
+use gz_features::{
+    ENCODING_VERSION, FeatureBatchView, TrainingTargetsView, decode_feature_schema_config,
+};
+use gz_replay::ReplayStore;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -51,6 +54,10 @@ fn replay_serve_returns_feature_batch_and_targets() {
         python_dir: None,
     })
     .unwrap();
+    let expected_schema_config = ReplayStore::open(dir.path())
+        .unwrap()
+        .feature_schema()
+        .unwrap();
     let socket = dir.path().join("sample.sock");
     let server_config = ReplayServeConfig {
         replay_dir: dir.path().to_path_buf(),
@@ -75,6 +82,8 @@ fn replay_serve_returns_feature_batch_and_targets() {
         u64::from_le_bytes(ack[40..48].try_into().unwrap()),
         summary.rows_produced
     );
+    let schema_config = decode_feature_schema_config(&ack[48..]).unwrap();
+    assert_eq!(Some(schema_config), expected_schema_config);
 
     let mut sample = Vec::new();
     sample.extend_from_slice(&1u32.to_le_bytes());

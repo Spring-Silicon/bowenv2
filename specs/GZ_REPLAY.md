@@ -239,9 +239,10 @@ rows.
 
 ## Storage Layout
 
-Schema version: 3. Version 3 adds optional per-row GZFR feature payloads and
-the persisted FeatureSchemaConfig metadata. Version 1 and 2 stores fail to
-open with SchemaMismatch.
+Schema version: 4. Version 4 records the expander fields in the persisted
+FeatureSchemaConfig metadata. Version 3 added optional per-row GZFR feature
+payloads and the persisted FeatureSchemaConfig metadata. Version 1, 2, and 3
+stores fail to open with SchemaMismatch.
 
 ```text
 RocksDB, one database directory, column families:

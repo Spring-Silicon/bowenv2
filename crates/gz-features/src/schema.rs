@@ -17,6 +17,8 @@ pub struct FeatureSchemaConfig {
     pub max_edges: u32,
     pub max_actions: u32,
     pub max_subjects: u32,
+    pub expander_degree: u8,
+    pub expander_seed: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +79,8 @@ impl FeatureSchemaHash {
         update_u32(&mut hasher, config.max_edges);
         update_u32(&mut hasher, config.max_actions);
         update_u32(&mut hasher, config.max_subjects);
+        update_u8(&mut hasher, config.expander_degree);
+        update_u64(&mut hasher, config.expander_seed);
         Self(*hasher.finalize().as_bytes())
     }
 }
@@ -127,6 +131,22 @@ fn validate_config(config: &FeatureSchemaConfig) -> FeatureResult<()> {
     }
     if config.max_subjects == 0 {
         return Err(FeatureError::InvalidSchema("max_subjects must be positive"));
+    }
+    if config.expander_degree > 0 {
+        if config.edge_type_count == 0 {
+            return Err(FeatureError::InvalidSchema(
+                "edge_type_count must include expander type",
+            ));
+        }
+        let required = u32::from(config.expander_degree)
+            .checked_mul(config.max_nodes)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(FeatureError::InvalidSchema("expander edge budget overflow"))?;
+        if config.max_edges < required {
+            return Err(FeatureError::InvalidSchema(
+                "max_edges too small for expander_degree",
+            ));
+        }
     }
     Ok(())
 }

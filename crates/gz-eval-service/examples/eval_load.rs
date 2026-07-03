@@ -116,6 +116,8 @@ fn schema() -> FeatureSchema {
         max_edges: 8,
         max_actions: 8,
         max_subjects: 2,
+        expander_degree: 0,
+        expander_seed: 0,
     })
     .unwrap()
 }

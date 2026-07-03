@@ -1,6 +1,6 @@
 use gz_features::{
     ENCODING_VERSION, FeatureCollator, FeatureRow, FeatureSchema, RowTargets, decode_feature_row,
-    encode_training_targets, validate_feature_row_header,
+    encode_feature_schema_config, encode_training_targets, validate_feature_row_header,
 };
 use gz_replay::{ReplayError, ReplayStore, SampleConfig};
 use std::io::{ErrorKind, Read, Write};
@@ -167,11 +167,15 @@ impl ReplaySampleServer {
             return Err((ERROR_ENCODING, "encoding version mismatch"));
         }
 
-        let mut payload = Vec::with_capacity(48);
+        let mut schema_config = Vec::new();
+        encode_feature_schema_config(self.collator.schema().config(), &mut schema_config)
+            .map_err(|_| (ERROR_ENCODING, "failed to encode schema config"))?;
+        let mut payload = Vec::with_capacity(48 + schema_config.len());
         payload.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
         payload.extend_from_slice(self.collator.schema().hash().as_bytes());
         payload.extend_from_slice(&(self.max_batch.get() as u32).to_le_bytes());
         payload.extend_from_slice(&self.store.counters().produced_rows.to_le_bytes());
+        payload.extend_from_slice(&schema_config);
         write_frame(stream, write_buf, FRAME_HELLO_ACK, &[&payload])
             .map_err(|_| (ERROR_PROTOCOL, "failed to write HELLO_ACK"))
     }

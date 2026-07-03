@@ -1,6 +1,6 @@
 use crate::{
     ActionFeature, ENCODING_VERSION, FeatureEdge, FeatureError, FeatureResult, FeatureRow,
-    FeatureSchema, FeatureSchemaHash, PositionFeatures,
+    FeatureSchema, FeatureSchemaConfig, FeatureSchemaHash, PositionFeatures,
 };
 
 const ROW_MAGIC: &[u8; 4] = b"GZFR";
@@ -186,6 +186,60 @@ pub fn validate_feature_row_header(
     Ok(())
 }
 
+pub fn encode_feature_schema_config(
+    config: &FeatureSchemaConfig,
+    out: &mut Vec<u8>,
+) -> FeatureResult<()> {
+    FeatureSchema::new(config.clone())?;
+    let name = config.name.as_bytes();
+    let name_len =
+        u16::try_from(name.len()).map_err(|_| FeatureError::InvalidSchema("name too long"))?;
+
+    out.clear();
+    write_u16(out, name_len);
+    out.extend_from_slice(name);
+    write_u16(out, config.node_vocab_size);
+    write_u16(out, config.node_attr_dim);
+    out.push(config.edge_type_count);
+    write_u32(out, config.action_kind_vocab_size);
+    write_u32(out, config.max_nodes);
+    write_u32(out, config.max_edges);
+    write_u32(out, config.max_actions);
+    write_u32(out, config.max_subjects);
+    out.push(config.expander_degree);
+    write_u64(out, config.expander_seed);
+    Ok(())
+}
+
+pub fn decode_feature_schema_config(bytes: &[u8]) -> FeatureResult<FeatureSchemaConfig> {
+    let mut reader = Reader::new(bytes);
+    let name_len = reader.u16()? as usize;
+    let name = reader.bytes(name_len)?;
+    let name = std::str::from_utf8(name)
+        .map_err(|_| FeatureError::InvalidEncoding("invalid schema name utf8"))?
+        .to_owned();
+    let config = FeatureSchemaConfig {
+        name,
+        node_vocab_size: reader.u16()?,
+        node_attr_dim: reader.u16()?,
+        edge_type_count: reader.u8()?,
+        action_kind_vocab_size: reader.u32()?,
+        max_nodes: reader.u32()?,
+        max_edges: reader.u32()?,
+        max_actions: reader.u32()?,
+        max_subjects: reader.u32()?,
+        expander_degree: reader.u8()?,
+        expander_seed: reader.u64()?,
+    };
+    if !reader.is_empty() {
+        return Err(FeatureError::InvalidEncoding(
+            "trailing schema config bytes",
+        ));
+    }
+    FeatureSchema::new(config.clone())?;
+    Ok(config)
+}
+
 pub fn encode_training_targets(
     targets: &[RowTargets],
     capacity: usize,
@@ -365,6 +419,13 @@ impl<'a> Reader<'a> {
         ))
     }
 
+    fn u64(&mut self) -> FeatureResult<u64> {
+        let bytes = self.take(8, "u64 truncated")?;
+        Ok(u64::from_le_bytes(
+            bytes.try_into().expect("length checked"),
+        ))
+    }
+
     fn f32(&mut self) -> FeatureResult<f32> {
         let bytes = self.take(4, "f32 truncated")?;
         Ok(f32::from_le_bytes(
@@ -424,6 +485,10 @@ impl<'a> Reader<'a> {
         self.cursor += len;
         Ok(bytes)
     }
+
+    fn bytes(&mut self, len: usize) -> FeatureResult<&'a [u8]> {
+        self.take(len, "bytes truncated")
+    }
 }
 
 fn parse_row_header(bytes: &[u8]) -> FeatureResult<FeatureSchemaHash> {
@@ -447,6 +512,10 @@ fn write_u16(out: &mut Vec<u8>, value: u16) {
 }
 
 fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 

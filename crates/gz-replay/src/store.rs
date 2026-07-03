@@ -209,6 +209,8 @@ struct StoredFeatureSchemaConfig {
     max_edges: u32,
     max_actions: u32,
     max_subjects: u32,
+    expander_degree: u8,
+    expander_seed: u64,
 }
 
 impl From<&FeatureSchemaConfig> for StoredFeatureSchemaConfig {
@@ -223,6 +225,8 @@ impl From<&FeatureSchemaConfig> for StoredFeatureSchemaConfig {
             max_edges: config.max_edges,
             max_actions: config.max_actions,
             max_subjects: config.max_subjects,
+            expander_degree: config.expander_degree,
+            expander_seed: config.expander_seed,
         }
     }
 }
@@ -239,6 +243,8 @@ impl From<StoredFeatureSchemaConfig> for FeatureSchemaConfig {
             max_edges: config.max_edges,
             max_actions: config.max_actions,
             max_subjects: config.max_subjects,
+            expander_degree: config.expander_degree,
+            expander_seed: config.expander_seed,
         }
     }
 }

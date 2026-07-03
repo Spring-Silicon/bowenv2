@@ -203,6 +203,13 @@ fn feature_schema_mismatch_is_rejected() {
         store.ensure_feature_schema(&other).unwrap_err(),
         ReplayError::InvalidRecord
     );
+
+    let mut other = feature_schema_config();
+    other.expander_seed = 9;
+    assert_eq!(
+        store.ensure_feature_schema(&other).unwrap_err(),
+        ReplayError::InvalidRecord
+    );
 }
 
 #[test]
@@ -284,20 +291,22 @@ fn schema_version_mismatch_fails_open() {
 }
 
 #[test]
-fn v2_store_fails_open() {
+fn old_schema_stores_fail_open() {
     let dir = common::temp_dir();
     drop(ReplayStore::open(dir.path()).unwrap());
 
-    let db = raw_db(dir.path());
-    let meta = db.cf_handle("meta").unwrap();
-    db.put_cf(&meta, b"schema_version", 2u32.to_be_bytes())
-        .unwrap();
-    drop(db);
+    for version in [2u32, 3] {
+        let db = raw_db(dir.path());
+        let meta = db.cf_handle("meta").unwrap();
+        db.put_cf(&meta, b"schema_version", version.to_be_bytes())
+            .unwrap();
+        drop(db);
 
-    assert!(matches!(
-        ReplayStore::open(dir.path()),
-        Err(ReplayError::SchemaMismatch)
-    ));
+        assert!(matches!(
+            ReplayStore::open(dir.path()),
+            Err(ReplayError::SchemaMismatch)
+        ));
+    }
 }
 
 fn raw_db(path: &std::path::Path) -> DB {

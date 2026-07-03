@@ -175,6 +175,18 @@ Frame types:
               feature_schema_hash 32B
               max_batch u32
               produced_rows u64
+              feature_schema_config:
+                name_len u16, utf8 name,
+                node_vocab_size u16,
+                node_attr_dim u16,
+                edge_type_count u8,
+                action_kind_vocab_size u32,
+                max_nodes u32,
+                max_edges u32,
+                max_actions u32,
+                max_subjects u32,
+                expander_degree u8,
+                expander_seed u64
 
 3 SAMPLE      trainer -> server:
               batch u32, must be 1..=max_batch

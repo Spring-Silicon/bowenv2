@@ -30,6 +30,8 @@ pub fn schema(name: &str, max_actions: u32) -> FeatureSchema {
         max_edges: 8,
         max_actions,
         max_subjects: 3,
+        expander_degree: 0,
+        expander_seed: 0,
     })
     .unwrap()
 }

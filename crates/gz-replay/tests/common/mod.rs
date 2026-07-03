@@ -150,6 +150,8 @@ pub fn feature_schema_config() -> FeatureSchemaConfig {
         max_edges: 4,
         max_actions: 4,
         max_subjects: 3,
+        expander_degree: 0,
+        expander_seed: 0,
     }
 }
 

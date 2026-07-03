@@ -88,6 +88,19 @@ def test_attr0_fixture_omits_attrs() -> None:
     assert view.position.tolist()[0] == [0.0, 1.0, 0.25, 0.25]
 
 
+def test_expander_fixture_contains_expander_typed_edges() -> None:
+    view = BatchView.parse((FIXTURES / "batch_expander.gzfb").read_bytes())
+
+    assert view.batch_capacity == 2
+    assert view.row_count == 1
+    assert view.dims.node_attr_dim == 0
+    assert view.dims.max_edges == 10
+    assert view.edge_count.tolist() == [4, 0]
+    assert view.edge_src.tolist()[0] == [0, 0, 1, 2, 0, 0, 0, 0, 0, 0]
+    assert view.edge_dst.tolist()[0] == [2, 1, 2, 0, 0, 0, 0, 0, 0, 0]
+    assert view.edge_type.tolist()[0] == [0, 2, 2, 2, 0, 0, 0, 0, 0, 0]
+
+
 def test_stub_on_fixture_matches_scalar_reference() -> None:
     view = BatchView.parse((FIXTURES / "batch_attr1.gzfb").read_bytes())
     values, logits = stub(view)

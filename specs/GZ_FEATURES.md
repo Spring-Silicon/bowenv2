@@ -146,6 +146,8 @@ pub struct FeatureSchemaConfig {
     pub max_edges: u32,
     pub max_actions: u32,
     pub max_subjects: u32,
+    pub expander_degree: u8,       // 0 disables expander edge emission
+    pub expander_seed: u64,
 }
 
 pub struct FeatureSchema { /* validated config + derived hash */ }
@@ -167,7 +169,9 @@ node tokens:   0 = PAD, engine ops start at 1
 action kinds:  0 = PAD, 1 = STOP, engine CandidateKindId k maps to k + 2
 subject slots: u32::MAX = PAD
 edge types:    engine-defined, 0-based; padding is expressed by edge_count,
-               not a reserved type
+               not a reserved type. When expander_degree > 0, the last
+               edge type (edge_type_count - 1) is the expander family.
+               Engine edge types occupy 0..edge_type_count-2.
 ```
 
 Config validation:
@@ -176,12 +180,16 @@ Config validation:
 node_vocab_size >= 2, action_kind_vocab_size >= 3 (PAD + STOP + one kind)
 max_nodes, max_edges, max_actions, max_subjects >= 1
 name non-empty
+when expander_degree > 0: edge_type_count must include the expander type,
+and max_edges >= expander_degree * max_nodes + 1. Extractors own the full
+engine-edge-budget check.
 ```
 
 `FeatureSchemaHash` derivation: blake3 over a domain prefix
 ("gz-features-schema-v1"), the encoding version constant, and every config
-field, length-delimited. Any change to any field, the token conventions, or
-the byte layout changes the hash. The hash rides with EngineVersion,
+field, length-delimited, including expander_degree and expander_seed. Any
+change to any field, the token conventions, or the byte layout changes the
+hash. The hash rides with EngineVersion,
 ActionSetHash, and ModelVersion in the evaluator/trainer fail-fast tag
 check; a checkpoint trained under one schema must be rejected by an
 evaluator collating another.
@@ -440,12 +448,17 @@ Mapping:
 
 ```text
 schema: name "whittle-v1", node vocab {PAD, Input, Const, And, Or, Not,
-Output} (size 7), attr_dim 0, edge types {arg0 = 0, arg1 = 1} (size 2),
-max_nodes = engine capacity, max_edges = 2 * capacity,
+Output} (size 7), attr_dim 0, edge types {arg0 = 0, arg1 = 1,
+expander = 2} when expander_degree > 0,
+max_nodes = engine capacity,
+max_edges = 2 * capacity + expander_degree * capacity,
 max_actions = 256, max_subjects = 8,
 action kind vocab = rule count + 2
 node tokens: op codes in arena node order, offset per the token convention
 edges: one edge per present arg, direction argument -> consumer
+expander edges: d seeded Fisher-Yates permutations over real nodes,
+one directed edge (i, perm[i], expander_type) per node per permutation,
+with self-pairs skipped; emitted after arg edges and cached by node count.
 actions: rule_id + 2 as kind token, CandidateInfo.static_prior,
 CandidateInfo.subjects as node indices (Whittle subjects are node ids;
 match_len <= 8 == max_subjects by construction)

@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     write_attr1(out_dir.join("batch_attr1.gzfb"))?;
     write_attr0(out_dir.join("batch_attr0.gzfb"))?;
+    write_expander(out_dir.join("batch_expander.gzfb"))?;
     Ok(())
 }
 
@@ -28,6 +29,8 @@ fn write_attr1(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         max_edges: 4,
         max_actions: 6,
         max_subjects: 2,
+        expander_degree: 0,
+        expander_seed: 0,
     })?;
     let rows = vec![
         FeatureRow {
@@ -150,6 +153,8 @@ fn write_attr0(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         max_edges: 2,
         max_actions: 3,
         max_subjects: 2,
+        expander_degree: 0,
+        expander_seed: 0,
     })?;
     let rows = vec![FeatureRow {
         node_count: 2,
@@ -173,6 +178,64 @@ fn write_attr0(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             leaf_depth: 1,
             budget_fraction: 0.25,
             budget_step: 0.25,
+        },
+    }];
+    write_batch(schema, 2, &rows, path)
+}
+
+fn write_expander(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = FeatureSchema::new(FeatureSchemaConfig {
+        name: "gz-fixture-expander-v1".to_string(),
+        node_vocab_size: 7,
+        node_attr_dim: 0,
+        edge_type_count: 3,
+        action_kind_vocab_size: 12,
+        max_nodes: 4,
+        max_edges: 10,
+        max_actions: 4,
+        max_subjects: 2,
+        expander_degree: 2,
+        expander_seed: 99,
+    })?;
+    let rows = vec![FeatureRow {
+        node_count: 3,
+        node_tokens: vec![1, 2, 3],
+        node_attrs: Vec::new(),
+        edges: vec![
+            FeatureEdge {
+                src: 0,
+                dst: 2,
+                edge_type: 0,
+            },
+            FeatureEdge {
+                src: 0,
+                dst: 1,
+                edge_type: 2,
+            },
+            FeatureEdge {
+                src: 1,
+                dst: 2,
+                edge_type: 2,
+            },
+            FeatureEdge {
+                src: 2,
+                dst: 0,
+                edge_type: 2,
+            },
+        ],
+        actions: vec![
+            ActionFeature {
+                kind_token: 4,
+                static_prior: 0.5,
+                subjects: vec![1, 2],
+            },
+            stop(),
+        ],
+        position: PositionFeatures {
+            root_step: 2,
+            leaf_depth: 0,
+            budget_fraction: 0.75,
+            budget_step: 0.125,
         },
     }];
     write_batch(schema, 2, &rows, path)

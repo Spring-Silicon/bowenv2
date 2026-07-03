@@ -12,6 +12,6 @@ pub use engine::{
     WhittleGeneratorConfigError, WhittleGraphGenerator, WhittleGraphGeneratorConfig,
     WhittleMeasureMode, WhittleRng, WhittleRoot,
 };
-pub use features::WhittleFeatureExtractor;
+pub use features::{WhittleFeatureExtractor, WhittleFeatureExtractorConfig};
 pub use graph::{NO_NODE, OpCode, WhittleCandidateId, WhittleGraph, WhittleGraphId};
 pub use rules::{RULE_COUNT, RuleId, rule_name};

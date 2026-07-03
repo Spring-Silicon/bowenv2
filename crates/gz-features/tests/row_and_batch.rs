@@ -7,7 +7,7 @@ use gz_features::{
 use std::num::NonZeroUsize;
 
 const HAND_BUILT_BATCH_FINGERPRINT: &str =
-    "665f9353ee10a9d6bb9a32cd57dd20200ca98ff36115cf80416b973ea6cfbfc9";
+    "4d1690bee936faf87a5d9d68ea4fff3ad9dc5a08e841acbf4ac4b2c197d6b062";
 
 fn schema() -> FeatureSchema {
     FeatureSchema::new(FeatureSchemaConfig {
@@ -20,6 +20,8 @@ fn schema() -> FeatureSchema {
         max_edges: 4,
         max_actions: 4,
         max_subjects: 3,
+        expander_degree: 0,
+        expander_seed: 0,
     })
     .unwrap()
 }
