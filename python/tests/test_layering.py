@@ -10,7 +10,14 @@ LAYERS = {
     "proto": {"common"},
     "codec": {"common", "proto"},
     "model": {"common", "codec"},
-    "evaluator": {"common", "proto", "codec", "model"},
+    "checkpoints": {"common", "codec"},
+    "evaluator": {"common", "proto", "codec", "model", "checkpoints"},
+}
+
+TORCH_ALLOWED = {
+    PACKAGE_ROOT / "model" / "exphormer.py",
+    PACKAGE_ROOT / "checkpoints" / "weights.py",
+    PACKAGE_ROOT / "evaluator" / "backends.py",
 }
 
 
@@ -19,7 +26,9 @@ def test_import_layering_and_torch_ban() -> None:
         module = path.relative_to(PACKAGE_ROOT).parts[0]
         tree = ast.parse(path.read_text())
         for imported in _imports(tree):
-            assert imported != "torch", f"{path} imports torch"
+            if imported == "torch":
+                assert path in TORCH_ALLOWED, f"{path} imports torch"
+                continue
             if imported == "gz":
                 continue
             if imported.startswith("gz."):

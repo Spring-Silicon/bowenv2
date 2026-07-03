@@ -8,6 +8,10 @@ of which Exphormer-style sparse attention is the shipped default
 configuration. This is a contract spec; the torch-backend work order
 implements it.
 
+Implemented by `python/gz/model/exphormer.py`,
+`python/gz/checkpoints/`, and `python/gz/evaluator/backends.py` for the
+initial torch inference path.
+
 The design targets, in order: correctness of the first learning run
 (minimize deltas against whittlezero's proven setup), inference latency at
 compiler scale (~2000+ nodes), and `torch.compile(fullgraph=True)` +

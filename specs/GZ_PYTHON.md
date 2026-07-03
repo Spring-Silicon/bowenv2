@@ -139,6 +139,7 @@ Manifest (`manifest.json` inside each version directory):
 manifest_version        format version, checked on read
 model_version           16B hex; identifies these exact weights
 arch                    { name, config }, plus arch_config_hash
+feature_schema          full FeatureSchemaConfig object
 feature_schema_hash     32B hex
 engine_id, engine_version, action_set_hash    16B/16B/32B hex
 training_step, run_id
@@ -168,6 +169,10 @@ disagree with the serving configuration is refused loudly on stderr and
 the evaluator keeps serving the old version — fail fast on the artifact
 without killing selfplay.
 ```
+
+Implemented in `python/gz/checkpoints`: local directory source, strict
+manifest parsing, safetensors save/load, atomic publish, latest
+resolution, and hash-verified weights.
 
 ## Version Tags
 

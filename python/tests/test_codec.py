@@ -5,8 +5,9 @@ import struct
 import numpy as np
 import pytest
 
-from gz.codec import BatchView, OutputEncoder
+from gz.codec import BatchView, FeatureSchemaConfig, OutputEncoder
 from gz.codec.batch import EncodingError
+from gz.codec.schema import SchemaConfigError
 from gz.proto.frames import ENCODING_VERSION
 
 SCHEMA_HASH = b"f" * 32
@@ -78,6 +79,61 @@ def test_output_encoder_exact_bytes_and_reuse() -> None:
     expected.extend(np.array([1.0, 2.0, 0.0, -1.0, 0.0, 0.0], dtype="<f4").tobytes())
     assert first == bytes(expected)
     assert second == first
+
+
+def test_feature_schema_config_codec_roundtrip_and_golden() -> None:
+    config = FeatureSchemaConfig(
+        name="whittle-v1",
+        node_vocab_size=7,
+        node_attr_dim=0,
+        edge_type_count=3,
+        action_kind_vocab_size=10,
+        max_nodes=64,
+        max_edges=448,
+        max_actions=256,
+        max_subjects=8,
+        expander_degree=5,
+        expander_seed=42,
+    )
+    expected = bytes.fromhex(
+        "0a00"
+        "77686974746c652d7631"
+        "0700"
+        "0000"
+        "03"
+        "0a000000"
+        "40000000"
+        "c0010000"
+        "00010000"
+        "08000000"
+        "05"
+        "2a00000000000000"
+    )
+
+    encoded = config.encode()
+
+    assert encoded == expected
+    assert FeatureSchemaConfig.decode(encoded) == config
+
+
+def test_feature_schema_config_validation() -> None:
+    with pytest.raises(SchemaConfigError, match="max_edges too small"):
+        FeatureSchemaConfig(
+            name="bad",
+            node_vocab_size=2,
+            node_attr_dim=0,
+            edge_type_count=1,
+            action_kind_vocab_size=3,
+            max_nodes=4,
+            max_edges=4,
+            max_actions=1,
+            max_subjects=1,
+            expander_degree=1,
+            expander_seed=0,
+        )
+
+    with pytest.raises(SchemaConfigError, match="bad schema config length"):
+        FeatureSchemaConfig.decode(b"\x00\x00trailing")
 
 
 def make_batch(attr_dim: int, schema_hash: bytes = SCHEMA_HASH, capacity: int = 2) -> bytes:

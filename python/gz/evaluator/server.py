@@ -11,7 +11,6 @@ from gz.codec import BatchView
 from gz.codec.batch import EncodingError
 from gz.common.tags import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
 from gz.evaluator.backends import StubBackend
-from gz.model.stub import STUB_MODEL_VERSION
 from gz.proto import (
     ENCODING_VERSION,
     ERROR_CAPACITY,
@@ -69,7 +68,7 @@ def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
     read_buf = bytearray()
     write_buf = bytearray()
     try:
-        state = _handshake(conn, read_buf, write_buf)
+        state = _handshake(conn, read_buf, write_buf, backend)
         while True:
             frame_type, payload = read_frame(conn, read_buf)
             try:
@@ -90,7 +89,12 @@ def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
         _send_error(conn, write_buf, ERROR_ENCODING, str(error))
 
 
-def _handshake(conn: socket.socket, read_buf: bytearray, write_buf: bytearray) -> _ConnectionState:
+def _handshake(
+    conn: socket.socket,
+    read_buf: bytearray,
+    write_buf: bytearray,
+    backend: StubBackend,
+) -> _ConnectionState:
     frame_type, payload = read_frame(conn, read_buf)
     if frame_type != FRAME_HELLO:
         raise ProtocolError(ERROR_PROTOCOL, "expected HELLO")
@@ -101,11 +105,12 @@ def _handshake(conn: socket.socket, read_buf: bytearray, write_buf: bytearray) -
         raise ProtocolError(ERROR_ENCODING, "encoding version mismatch")
     if hello.batch_capacity == 0:
         raise ProtocolError(ERROR_CAPACITY, "zero batch capacity")
+    model_version = backend.handshake(hello)
     write_frame_into(
         conn,
         write_buf,
         FRAME_HELLO_ACK,
-        HelloAck(PROTOCOL_VERSION, STUB_MODEL_VERSION).encode(),
+        HelloAck(PROTOCOL_VERSION, model_version).encode(),
     )
     return _ConnectionState(
         feature_schema_hash=hello.feature_schema_hash,

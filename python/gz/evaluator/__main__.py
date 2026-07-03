@@ -4,18 +4,34 @@ import argparse
 import sys
 
 from gz.common.log import setup
-from gz.evaluator.backends import StubBackend
+from gz.evaluator.backends import StubBackend, TorchBackend
 from gz.evaluator.server import serve
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", required=True)
+    parser.add_argument("--backend", choices=["stub", "torch"], default="stub")
+    parser.add_argument("--checkpoint-dir")
+    parser.add_argument("--device")
+    parser.add_argument("--max-batch", type=int, default=1024)
+    parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args(argv)
     log = setup("gz.evaluator")
     try:
-        log.info("event=start socket=%s backend=stub", args.socket)
-        serve(args.socket, StubBackend())
+        if args.backend == "torch":
+            if args.checkpoint_dir is None:
+                parser.error("--checkpoint-dir is required for --backend torch")
+            backend = TorchBackend(
+                args.checkpoint_dir,
+                device=args.device,
+                compile_model=not args.no_compile,
+                max_batch=args.max_batch,
+            )
+        else:
+            backend = StubBackend()
+        log.info("event=start socket=%s backend=%s", args.socket, args.backend)
+        serve(args.socket, backend)
     except Exception as error:
         log.error("event=error error=%s", error)
         return 1

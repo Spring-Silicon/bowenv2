@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
-torch = ["torch", "safetensors"]
+torch = ["torch>=2.7", "safetensors"]
 
 [tool.setuptools.packages.find]
 where = ["."]
