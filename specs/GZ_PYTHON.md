@@ -162,12 +162,14 @@ replace latest.json ({ version_dir, model_version }).
 resolution (evaluator side): a CheckpointSource abstraction with two
 implementations planned — local directory now, URL fetch later (the
 distributed-trainer hedge). Consumers only see the abstraction.
-hot swap (evaluator side): load and warm the new version off to the side
-(including any compile/capture warmup), then swap the serving slot;
-in-flight batches finish on the old version. A new checkpoint whose tags
-disagree with the serving configuration is refused loudly on stderr and
-the evaluator keeps serving the old version — fail fast on the artifact
-without killing selfplay.
+hot swap (evaluator side): build and load the new version off to the
+side, then adopt it between frames on the serving thread, which runs the
+compile/capture warmup at adoption — CUDA graph capture (reduce-overhead)
+only works on the thread that serves, and a same-arch checkpoint hits the
+inductor cache so the warmup pause is near zero. In-flight batches finish
+on the old version. A new checkpoint whose tags disagree with the serving
+configuration is refused loudly on stderr and the evaluator keeps serving
+the old version — fail fast on the artifact without killing selfplay.
 ```
 
 Implemented in `python/gz/checkpoints`: local directory source, strict
@@ -175,8 +177,8 @@ manifest parsing, safetensors save/load, atomic publish, latest
 resolution, and hash-verified weights.
 
 Implemented in `python/gz/evaluator/backends.py`: torch evaluator
-checkpoint polling, warm-then-swap loading, mismatch rejection, and
-between-frame model-version swaps.
+checkpoint polling, load-then-warm-at-adoption swaps, mismatch rejection,
+and between-frame model-version swaps.
 
 ## Version Tags
 

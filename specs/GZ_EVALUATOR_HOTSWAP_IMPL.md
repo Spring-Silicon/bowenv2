@@ -86,6 +86,18 @@ Warm-up contention note (goes in a comment): warming compiles/captures on
 the same GPU that is serving; evals during a warm are slower, workers
 park, nothing breaks. Accepted.
 
+Amendment (post-review): loader-thread warming is impossible under
+reduce-overhead — CUDA graph capture is single-threaded per process, so
+capture from the loader thread fails and every checkpoint gets rejected
+(verified on the GPU; mode="default" avoids it but costs 3x on the hot
+path: 2.95ms vs 0.97ms at B=64). The implemented design instead has the
+loader publish the slot unwarmed after build/load/to(device), and
+apply_pending_swap warms 3x on the serving thread before adopting. The
+serving pause is near zero for same-arch checkpoints (inductor cache hit;
+measured ~0s vs 13s cold) and workers park through it either way. The
+warm-count test asserts warming happens at adoption, not in the loader,
+and the primary swap test runs compiled on the GPU.
+
 ## Stage 3: Tests
 
 All torch tests, on the GPU:

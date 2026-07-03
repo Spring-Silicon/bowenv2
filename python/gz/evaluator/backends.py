@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,7 +52,6 @@ class StubBackend:
 class _ServingSlot:
     manifest: object
     runner: object
-    model: object
     model_version: ModelVersion
 
 
@@ -84,14 +82,13 @@ class TorchBackend:
         self._pending_lock = threading.Lock()
         self._logged_rejections: set[str] = set()
         self._loader_started = False
-        self._capacity = 0
+        self._stop_polling = threading.Event()
 
     def handshake(self, hello: Hello) -> ModelVersion:
         if hello.feature_schema_hash != self._active.manifest.feature_schema_hash:
             raise ProtocolError(ERROR_SCHEMA, "feature schema hash mismatch")
         if hello.batch_capacity > self.max_batch:
             raise ProtocolError(ERROR_CAPACITY, "batch capacity exceeds backend maximum")
-        self._capacity = hello.batch_capacity
         self.stager = BatchStager(self._active.manifest.feature_schema, hello.batch_capacity, self.device)
         self._warm_runner(self._active.runner, self.stager, WARMUP_RUNS)
         if self.poll_interval > 0.0:
@@ -99,12 +96,28 @@ class TorchBackend:
         return self._active.model_version
 
     def apply_pending_swap(self) -> None:
+        if self.stager is None:
+            return
         with self._pending_lock:
             pending = self._pending
             self._pending = None
-        if pending is not None:
-            self._active = pending
-            self.manifest = pending.manifest
+        if pending is None:
+            return
+        try:
+            # CUDA graph capture (reduce-overhead) only works on the serving
+            # thread, so the loader publishes the slot unwarmed and warmup
+            # happens here, between frames. A same-arch checkpoint hits the
+            # inductor cache and warms in well under a second; a cold compile
+            # pauses serving for its duration while workers park.
+            self._warm_runner(pending.runner, self.stager, WARMUP_RUNS)
+        except Exception as error:
+            self._log_rejection(pending.model_version.hex(), pending.model_version, error)
+            return
+        self._active = pending
+        self.manifest = pending.manifest
+
+    def stop_polling(self) -> None:
+        self._stop_polling.set()
 
     def eval(self, view: BatchView) -> EvalResult:
         if self.stager is None:
@@ -112,7 +125,7 @@ class TorchBackend:
         if (
             self._encoder is None
             or self._encoder.capacity != view.batch_capacity
-                or self._encoder.max_actions != view.max_actions
+            or self._encoder.max_actions != view.max_actions
         ):
             self._encoder = OutputEncoder(view.batch_capacity, view.max_actions)
         tensors = self.stager.copy(view)
@@ -136,8 +149,7 @@ class TorchBackend:
         thread.start()
 
     def _loader_loop(self) -> None:
-        while True:
-            time.sleep(self.poll_interval)
+        while not self._stop_polling.wait(self.poll_interval):
             try:
                 self._poll_once()
             except Exception as error:
@@ -146,6 +158,8 @@ class TorchBackend:
     def _poll_once(self) -> None:
         resolved = self.source.resolve_latest()
         version = resolved.manifest.model_version
+        if version.hex() in self._logged_rejections:
+            return
         with self._pending_lock:
             pending_version = self._pending.model_version if self._pending is not None else None
         if version == self._active.model_version or version == pending_version:
@@ -155,14 +169,6 @@ class TorchBackend:
             return
         try:
             slot = self._build_slot(resolved)
-            # Warmup uses separate staging tensors. It compiles/captures on the
-            # serving GPU, so evals during warmup can slow down, but the old
-            # slot remains valid until the warmed slot is published.
-            self._warm_runner(
-                slot.runner,
-                BatchStager(slot.manifest.feature_schema, self._capacity, self.device),
-                WARMUP_RUNS,
-            )
         except Exception as error:
             self._log_rejection(version.hex(), version, error)
             return
@@ -184,7 +190,6 @@ class TorchBackend:
         return _ServingSlot(
             manifest=resolved.manifest,
             runner=runner,
-            model=model,
             model_version=resolved.manifest.model_version,
         )
 

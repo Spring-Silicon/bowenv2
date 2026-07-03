@@ -39,7 +39,7 @@ def test_torch_backend_serves_checkpoint_and_rejects_wrong_schema(tmp_path: Path
     view = BatchView.parse(batch)
     manifest = publish_random_checkpoint(tmp_path, view)
 
-    client, thread = start_torch_client(tmp_path, view, manifest.feature_schema_hash)
+    client, thread, backend = start_torch_client(tmp_path, view, manifest.feature_schema_hash)
     try:
         write_frame(client, FRAME_EVAL, struct.pack("<Q", 44), batch)
         frame_type, payload = read_frame(client, bytearray())
@@ -56,10 +56,11 @@ def test_torch_backend_serves_checkpoint_and_rejects_wrong_schema(tmp_path: Path
         assert frame_type == FRAME_EVAL_RESULT
         assert bytes(payload[8:]) == first[8:]
     finally:
+        backend.stop_polling()
         client.close()
         thread.join(timeout=5)
 
-    bad_client, bad_thread = start_raw_torch_client(tmp_path, view)
+    bad_client, bad_thread, bad_backend = start_raw_torch_client(tmp_path, view)
     try:
         write_frame(bad_client, FRAME_HELLO, make_hello(view, FeatureSchemaHash.from_bytes(b"x" * 32)).encode())
         frame_type, payload = read_frame(bad_client, bytearray())
@@ -67,6 +68,7 @@ def test_torch_backend_serves_checkpoint_and_rejects_wrong_schema(tmp_path: Path
         code, _ = decode_error(payload)
         assert code == ERROR_SCHEMA
     finally:
+        bad_backend.stop_polling()
         bad_client.close()
         bad_thread.join(timeout=5)
 
@@ -75,23 +77,24 @@ def test_torch_backend_hot_swaps_to_new_checkpoint(tmp_path: Path) -> None:
     batch = (FIXTURES / "batch_expander.gzfb").read_bytes()
     view = BatchView.parse(batch)
     first = publish_random_checkpoint(tmp_path, view, seed=11)
-    client, thread = start_torch_client(
+    client, thread, backend = start_torch_client(
         tmp_path,
         view,
         first.feature_schema_hash,
         poll_interval=0.05,
-        compile_model=False,
+        compile_model=None,
     )
     try:
         first_payload = eval_once(client, 1, batch)
         assert result_version(first_payload) == first.model_version
 
         second = publish_random_checkpoint(tmp_path, view, seed=12)
-        second_payload = wait_for_version(client, batch, second.model_version)
+        second_payload = wait_for_version(client, batch, second.model_version, deadline=30.0)
 
         assert result_version(second_payload) == second.model_version
         assert second_payload[24:] != first_payload[24:]
     finally:
+        backend.stop_polling()
         client.close()
         thread.join(timeout=5)
 
@@ -100,7 +103,7 @@ def test_torch_backend_rejects_bad_swap_once_and_keeps_serving(tmp_path: Path, c
     batch = (FIXTURES / "batch_expander.gzfb").read_bytes()
     view = BatchView.parse(batch)
     first = publish_random_checkpoint(tmp_path, view, seed=11)
-    client, thread = start_torch_client(
+    client, thread, backend = start_torch_client(
         tmp_path,
         view,
         first.feature_schema_hash,
@@ -120,6 +123,7 @@ def test_torch_backend_rejects_bad_swap_once_and_keeps_serving(tmp_path: Path, c
         assert captured.count("event=checkpoint_rejected") == 1
         assert "feature schema hash mismatch" in captured
     finally:
+        backend.stop_polling()
         client.close()
         thread.join(timeout=5)
 
@@ -128,7 +132,7 @@ def test_torch_backend_ignores_broken_latest_and_keeps_serving(tmp_path: Path) -
     batch = (FIXTURES / "batch_expander.gzfb").read_bytes()
     view = BatchView.parse(batch)
     first = publish_random_checkpoint(tmp_path, view, seed=11)
-    client, thread = start_torch_client(
+    client, thread, backend = start_torch_client(
         tmp_path,
         view,
         first.feature_schema_hash,
@@ -141,6 +145,7 @@ def test_torch_backend_ignores_broken_latest_and_keeps_serving(tmp_path: Path) -
             time.sleep(0.06)
             assert result_version(eval_once(client, batch_id, batch)) == first.model_version
     finally:
+        backend.stop_polling()
         client.close()
         thread.join(timeout=5)
 
@@ -149,7 +154,7 @@ def test_torch_backend_poll_interval_zero_keeps_static_model(tmp_path: Path) -> 
     batch = (FIXTURES / "batch_expander.gzfb").read_bytes()
     view = BatchView.parse(batch)
     first = publish_random_checkpoint(tmp_path, view, seed=11)
-    client, thread = start_torch_client(
+    client, thread, backend = start_torch_client(
         tmp_path,
         view,
         first.feature_schema_hash,
@@ -162,6 +167,7 @@ def test_torch_backend_poll_interval_zero_keeps_static_model(tmp_path: Path) -> 
         time.sleep(0.2)
         assert result_version(eval_once(client, 2, batch)) == first.model_version
     finally:
+        backend.stop_polling()
         client.close()
         thread.join(timeout=5)
 
@@ -190,9 +196,13 @@ def test_torch_backend_warms_three_times(tmp_path: Path, monkeypatch: pytest.Mon
     assert backend.handshake(make_hello(view, first.feature_schema_hash)) == first.model_version
     assert calls == 3
 
-    publish_random_checkpoint(tmp_path, view, seed=12)
+    second = publish_random_checkpoint(tmp_path, view, seed=12)
     backend._poll_once()
+    assert calls == 3
+
+    backend.apply_pending_swap()
     assert calls == 6
+    assert backend._active.model_version == second.model_version
 
 
 def publish_random_checkpoint(
@@ -242,14 +252,14 @@ def start_torch_client(
     *,
     poll_interval: float = 0.0,
     compile_model: bool | None = None,
-) -> tuple[socket.socket, threading.Thread]:
-    client, thread = start_raw_torch_client(tmp_path, view, poll_interval=poll_interval, compile_model=compile_model)
+) -> tuple[socket.socket, threading.Thread, TorchBackend]:
+    client, thread, backend = start_raw_torch_client(tmp_path, view, poll_interval=poll_interval, compile_model=compile_model)
     write_frame(client, FRAME_HELLO, make_hello(view, schema_hash).encode())
     frame_type, payload = read_frame(client, bytearray())
     assert frame_type == FRAME_HELLO_ACK
     assert struct.unpack_from("<I", payload, 0)[0] == PROTOCOL_VERSION
     del payload
-    return client, thread
+    return client, thread, backend
 
 
 def start_raw_torch_client(
@@ -258,7 +268,7 @@ def start_raw_torch_client(
     *,
     poll_interval: float = 0.0,
     compile_model: bool | None = None,
-) -> tuple[socket.socket, threading.Thread]:
+) -> tuple[socket.socket, threading.Thread, TorchBackend]:
     socket_path = tmp_path / f"eval-{len(list(tmp_path.glob('*.sock')))}.sock"
     ready = threading.Event()
     backend = TorchBackend(
@@ -278,7 +288,7 @@ def start_raw_torch_client(
     assert ready.wait(timeout=5)
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(str(socket_path))
-    return client, thread
+    return client, thread, backend
 
 
 def make_hello(view: BatchView, schema_hash: FeatureSchemaHash) -> Hello:
@@ -312,8 +322,8 @@ def eval_once(client: socket.socket, batch_id: int, batch: bytes) -> bytes:
     return bytes(payload)
 
 
-def wait_for_version(client: socket.socket, batch: bytes, version: ModelVersion) -> bytes:
-    deadline = time.monotonic() + 5.0
+def wait_for_version(client: socket.socket, batch: bytes, version: ModelVersion, *, deadline: float = 5.0) -> bytes:
+    deadline = time.monotonic() + deadline
     batch_id = 100
     last = b""
     while time.monotonic() < deadline:
