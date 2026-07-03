@@ -1,6 +1,7 @@
 use gz_cli::selfplay::{EvaluatorMode, ReferenceMode, SelfplayConfig, run};
 use gz_replay::ReplayStore;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +32,38 @@ impl Drop for TestDir {
 }
 
 #[test]
+fn selfplay_config_defaults_tree_reuse_on() {
+    assert!(SelfplayConfig::default().tree_reuse);
+}
+
+#[test]
+fn selfplay_cli_accepts_tree_reuse_flag() {
+    let dir = TestDir::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_graphzero"))
+        .args([
+            "selfplay",
+            "--replay-dir",
+            dir.path().to_str().unwrap(),
+            "--episodes",
+            "1",
+            "--lanes",
+            "1",
+            "--workers-per-lane",
+            "1",
+            "--max-steps",
+            "1",
+            "--simulations",
+            "1",
+            "--tree-reuse",
+            "false",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
 fn selfplay_run_writes_replay_rows() {
     let dir = TestDir::new();
     let summary = run(SelfplayConfig {
@@ -43,6 +76,7 @@ fn selfplay_run_writes_replay_rows() {
         seed: 3,
         max_steps: 2,
         simulations: 2,
+        tree_reuse: false,
         max_batch: 4,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
@@ -76,6 +110,7 @@ fn selfplay_run_supports_stub_evaluator() {
         seed: 4,
         max_steps: 2,
         simulations: 2,
+        tree_reuse: false,
         max_batch: 2,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
@@ -106,6 +141,7 @@ fn selfplay_run_supports_self_average_reference() {
         seed: 11,
         max_steps: 2,
         simulations: 2,
+        tree_reuse: false,
         max_batch: 1,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
@@ -135,6 +171,7 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         seed: 3,
         max_steps: 2,
         simulations: 2,
+        tree_reuse: false,
         max_batch: 1,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,

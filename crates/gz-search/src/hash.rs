@@ -53,11 +53,12 @@ pub fn gumbel_search_config_hash(
     c_visit: f32,
     c_scale: f32,
     temperature_moves: usize,
+    tree_reuse: bool,
     candidate_options: CandidateOptions,
     measure_options: MeasureOptions,
 ) -> SearchConfigHash {
     let mut hasher = blake3::Hasher::new();
-    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v1");
+    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v2");
     update_u64(&mut hasher, max_steps as u64);
     update_u64(&mut hasher, simulations as u64);
     update_u64(&mut hasher, max_considered_actions as u64);
@@ -66,6 +67,7 @@ pub fn gumbel_search_config_hash(
     update_u32(&mut hasher, c_visit.to_bits());
     update_u32(&mut hasher, c_scale.to_bits());
     update_u64(&mut hasher, temperature_moves as u64);
+    update_bool(&mut hasher, tree_reuse);
     update_candidate_options(&mut hasher, candidate_options);
     update_measure_options(&mut hasher, measure_options);
     SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())

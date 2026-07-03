@@ -73,9 +73,16 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         c_visit: 50.0,
         c_scale: 1.0,
         temperature_moves: 0,
+        tree_reuse: false,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: measure_options(),
     }
+}
+
+fn reuse_config(max_steps: usize) -> GumbelMctsConfig {
+    let mut config = config(max_steps);
+    config.tree_reuse = true;
+    config
 }
 
 #[test]
@@ -253,6 +260,12 @@ fn search_config_hash_changes_when_seed_changes() {
         GumbelMcts::new(left).search_config_hash(),
         GumbelMcts::new(config(1)).search_config_hash()
     );
+
+    let reuse = reuse_config(1);
+    assert_ne!(
+        GumbelMcts::new(reuse).search_config_hash(),
+        GumbelMcts::new(config(1)).search_config_hash()
+    );
 }
 
 #[test]
@@ -283,4 +296,97 @@ fn opponent_context_uses_same_index_alignment_and_stop_terminal_row() {
     assert_eq!(evaluator.requests[0].position.opponent_row(), Some(1));
     assert_eq!(evaluator.requests[1].position.leaf_depth, 2);
     assert_eq!(evaluator.requests[1].position.opponent_row(), Some(3));
+}
+
+#[test]
+fn tree_reuse_on_is_deterministic() {
+    fn run() -> gz_search::GumbelEpisode<u8, u8> {
+        let mut engine = TestEngine::new()
+            .candidates(0, [1])
+            .candidates(1, [2])
+            .candidates(2, [3])
+            .reward(3, 3.0);
+        let mut evaluator = RecordedEvaluator::default()
+            .row(0, [10.0, -10.0], 0.0)
+            .row(1, [10.0, -10.0], 0.1)
+            .row(2, [10.0, -10.0], 0.2)
+            .row(3, [0.0], 0.3);
+        let mut config = reuse_config(3);
+        config.simulations = NonZeroUsize::new(8).unwrap();
+        config.max_considered_actions = NonZeroUsize::new(2).unwrap();
+        config.seed = 42;
+
+        GumbelMcts::new(config)
+            .run(
+                &mut engine,
+                &mut evaluator,
+                0,
+                GumbelEpisodeContext::default(),
+            )
+            .unwrap()
+    }
+
+    assert_eq!(run(), run());
+}
+
+#[test]
+fn tree_reuse_skips_later_root_evals() {
+    let mut engine = TestEngine::new()
+        .candidates(0, [1])
+        .candidates(1, [2])
+        .candidates(2, [3])
+        .reward(3, 3.0);
+    let mut evaluator = RecordedEvaluator::default()
+        .row(0, [10.0, -10.0], 0.0)
+        .row(1, [10.0, -10.0], 0.1)
+        .row(2, [10.0, -10.0], 0.2)
+        .row(3, [0.0], 0.3);
+    let mut config = reuse_config(3);
+    config.simulations = NonZeroUsize::new(16).unwrap();
+    config.max_considered_actions = NonZeroUsize::new(2).unwrap();
+    let search = GumbelMcts::new(config);
+
+    let episode = search
+        .run(
+            &mut engine,
+            &mut evaluator,
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(episode.steps.len(), 3);
+    assert_eq!(episode.root_stats.len(), 3);
+    assert_eq!(episode.root_stats[0].carried_nodes, 0);
+    assert_eq!(episode.root_stats[0].carried_root_visits, 0);
+    assert!(episode.root_stats[1..].iter().all(|stats| {
+        stats.eval_count < episode.root_stats[0].eval_count && stats.carried_root_visits > 0
+    }));
+    let root_eval_steps = evaluator
+        .requests
+        .iter()
+        .filter(|request| request.position.leaf_depth == 0)
+        .map(|request| request.position.root_step)
+        .collect::<Vec<_>>();
+
+    assert_eq!(root_eval_steps, vec![0]);
+}
+
+#[test]
+fn tree_reuse_stop_selection_completes_cleanly() {
+    let mut engine = TestEngine::new().candidates(0, [1]).reward(0, 0.0);
+    let mut evaluator = RecordedEvaluator::default().row(0, [-10.0, 10.0], 0.0);
+    let search = GumbelMcts::new(reuse_config(3));
+
+    let episode = search
+        .run(
+            &mut engine,
+            &mut evaluator,
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
+    assert_eq!(episode.final_graph, 0);
 }

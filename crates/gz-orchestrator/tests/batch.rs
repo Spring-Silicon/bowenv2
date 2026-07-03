@@ -11,7 +11,7 @@ use gz_orchestrator::{
 use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
 use std::num::NonZeroUsize;
 
-fn search(engine: &WhittleEngine) -> GumbelMcts {
+fn search(engine: &WhittleEngine, tree_reuse: bool) -> GumbelMcts {
     GumbelMcts::new(GumbelMctsConfig {
         max_steps: 2,
         simulations: NonZeroUsize::new(2).unwrap(),
@@ -21,6 +21,7 @@ fn search(engine: &WhittleEngine) -> GumbelMcts {
         c_visit: 50.0,
         c_scale: 1.0,
         temperature_moves: 0,
+        tree_reuse,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: engine.measure_options(),
     })
@@ -43,9 +44,10 @@ fn repeated_roots(
 fn run_batched(
     workers: usize,
     roots: u64,
+    tree_reuse: bool,
 ) -> Vec<OrchestratedEpisode<WhittleGraphId, WhittleCandidateId>> {
     let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
-    let search = search(&engine);
+    let search = search(&engine, tree_reuse);
     let mut orchestrator = BatchedGumbelOrchestrator::new(
         engine,
         evaluator(),
@@ -60,9 +62,12 @@ fn run_batched(
         .episodes
 }
 
-fn run_serial(roots: u64) -> Vec<OrchestratedEpisode<WhittleGraphId, WhittleCandidateId>> {
+fn run_serial(
+    roots: u64,
+    tree_reuse: bool,
+) -> Vec<OrchestratedEpisode<WhittleGraphId, WhittleCandidateId>> {
     let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
-    let search = search(&engine);
+    let search = search(&engine, tree_reuse);
     let mut orchestrator =
         SerialGumbelOrchestrator::new(WorkerId::new(0), engine, evaluator(), search);
 
@@ -77,31 +82,35 @@ fn run_serial(roots: u64) -> Vec<OrchestratedEpisode<WhittleGraphId, WhittleCand
 
 #[test]
 fn one_worker_matches_serial() {
-    let batched = run_batched(1, 3);
-    let serial = run_serial(3);
+    for tree_reuse in [false, true] {
+        let batched = run_batched(1, 3, tree_reuse);
+        let serial = run_serial(3, tree_reuse);
 
-    assert_eq!(batched.len(), serial.len());
-    for (batched, serial) in batched.iter().zip(&serial) {
-        assert_eq!(batched.episode, serial.episode);
+        assert_eq!(batched.len(), serial.len());
+        for (batched, serial) in batched.iter().zip(&serial) {
+            assert_eq!(batched.episode, serial.episode);
+        }
     }
 }
 
 #[test]
 fn multi_worker_matches_serial_and_assigns_admission_ids() {
-    let batched = run_batched(4, 7);
-    let serial = run_serial(7);
+    for tree_reuse in [false, true] {
+        let batched = run_batched(4, 7, tree_reuse);
+        let serial = run_serial(7, tree_reuse);
 
-    assert_eq!(batched.len(), serial.len());
-    for (index, (batched, serial)) in batched.iter().zip(&serial).enumerate() {
-        assert_eq!(batched.episode_id.value(), index as u64);
-        assert_eq!(batched.episode, serial.episode);
+        assert_eq!(batched.len(), serial.len());
+        for (index, (batched, serial)) in batched.iter().zip(&serial).enumerate() {
+            assert_eq!(batched.episode_id.value(), index as u64);
+            assert_eq!(batched.episode, serial.episode);
+        }
     }
 }
 
 #[test]
 fn first_batch_fills_available_workers() {
     let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
-    let search = search(&engine);
+    let search = search(&engine, false);
     let mut orchestrator =
         BatchedGumbelOrchestrator::new(engine, evaluator(), search, NonZeroUsize::new(4).unwrap());
     let mut roots = repeated_roots(6);
@@ -117,7 +126,7 @@ fn first_batch_fills_available_workers() {
 #[test]
 fn empty_root_source_returns_empty_run() {
     let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
-    let search = search(&engine);
+    let search = search(&engine, false);
     let mut orchestrator =
         BatchedGumbelOrchestrator::new(engine, evaluator(), search, NonZeroUsize::new(4).unwrap());
     let mut roots = repeated_roots(0);
@@ -133,7 +142,7 @@ fn empty_root_source_returns_empty_run() {
 #[test]
 fn evaluator_failure_aborts_run() {
     let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
-    let search = search(&engine);
+    let search = search(&engine, false);
     let mut orchestrator = BatchedGumbelOrchestrator::new(
         engine,
         FailingEvaluator,
@@ -153,7 +162,7 @@ fn evaluator_failure_aborts_run() {
 fn batched_run_is_deterministic() {
     let first = {
         let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
-        let search = search(&engine);
+        let search = search(&engine, false);
         let mut orchestrator = BatchedGumbelOrchestrator::new(
             engine,
             evaluator(),
@@ -167,7 +176,7 @@ fn batched_run_is_deterministic() {
     };
     let second = {
         let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
-        let search = search(&engine);
+        let search = search(&engine, false);
         let mut orchestrator = BatchedGumbelOrchestrator::new(
             engine,
             evaluator(),

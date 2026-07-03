@@ -26,6 +26,7 @@ pub struct GumbelMctsConfig {
     pub c_visit: f32,
     pub c_scale: f32,
     pub temperature_moves: usize,
+    pub tree_reuse: bool,
     pub candidate_options: CandidateOptions,
     pub measure_options: MeasureOptions,
 }
@@ -51,6 +52,7 @@ impl GumbelMcts {
             config.c_visit,
             config.c_scale,
             config.temperature_moves,
+            config.tree_reuse,
             config.candidate_options,
             config.measure_options,
         );
@@ -279,6 +281,8 @@ pub struct GumbelRootStats {
     pub simulations: usize,
     pub expanded_nodes: usize,
     pub eval_count: usize,
+    pub carried_nodes: usize,
+    pub carried_root_visits: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,6 +292,7 @@ pub struct GumbelEpisode<G, C> {
     pub root_context: ReplayGraphContext,
     pub final_context: ReplayGraphContext,
     pub steps: Vec<GumbelStep<G, C>>,
+    pub root_stats: Vec<GumbelRootStats>,
     pub final_measure: MeasureResult<G>,
     pub stop_reason: GumbelStopReason,
     pub search_config_hash: SearchConfigHash,
@@ -329,6 +334,7 @@ pub struct GumbelEpisodeTask<G, C> {
     current_context: Option<ReplayGraphContext>,
     root_context: Option<ReplayGraphContext>,
     steps: Vec<GumbelStep<G, C>>,
+    root_stats: Vec<GumbelRootStats>,
     step_index: usize,
     budget_step: f32,
     next_token: u64,
@@ -363,6 +369,7 @@ where
             current_context: None,
             root_context: None,
             steps: Vec::new(),
+            root_stats: Vec::new(),
             step_index: 0,
             budget_step,
             next_token: 0,
@@ -411,7 +418,8 @@ where
                         if root_context != result.root_context {
                             return Err(internal("root context mismatch"));
                         }
-                        self.finish_root_result(result)?;
+                        let reused_root = self.reused_root_task(&root_task, &result)?;
+                        self.finish_root_result(result, reused_root)?;
                     }
                 },
                 EpisodeTaskState::Measure { stop_reason } => {
@@ -476,6 +484,7 @@ where
                     root_context,
                     final_context,
                     steps: std::mem::take(&mut self.steps),
+                    root_stats: std::mem::take(&mut self.root_stats),
                     final_measure: measure,
                     stop_reason,
                     search_config_hash: self.search_config_hash,
@@ -496,19 +505,23 @@ where
     }
 
     fn new_root_task(&self) -> GumbelRootTask<G, C> {
-        let root_step = self.step_index as u32;
+        self.root_task_at(self.step_index, self.current)
+    }
+
+    fn root_task_at(&self, step_index: usize, root: G) -> GumbelRootTask<G, C> {
+        let root_step = step_index as u32;
         GumbelRootTask::new(
             &GumbelMcts {
                 config: self.config,
                 search_config_hash: self.search_config_hash,
             },
             self.identity,
-            self.current,
+            root,
             GumbelSearchContext {
                 root_step,
-                budget_fraction: budget_fraction(self.config.max_steps, self.step_index),
+                budget_fraction: budget_fraction(self.config.max_steps, step_index),
                 budget_step: self.budget_step,
-                selection_temperature: if self.step_index < self.config.temperature_moves {
+                selection_temperature: if step_index < self.config.temperature_moves {
                     1.0
                 } else {
                     0.0
@@ -518,7 +531,33 @@ where
         )
     }
 
-    fn finish_root_result(&mut self, result: GumbelRootResult<G, C>) -> EngineResult<()> {
+    fn reused_root_task(
+        &self,
+        root_task: &GumbelRootTask<G, C>,
+        result: &GumbelRootResult<G, C>,
+    ) -> EngineResult<Option<GumbelRootTask<G, C>>> {
+        let next_step = self.step_index + 1;
+        if !self.config.tree_reuse
+            || matches!(result.selected_action, SearchAction::Stop)
+            || next_step >= self.config.max_steps
+        {
+            return Ok(None);
+        }
+
+        let fresh = self.root_task_at(next_step, result.selected_after);
+        root_task.reused_child_task(
+            result.selected_action_index,
+            result.selected_after,
+            result.selected_after_context,
+            fresh.context,
+        )
+    }
+
+    fn finish_root_result(
+        &mut self,
+        result: GumbelRootResult<G, C>,
+        reused_root: Option<GumbelRootTask<G, C>>,
+    ) -> EngineResult<()> {
         let before_context = self.current_context.unwrap_or(result.root_context);
         let step_ref = step_ref(
             before_context,
@@ -551,6 +590,7 @@ where
         self.current = result.selected_after;
         self.current_context = Some(result.selected_after_context);
         self.steps.push(step);
+        self.root_stats.push(result.stats);
         self.step_index += 1;
 
         if selected_stop {
@@ -561,6 +601,8 @@ where
             self.state = EpisodeTaskState::Measure {
                 stop_reason: GumbelStopReason::MaxSteps,
             };
+        } else if let Some(root_task) = reused_root {
+            self.state = EpisodeTaskState::Root(root_task);
         } else {
             self.state = EpisodeTaskState::Root(self.new_root_task());
         }
@@ -659,6 +701,37 @@ where
                 run: None,
             },
         }
+    }
+
+    fn reused_child_task(
+        &self,
+        action: usize,
+        root: G,
+        expected_context: ReplayGraphContext,
+        context: GumbelSearchContext,
+    ) -> EngineResult<Option<Self>> {
+        let Some(child_index) = self.tree.nodes[0].children[action] else {
+            return Ok(None);
+        };
+        let (tree, root_context) = self.tree.compact_subtree(child_index, context)?;
+        if root_context != expected_context {
+            return Err(internal("reused root context mismatch"));
+        }
+
+        let mut task = Self {
+            config: self.config,
+            identity: self.identity,
+            root,
+            context,
+            root_context: Some(root_context),
+            tree,
+            next_token: 0,
+            pending: None,
+            state: RootTaskState::Done,
+        };
+        let run = task.start_run_state();
+        task.state = RootTaskState::Running(run);
+        Ok(Some(task))
     }
 
     pub fn poll(&mut self) -> EngineResult<SearchPoll<G, C, GumbelRootResult<G, C>>> {
@@ -821,14 +894,27 @@ where
         }
 
         let root_scores = self.tree.root_scores(0, &run.base_scores);
-        let target_visits = run.schedule[run.schedule_index];
-        let Some(action) = best_eligible(
-            &self.tree.nodes[0],
-            &run.considered,
-            target_visits,
-            &root_scores,
-        ) else {
-            return false;
+        let action = loop {
+            if run.schedule_index >= run.schedule.len() {
+                return false;
+            }
+
+            let target_visits = run.schedule[run.schedule_index];
+            if let Some(action) = best_eligible(
+                &self.tree.nodes[0],
+                &run.considered,
+                target_visits,
+                &root_scores,
+                self.config.tree_reuse,
+            ) {
+                break action;
+            }
+
+            if !self.config.tree_reuse {
+                return false;
+            }
+
+            run.schedule_index += 1;
         };
 
         run.descent = Some(DescentState {
@@ -1185,6 +1271,8 @@ where
                 simulations: run.simulations,
                 expanded_nodes: self.tree.nodes.len(),
                 eval_count: self.tree.eval_count,
+                carried_nodes: self.tree.carried_nodes,
+                carried_root_visits: self.tree.carried_root_visits,
             },
         }))
     }
@@ -1290,6 +1378,8 @@ struct Tree<G, C> {
     context: GumbelSearchContext,
     nodes: Vec<Node<G, C>>,
     eval_count: usize,
+    carried_nodes: usize,
+    carried_root_visits: u32,
 }
 
 impl<G, C> Tree<G, C>
@@ -1303,7 +1393,62 @@ where
             context,
             nodes: Vec::new(),
             eval_count: 0,
+            carried_nodes: 0,
+            carried_root_visits: 0,
         }
+    }
+
+    fn compact_subtree(
+        &self,
+        root_index: usize,
+        context: GumbelSearchContext,
+    ) -> EngineResult<(Self, ReplayGraphContext)> {
+        let mut remap = vec![None; self.nodes.len()];
+        let mut old_indices = Vec::new();
+        let mut stack = vec![root_index];
+
+        while let Some(index) = stack.pop() {
+            if remap[index].is_some() {
+                continue;
+            }
+
+            remap[index] = Some(old_indices.len());
+            old_indices.push(index);
+
+            for child in self.nodes[index].children.iter().rev().flatten() {
+                stack.push(*child);
+            }
+        }
+
+        let mut nodes = Vec::with_capacity(old_indices.len());
+        for &old_index in &old_indices {
+            let mut node = self.nodes[old_index].clone();
+            for child in &mut node.children {
+                if let Some(old_child) = *child {
+                    *child = remap[old_child];
+                }
+            }
+            nodes.push(node);
+        }
+
+        let root_context = nodes
+            .first()
+            .map(|node| node.context)
+            .ok_or_else(|| internal("empty reused subtree"))?;
+        let carried_root_visits = nodes[0].visits.iter().sum();
+        let carried_nodes = nodes.len();
+
+        Ok((
+            Self {
+                config: self.config,
+                context,
+                nodes,
+                eval_count: 0,
+                carried_nodes,
+                carried_root_visits,
+            },
+            root_context,
+        ))
     }
 
     fn backup(&mut self, path: &[Edge], value: f32) {
@@ -1498,11 +1643,19 @@ fn best_eligible<G, C>(
     considered: &[usize],
     target_visits: u32,
     scores: &[f32],
+    tree_reuse: bool,
 ) -> Option<usize> {
     considered
         .iter()
         .copied()
-        .filter(|&action| node.logits[action].is_finite() && node.visits[action] == target_visits)
+        .filter(|&action| {
+            node.logits[action].is_finite()
+                && if tree_reuse {
+                    node.visits[action] <= target_visits
+                } else {
+                    node.visits[action] == target_visits
+                }
+        })
         .max_by(|&left, &right| {
             scores[left]
                 .total_cmp(&scores[right])

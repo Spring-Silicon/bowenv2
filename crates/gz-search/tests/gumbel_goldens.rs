@@ -74,6 +74,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         c_visit: 50.0,
         c_scale: 1.0,
         temperature_moves: 0,
+        tree_reuse: false,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: measure_options(),
     }
@@ -118,7 +119,51 @@ fn g1_multi_step_episode_golden() {
     assert_fingerprint(
         "g1",
         &episode_fingerprint(&episode),
-        "2629e6fc53b5b5ad743e66549494e6088d54321c8f6e39f9dc1e083fc688ac8e",
+        "d3ab766c6c6946ff8131c5f6fc5b3d01294a50acaec258c7559c8d0cdae3f062",
+    );
+}
+
+#[test]
+fn g1_reuse_on_multi_step_episode_golden() {
+    let mut engine = TestEngine::new()
+        .candidates(0, [1, 2])
+        .candidates(10, [3, 4])
+        .candidates(20, [])
+        .candidates(30, [])
+        .candidates(40, [])
+        .apply(0, 1, 10)
+        .apply(0, 2, 20)
+        .apply(10, 3, 30)
+        .apply(10, 4, 40)
+        .reward(30, 30.0)
+        .reward(40, 40.0);
+    let mut evaluator = RecordedEvaluator::default()
+        .row(0, [0.5, 0.1, -0.3], 0.0)
+        .row(10, [1.0, -0.5, -1.0], 0.3)
+        .row(20, [0.0], 0.2)
+        .row(30, [0.0], 0.4)
+        .row(40, [0.0], 0.5);
+    let mut cfg = config(2);
+    cfg.tree_reuse = true;
+    cfg.seed = 17;
+    cfg.gumbel_scale = 0.7;
+    cfg.simulations = NonZeroUsize::new(4).unwrap();
+    cfg.max_considered_actions = NonZeroUsize::new(3).unwrap();
+    let search = GumbelMcts::new(cfg);
+
+    let episode = search
+        .run(
+            &mut engine,
+            &mut evaluator,
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_fingerprint(
+        "g1-reuse",
+        &episode_fingerprint(&episode),
+        "0cc49f8997744bf1876b1b4cc25deb41c8b2aaa79f9b0f07ff7e817dfb774ce7",
     );
 }
 
@@ -153,7 +198,7 @@ fn g2_temperature_episode_golden() {
     assert_fingerprint(
         "g2",
         &episode_fingerprint(&episode),
-        "d24f9ae84bbc4a960124b5a23a208fc7a9f22910725f90c05edbce73e43827dc",
+        "8ab18c4e4c77d421443aa1ddc97a98aa1d330d96e4de7ec3295c0f12259c9963",
     );
 }
 
@@ -180,7 +225,7 @@ fn g3_opponent_stop_reeval_episode_golden() {
     assert_fingerprint(
         "g3",
         &episode_fingerprint(&episode),
-        "e6ce5da18f9c3c7fa44d3668bba9dd7d75d9d598ab5c208c2ddf483dee46c3b9",
+        "86e24d80855d3f41b78f62cb3afc6cf15a4a0a7fd3e4d2eda4c67a146a5051b3",
     );
 }
 
@@ -207,7 +252,7 @@ fn g4_rejected_candidate_episode_golden() {
     assert_fingerprint(
         "g4",
         &episode_fingerprint(&episode),
-        "efbb4e868757c6fbffc565725ada7275388fc2bae652dd6ad417f79d9677588d",
+        "36fdff2a1f5790a4025f1dab1629585dd65e4b95060be6d50509ed72c6a302ee",
     );
 }
 
@@ -229,7 +274,7 @@ fn g5_zero_step_episode_golden() {
     assert_fingerprint(
         "g5",
         &episode_fingerprint(&episode),
-        "b9aba571962a9d2ce4c4559707e1cad43e93efdd950a1f26f7dcc88a353cc0e3",
+        "0433abd02ff64853debdd2f970b78fc68f85f9e546f47ca870c594eeb790b1a7",
     );
 }
 
@@ -264,7 +309,7 @@ fn g6_root_result_golden() {
     assert_fingerprint(
         "g6",
         &root_fingerprint(&result),
-        "74b1587d9967be874cd6e1aa1a9809927ffc5d1078e1064e708bf46987d8b033",
+        "3f34cd6f373dc2898d72aaa5854664f87aea6ad4f9b53fcb6604ab44bc9ccea6",
     );
 }
 
@@ -291,6 +336,10 @@ fn episode_fingerprint<G, C>(episode: &GumbelEpisode<G, C>) -> String {
         out.f32(step.root_search_value);
         out.f32(step.root_q_max);
         out.model_version(step.model_version);
+    }
+    out.len(episode.root_stats.len());
+    for stats in &episode.root_stats {
+        out.root_stats(*stats);
     }
     out.finish()
 }
@@ -444,5 +493,7 @@ impl Fingerprint {
         self.usize(stats.simulations);
         self.usize(stats.expanded_nodes);
         self.usize(stats.eval_count);
+        self.usize(stats.carried_nodes);
+        self.u32(stats.carried_root_visits);
     }
 }

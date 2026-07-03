@@ -127,6 +127,7 @@ pub struct GumbelMctsConfig {
     pub c_visit: f32,
     pub c_scale: f32,
     pub temperature_moves: usize,
+    pub tree_reuse: bool,
     pub candidate_options: CandidateOptions,
     pub measure_options: MeasureOptions,
 }
@@ -150,12 +151,21 @@ pub struct GumbelRootResult<G, C> {
     pub stats: GumbelRootStats,
 }
 
+pub struct GumbelRootStats {
+    pub simulations: usize,
+    pub expanded_nodes: usize,
+    pub eval_count: usize,
+    pub carried_nodes: usize,
+    pub carried_root_visits: u32,
+}
+
 pub struct GumbelEpisode<G, C> {
     pub root: G,
     pub final_graph: G,
     pub root_context: ReplayGraphContext,
     pub final_context: ReplayGraphContext,
     pub steps: Vec<GumbelStep<G, C>>,
+    pub root_stats: Vec<GumbelRootStats>,
     pub final_measure: MeasureResult<G>,
     pub stop_reason: GumbelStopReason,
     pub search_config_hash: SearchConfigHash,
@@ -200,6 +210,7 @@ c_visit must be finite and non-negative
 c_scale must be finite and non-negative
 candidate_options are passed unchanged to engine.candidates()
 measure_options are used only for final episode measurement
+tree_reuse carries the selected child subtree to the next episode step
 ```
 
 There is no user-facing max-depth budget. Like WhittleZero, each simulation
@@ -207,6 +218,29 @@ descends through already-expanded tree nodes until it reaches a new leaf, STOP,
 an engine rejection/mask event, a no-legal-action state, or a path cycle guard.
 Depth is still tracked for eval context and opponent-row alignment; it is not a
 search budget.
+
+Tree reuse:
+
+```text
+When tree_reuse is true, an episode carries the selected non-STOP child
+subtree from step t into the root search for step t+1. The carried root is
+not expanded or evaluated again. The new root task keeps the carried node
+payloads and visit/value statistics, but uses the new GumbelSearchContext
+for all future eval requests. Root Gumbel noise is regenerated from
+(seed, root_step), so reuse remains deterministic.
+
+Carried policy/value outputs may have been produced with the previous
+position context or an older model version. This staleness is accepted
+within one episode; there is no cross-episode reuse or staleness-triggered
+re-evaluation.
+
+With tree_reuse disabled, root scheduling keeps the original exact
+eligibility rule: visits == target_visits. With tree_reuse enabled,
+eligibility is visits <= target_visits, and schedule slots with no eligible
+action are skipped without consuming a simulation. GumbelRootStats reports
+carried_nodes and carried_root_visits for seeded roots; both are zero for
+fresh roots.
+```
 
 Execution methods:
 

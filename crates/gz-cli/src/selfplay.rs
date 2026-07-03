@@ -38,6 +38,7 @@ pub struct SelfplayConfig {
     pub seed: u64,
     pub max_steps: usize,
     pub simulations: usize,
+    pub tree_reuse: bool,
     pub max_batch: usize,
     pub evaluator: EvaluatorMode,
     pub python_dir: Option<PathBuf>,
@@ -61,6 +62,7 @@ impl Default for SelfplayConfig {
             seed: 0,
             max_steps: 8,
             simulations: 8,
+            tree_reuse: true,
             max_batch: 16,
             evaluator: EvaluatorMode::Random,
             python_dir: None,
@@ -512,6 +514,7 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         c_visit: 50.0,
         c_scale: 1.0,
         temperature_moves: 0,
+        tree_reuse: config.tree_reuse,
         candidate_options: match config.evaluator {
             EvaluatorMode::Random => CandidateOptions::default(),
             EvaluatorMode::Stub | EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {

@@ -50,6 +50,7 @@ fn replay_serve_returns_feature_batch_and_targets() {
         seed: 5,
         max_steps: 2,
         simulations: 2,
+        tree_reuse: false,
         max_batch: 2,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
@@ -132,6 +133,7 @@ fn replay_serve_rejects_featureless_store() {
         seed: 7,
         max_steps: 1,
         simulations: 1,
+        tree_reuse: false,
         max_batch: 1,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
@@ -247,6 +249,7 @@ fn live_setup(
         c_visit: 50.0,
         c_scale: 1.0,
         temperature_moves: 0,
+        tree_reuse: false,
         candidate_options: gz_engine::CandidateOptions {
             max_candidates: Some(255),
             deterministic_order: true,
