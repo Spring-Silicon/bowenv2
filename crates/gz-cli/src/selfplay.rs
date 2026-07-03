@@ -41,6 +41,8 @@ pub struct SelfplayConfig {
     pub max_batch: usize,
     pub evaluator: EvaluatorMode,
     pub python_dir: Option<PathBuf>,
+    pub checkpoint_dir: Option<PathBuf>,
+    pub eval_device: Option<String>,
     pub serve_socket: Option<PathBuf>,
     pub serve_max_batch: usize,
     pub replay_backlog: Option<u64>,
@@ -61,6 +63,8 @@ impl Default for SelfplayConfig {
             max_batch: 16,
             evaluator: EvaluatorMode::Random,
             python_dir: None,
+            checkpoint_dir: None,
+            eval_device: None,
             serve_socket: None,
             serve_max_batch: 512,
             replay_backlog: None,
@@ -100,8 +104,20 @@ impl SelfplayConfig {
             }
             if self.evaluator == EvaluatorMode::Random {
                 return Err(
-                    "--serve-socket requires a featurized evaluator (stub|process-stub)".to_owned(),
+                    "--serve-socket requires a featurized evaluator (stub|process-stub|torch)"
+                        .to_owned(),
                 );
+            }
+        }
+        if self.evaluator == EvaluatorMode::Torch && self.checkpoint_dir.is_none() {
+            return Err("--evaluator torch requires --checkpoint-dir".to_owned());
+        }
+        if self.evaluator != EvaluatorMode::Torch {
+            if self.checkpoint_dir.is_some() {
+                return Err("--checkpoint-dir requires --evaluator torch".to_owned());
+            }
+            if self.eval_device.is_some() {
+                return Err("--eval-device requires --evaluator torch".to_owned());
             }
         }
         if self.episodes == 0 && self.serve_socket.is_none() {
@@ -115,6 +131,28 @@ impl SelfplayConfig {
         }
 
         Ok(())
+    }
+
+    /// Extra command-line arguments passed to the spawned evaluator child.
+    pub fn evaluator_extra_args(&self) -> Vec<String> {
+        match self.evaluator {
+            EvaluatorMode::Random | EvaluatorMode::Stub | EvaluatorMode::ProcessStub => Vec::new(),
+            EvaluatorMode::Torch => {
+                let checkpoint_dir = self
+                    .checkpoint_dir
+                    .as_ref()
+                    .expect("validated checkpoint_dir exists");
+                let device = self.eval_device.as_deref().unwrap_or("cuda:0");
+                vec![
+                    "--backend".to_owned(),
+                    "torch".to_owned(),
+                    "--checkpoint-dir".to_owned(),
+                    checkpoint_dir.display().to_string(),
+                    "--device".to_owned(),
+                    device.to_owned(),
+                ]
+            }
+        }
     }
 }
 
@@ -133,6 +171,7 @@ pub enum EvaluatorMode {
     Random,
     Stub,
     ProcessStub,
+    Torch,
 }
 
 impl EvaluatorMode {
@@ -141,6 +180,7 @@ impl EvaluatorMode {
             Self::Random => "random",
             Self::Stub => "stub",
             Self::ProcessStub => "process-stub",
+            Self::Torch => "torch",
         }
     }
 }
@@ -153,6 +193,7 @@ impl FromStr for EvaluatorMode {
             "random" => Ok(Self::Random),
             "stub" => Ok(Self::Stub),
             "process-stub" => Ok(Self::ProcessStub),
+            "torch" => Ok(Self::Torch),
             _ => Err(format!("unknown evaluator: {value}")),
         }
     }
@@ -231,8 +272,8 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
     match config.evaluator {
         EvaluatorMode::Random => run_random(config, store, engines, search, roots, providers),
         EvaluatorMode::Stub => run_stub(config, store, engines, search, roots, providers),
-        EvaluatorMode::ProcessStub => {
-            run_process_stub(config, store, engines, search, roots, providers)
+        EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {
+            run_process(config, store, engines, search, roots, providers)
         }
     }
 }
@@ -312,7 +353,7 @@ fn run_stub(
     summarize(&store, run, EvaluatorMode::Stub, Some(STUB_MODEL_VERSION))
 }
 
-fn run_process_stub(
+fn run_process(
     config: SelfplayConfig,
     store: std::sync::Arc<ReplayStore>,
     engines: Vec<WhittleEngine>,
@@ -332,6 +373,7 @@ fn run_process_stub(
         socket_path: process_socket_path(),
         ready_timeout: Duration::from_secs(10),
         io_timeout: Duration::from_secs(30),
+        extra_args: config.evaluator_extra_args(),
         ..EvaluatorProcessConfig::default()
     })
     .map_err(|error| error.to_string())?;
@@ -347,6 +389,7 @@ fn run_process_stub(
         engines[0].action_set_hash(),
     );
     let backend = process.connect(&hello).map_err(|error| error.to_string())?;
+    let model_version = backend.model_version();
     let orchestrator = ThreadedGumbelOrchestrator::new(
         engines,
         random_placeholder(&config)?,
@@ -370,12 +413,7 @@ fn run_process_stub(
         .map_err(|error| error.to_string())?;
     wait_for_process_exit(&mut process)?;
 
-    summarize(
-        &store,
-        run,
-        EvaluatorMode::ProcessStub,
-        Some(STUB_MODEL_VERSION),
-    )
+    summarize(&store, run, config.evaluator, Some(model_version))
 }
 
 fn summarize(
@@ -461,7 +499,9 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         temperature_moves: 0,
         candidate_options: match config.evaluator {
             EvaluatorMode::Random => CandidateOptions::default(),
-            EvaluatorMode::Stub | EvaluatorMode::ProcessStub => feature_candidate_options(),
+            EvaluatorMode::Stub | EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {
+                feature_candidate_options()
+            }
         },
         measure_options: engine.measure_options(),
     }))

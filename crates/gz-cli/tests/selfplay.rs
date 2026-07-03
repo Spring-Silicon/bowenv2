@@ -46,6 +46,8 @@ fn selfplay_run_writes_replay_rows() {
         max_batch: 4,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
+        checkpoint_dir: None,
+        eval_device: None,
         serve_socket: None,
         serve_max_batch: 512,
         replay_backlog: None,
@@ -76,6 +78,8 @@ fn selfplay_run_supports_stub_evaluator() {
         max_batch: 2,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
+        checkpoint_dir: None,
+        eval_device: None,
         serve_socket: None,
         serve_max_batch: 512,
         replay_backlog: None,
@@ -103,6 +107,8 @@ fn selfplay_run_supports_self_average_reference() {
         max_batch: 1,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
+        checkpoint_dir: None,
+        eval_device: None,
         serve_socket: None,
         serve_max_batch: 512,
         replay_backlog: None,
@@ -129,6 +135,8 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         max_batch: 1,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
+        checkpoint_dir: None,
+        eval_device: None,
         serve_socket: Some(dir.path().join("live.sock")),
         serve_max_batch: 512,
         replay_backlog: None,
@@ -176,4 +184,66 @@ fn selfplay_config_rejects_zero_replay_backlog() {
 
     let error = config.validate().unwrap_err();
     assert!(error.contains("--replay-backlog"), "{error}");
+}
+
+#[test]
+fn torch_evaluator_builds_the_child_command_line() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.evaluator = EvaluatorMode::Torch;
+    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
+    config.validate().unwrap();
+
+    assert_eq!(
+        config.evaluator_extra_args(),
+        [
+            "--backend",
+            "torch",
+            "--checkpoint-dir",
+            "/ckpt",
+            "--device",
+            "cuda:0"
+        ]
+    );
+
+    config.eval_device = Some("cuda:1".to_owned());
+    assert_eq!(config.evaluator_extra_args()[5], "cuda:1");
+}
+
+#[test]
+fn stub_evaluators_pass_no_extra_args() {
+    let dir = TestDir::new();
+    let config = serving_config(&dir);
+
+    assert!(config.evaluator_extra_args().is_empty());
+}
+
+#[test]
+fn selfplay_config_rejects_torch_without_checkpoint_dir() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.evaluator = EvaluatorMode::Torch;
+
+    let error = config.validate().unwrap_err();
+    assert!(error.contains("requires --checkpoint-dir"), "{error}");
+}
+
+#[test]
+fn selfplay_config_rejects_checkpoint_dir_without_torch() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
+
+    let error = config.validate().unwrap_err();
+    assert!(error.contains("--checkpoint-dir requires"), "{error}");
+}
+
+#[test]
+fn selfplay_config_rejects_eval_device_without_torch() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.eval_device = Some("cuda:1".to_owned());
+
+    let error = config.validate().unwrap_err();
+    assert!(error.contains("--eval-device requires"), "{error}");
 }
