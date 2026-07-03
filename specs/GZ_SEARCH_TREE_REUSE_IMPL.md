@@ -113,6 +113,25 @@ with tree_reuse off, the == comparison and today's finish-early
 behavior are preserved verbatim (the off-path oracle above).
 ```
 
+Amendment (post-review): slot skipping alone measured only an 8%
+eval reduction — a fresh Gumbel draw nearly always includes unvisited
+actions, so unsatisfied slots redirect instead of skipping, and every
+simulation still costs one leaf eval. The savings mechanism is budget
+crediting: a reused root's schedule is built for
+max(simulations - carried_root_visits, simulations / 4) fresh
+simulations (the floor keeps exploration under the new Gumbel draw).
+The hash domain moved to gz-search-gumbel-mcts-v3 because reuse-on
+semantics changed without a config-shape change. Measured on the
+stage-3 eval-count benchmark (stub evaluator, sims=64, max-steps=64,
+512 episodes, seed 5): 64.5 evals/row with reuse off, 59.3 under slot
+skipping alone (-8.1%), 49.3 with budget crediting (-23.7%). The
+selected child carries ~14 of 64 visits at this config — sequential
+halving spreads the rest across losers whose subtrees are discarded —
+so the acceptance target of 35% is not reachable by carry alone; the
+remaining gap to the predecessor's ~16 evals/position is episode-shape
+(93-step episodes spend most moves in shrunken late-game action sets)
+plus its caches, out of scope here.
+
 `GumbelRootStats` gains `carried_nodes: usize` and
 `carried_root_visits: u32` (zero on fresh trees) so tests and future
 metrics can see reuse working. `run.simulations` keeps counting only

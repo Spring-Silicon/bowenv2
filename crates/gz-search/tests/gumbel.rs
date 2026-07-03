@@ -362,6 +362,15 @@ fn tree_reuse_skips_later_root_evals() {
     assert!(episode.root_stats[1..].iter().all(|stats| {
         stats.eval_count < episode.root_stats[0].eval_count && stats.carried_root_visits > 0
     }));
+    // Budget crediting: a reused root runs at most
+    // max(simulations - carried, simulations / 4) fresh simulations, and
+    // each simulation costs at most one eval (stop re-evals included).
+    assert!(episode.root_stats[1..].iter().all(|stats| {
+        let budget = 16usize
+            .saturating_sub(stats.carried_root_visits as usize)
+            .max(4);
+        stats.simulations <= budget && stats.eval_count <= budget
+    }));
     let root_eval_steps = evaluator
         .requests
         .iter()

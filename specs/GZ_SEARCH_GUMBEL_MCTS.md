@@ -210,7 +210,13 @@ c_visit must be finite and non-negative
 c_scale must be finite and non-negative
 candidate_options are passed unchanged to engine.candidates()
 measure_options are used only for final episode measurement
-tree_reuse carries the selected child subtree to the next episode step
+tree_reuse carries the selected child subtree to the next episode step; the
+reused root skips its root expand/eval, keeps carried per-action
+visit/Q statistics, redraws root Gumbel noise (root_step seeds it), and
+runs max(simulations - carried_root_visits, simulations / 4) fresh
+simulations — carried visits are budget already spent. Carried values
+and priors keep the position context and model version they were
+evaluated under (accepted staleness, bounded by max_steps)
 ```
 
 There is no user-facing max-depth budget. Like WhittleZero, each simulation

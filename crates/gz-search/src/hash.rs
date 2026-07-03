@@ -58,7 +58,9 @@ pub fn gumbel_search_config_hash(
     measure_options: MeasureOptions,
 ) -> SearchConfigHash {
     let mut hasher = blake3::Hasher::new();
-    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v2");
+    // v3: reused roots credit carried visits against the simulation
+    // budget (semantics change without a config-shape change).
+    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v3");
     update_u64(&mut hasher, max_steps as u64);
     update_u64(&mut hasher, simulations as u64);
     update_u64(&mut hasher, max_considered_actions as u64);

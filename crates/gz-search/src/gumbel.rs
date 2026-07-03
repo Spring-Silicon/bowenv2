@@ -1190,6 +1190,22 @@ where
         self.tree.nodes.len() - 1
     }
 
+    /// Carried visits are information the previous step's search already
+    /// paid for, so a reused root spends its budget only on what is new.
+    /// A floor of a quarter budget keeps fresh exploration under the new
+    /// Gumbel draw even when the carried subtree exceeds the budget.
+    fn fresh_simulation_budget(&self) -> usize {
+        let simulations = self.config.simulations.get();
+        let carried = self.tree.carried_root_visits as usize;
+        if carried == 0 {
+            return simulations;
+        }
+
+        simulations
+            .saturating_sub(carried)
+            .max((simulations / 4).max(1))
+    }
+
     fn start_run_state(&self) -> RunState<G, C> {
         let root_index = 0;
         let action_count = self.tree.nodes[root_index].action_count();
@@ -1207,7 +1223,7 @@ where
         }
 
         let considered = considered_actions(&base_scores, self.config.max_considered_actions.get());
-        let schedule = considered_visit_sequence(considered.len(), self.config.simulations.get());
+        let schedule = considered_visit_sequence(considered.len(), self.fresh_simulation_budget());
 
         RunState {
             base_scores,
