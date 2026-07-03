@@ -143,6 +143,49 @@ fn stop_is_selected_through_eval_policy_and_never_applied() {
 }
 
 #[test]
+fn root_budget_matches_episode_eval_positions() {
+    let mut engine = TestEngine::new()
+        .candidates(0, [1])
+        .candidates(1, [2])
+        .reward(2, 2.0);
+    let mut evaluator = RecordedEvaluator::default()
+        .row(0, [10.0, -10.0], 0.0)
+        .row(1, [10.0, -10.0], 0.0)
+        .row(2, [0.0], 1.0);
+    let search = GumbelMcts::new(config(2));
+
+    search
+        .run(
+            &mut engine,
+            &mut evaluator,
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    let root_positions = evaluator
+        .requests
+        .iter()
+        .filter(|request| request.position.leaf_depth == 0)
+        .map(|request| {
+            (
+                request.position.root_step as usize,
+                request.position.budget_fraction,
+                request.position.budget_step,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        root_positions,
+        vec![
+            (0, search.root_budget(0).0, search.root_budget(0).1),
+            (1, search.root_budget(1).0, search.root_budget(1).1),
+        ]
+    );
+}
+
+#[test]
 fn rejected_root_candidate_is_masked_before_final_selection() {
     let mut engine = TestEngine::new()
         .candidates(0, [1])

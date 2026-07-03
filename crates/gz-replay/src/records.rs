@@ -3,6 +3,7 @@ use gz_engine::{
     MeasureSummary, ModelVersion, PortableSearchActionRef, ReplayGraphContext, SearchConfigHash,
     SearchStepRef,
 };
+use gz_features::{FeatureSchemaHash, validate_feature_row_header};
 
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -73,16 +74,26 @@ pub struct ReplayRow {
     pub final_measure: MeasureSummary,
     pub model_version: Option<ModelVersion>,
     pub search_config_hash: SearchConfigHash,
+    pub feature_row: Option<Vec<u8>>,
 }
 
 pub(crate) fn validate_episode(
     record: &ReplayEpisodeRecord,
     rows: &[ReplayRow],
+    feature_schema_hash: Option<FeatureSchemaHash>,
 ) -> ReplayResult<()> {
     validate_admission(record)?;
     validate_outcome(record)?;
 
     if rows.len() != record.row_count as usize || rows.len() != record.steps.len() {
+        return Err(ReplayError::InvalidRecord);
+    }
+
+    let has_feature_rows = rows
+        .first()
+        .map(|row| row.feature_row.is_some())
+        .unwrap_or(false);
+    if has_feature_rows && feature_schema_hash.is_none() {
         return Err(ReplayError::InvalidRecord);
     }
 
@@ -93,6 +104,12 @@ pub(crate) fn validate_episode(
 
         if row.step_index != step_index {
             return Err(ReplayError::InvalidRecord);
+        }
+        if row.feature_row.is_some() != has_feature_rows {
+            return Err(ReplayError::InvalidRecord);
+        }
+        if let (Some(bytes), Some(hash)) = (&row.feature_row, feature_schema_hash) {
+            validate_feature_row_header(bytes, &hash).map_err(|_| ReplayError::InvalidRecord)?;
         }
 
         validate_row(record, row, &expected_history)?;

@@ -6,12 +6,19 @@ use gz_search::GumbelEpisode;
 pub fn project_episode<G, C>(
     episode: &GumbelEpisode<G, C>,
     reference: Option<&Reference<G>>,
+    feature_rows: Option<&[Vec<u8>]>,
 ) -> Option<(ReplayEpisodeRecord, Vec<ReplayRow>)> {
     let learner_reward = score(
         episode.final_measure.measured,
         episode.final_measure.valid,
         episode.final_measure.scalar_reward,
     )?;
+    if let Some(feature_rows) = feature_rows
+        && feature_rows.len() != episode.steps.len()
+    {
+        return None;
+    }
+
     let final_measure = MeasureSummary::from(&episode.final_measure);
     let value_target =
         reference.map(|reference| sign_target(learner_reward, reference.final_reward));
@@ -40,6 +47,7 @@ pub fn project_episode<G, C>(
             final_measure: final_measure.clone(),
             model_version: Some(step.model_version),
             search_config_hash: episode.search_config_hash,
+            feature_row: feature_rows.map(|rows| rows[index].clone()),
         });
         action_history.push(step.selected_action);
     }

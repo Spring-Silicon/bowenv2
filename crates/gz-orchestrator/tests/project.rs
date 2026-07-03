@@ -48,7 +48,7 @@ fn projected_episode_appends_to_replay_store() {
     let episode = run_episode();
     let reference = reference(&episode, episode.final_measure.scalar_reward.unwrap() - 1.0);
 
-    let (record, rows) = project_episode(&episode, Some(&reference)).unwrap();
+    let (record, rows) = project_episode(&episode, Some(&reference), None).unwrap();
     let id = store.append_episode(&record, &rows).unwrap();
 
     assert_eq!(store.episode(id).unwrap(), Some(record));
@@ -66,7 +66,7 @@ fn labels_follow_win_loss_tie_sign_rule() {
         (learner, Some(0.0)),
     ] {
         let reference = reference(&episode, reference_reward);
-        let (record, rows) = project_episode(&episode, Some(&reference)).unwrap();
+        let (record, rows) = project_episode(&episode, Some(&reference), None).unwrap();
 
         assert_eq!(record.outcome.value_target, expected);
         assert!(rows.iter().all(|row| row.value_target == expected));
@@ -79,7 +79,7 @@ fn reference_none_yields_policy_only_rows_that_append() {
     let store = ReplayStore::open(dir.path()).unwrap();
     let episode = run_episode();
 
-    let (record, rows) = project_episode(&episode, None).unwrap();
+    let (record, rows) = project_episode(&episode, None, None).unwrap();
 
     assert_eq!(record.outcome.value_target, None);
     assert!(rows.iter().all(|row| row.value_target.is_none()));
@@ -91,7 +91,7 @@ fn ineligible_episode_projects_to_none() {
     let mut episode = run_episode();
     episode.final_measure.valid = false;
 
-    assert!(project_episode(&episode, None).is_none());
+    assert!(project_episode(&episode, None, None).is_none());
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn row_count_matches_steps_and_stop_row_is_decision_state() {
     let episode = run_episode();
 
     assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
-    let (record, rows) = project_episode(&episode, None).unwrap();
+    let (record, rows) = project_episode(&episode, None, None).unwrap();
     let last_step = episode.steps.last().unwrap();
     let last_row = rows.last().unwrap();
 
@@ -111,6 +111,31 @@ fn row_count_matches_steps_and_stop_row_is_decision_state() {
         last_row.selected_action,
         gz_engine::PortableSearchActionRef::Stop { .. }
     ));
+}
+
+#[test]
+fn feature_rows_are_attached_in_step_order() {
+    let episode = run_episode();
+    let feature_rows = (0..episode.steps.len())
+        .map(|index| vec![index as u8, 99])
+        .collect::<Vec<_>>();
+
+    let (_, rows) = project_episode(&episode, None, Some(&feature_rows)).unwrap();
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.feature_row.clone().unwrap())
+            .collect::<Vec<_>>(),
+        feature_rows
+    );
+}
+
+#[test]
+fn feature_row_length_mismatch_rejects_projection() {
+    let episode = run_episode();
+    let feature_rows = Vec::new();
+
+    assert!(project_episode(&episode, None, Some(&feature_rows)).is_none());
 }
 
 fn run_episode() -> GumbelEpisode<WhittleGraphId, WhittleCandidateId> {

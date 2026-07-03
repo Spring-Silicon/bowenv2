@@ -2,11 +2,16 @@
 
 //! Feature schema, row validation, and fixed-layout batch encoding.
 
+mod codec;
 mod collator;
 mod error;
 mod row;
 mod schema;
 
+pub use codec::{
+    RowTargets, TrainingTargetsView, decode_feature_row, encode_feature_row,
+    encode_training_targets, validate_feature_row_header,
+};
 pub use collator::{
     FeatureBatchView, FeatureCollator, RowOutput, decode_outputs, validate_batch_action_counts,
 };

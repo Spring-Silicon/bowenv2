@@ -6,14 +6,14 @@ use gz_eval::{RandomValueEvaluator, RandomValueEvaluatorConfig};
 use gz_eval_service::StubBackend;
 use gz_features::{
     FeatureExtractor, FeatureResult, FeatureRow, FeatureSchema, FeatureSchemaConfig,
-    PositionFeatures,
+    PositionFeatures, decode_feature_row,
 };
 use gz_orchestrator::reference::RootBaselineProvider;
 use gz_orchestrator::{
     CountedRoots, FeaturizedRuntime, ReplayRuntime, ThreadedGumbelOrchestrator,
     ThreadedOrchestratorConfig,
 };
-use gz_replay::ReplayStore;
+use gz_replay::{ReplayStore, SampleConfig};
 use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -118,6 +118,7 @@ fn featurized_replay_appends_rows() {
     let engines = engines(2);
     let search = search(&engines[0]);
     let extractors = extractors(&engines);
+    let feature_config = extractors[0].schema().config().clone();
     let providers = engines
         .iter()
         .map(|engine| RootBaselineProvider::new(engine.measure_options()))
@@ -142,6 +143,19 @@ fn featurized_replay_appends_rows() {
     assert_eq!(run.episodes_dropped, 0);
     assert_eq!(run.episodes_appended, 4);
     assert!(store.counters().produced_rows > 0);
+    assert_eq!(store.feature_schema().unwrap(), Some(feature_config));
+
+    let sample = store
+        .sample_rows(SampleConfig {
+            batch: NonZeroUsize::new(store.counters().produced_rows as usize).unwrap(),
+            window_rows: std::num::NonZeroU64::new(store.counters().produced_rows).unwrap(),
+            seed: 0,
+        })
+        .unwrap();
+    for (_, row) in sample {
+        let feature_row = decode_feature_row(row.feature_row.as_ref().unwrap()).unwrap();
+        assert_eq!(feature_row.actions.len(), row.legal_actions.len());
+    }
 }
 
 #[test]

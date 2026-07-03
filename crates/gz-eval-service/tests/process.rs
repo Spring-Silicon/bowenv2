@@ -7,6 +7,7 @@ use gz_eval_service::{
     ERROR_PROTOCOL, EvaluatorProcess, EvaluatorProcessConfig, FRAME_EVAL_RESULT,
     FeatureEvalBackend, ServiceError, StubBackend, write_frame,
 };
+use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,6 +25,52 @@ fn spawn_failure_is_io_error() {
         EvaluatorProcess::spawn(config),
         Err(ServiceError::Io(_))
     ));
+}
+
+#[test]
+fn process_spawn_appends_extra_args_after_socket() {
+    let dir = std::env::temp_dir().join(format!("gz-eval-service-argv-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("argv_probe.py"),
+        r#"
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[sys.argv.index("--argv-out") + 1])
+path.write_text("\n".join(sys.argv), encoding="utf-8")
+"#,
+    )
+    .unwrap();
+    let argv_out = dir.join("argv.txt");
+    let socket = dir.join("probe.sock");
+    let mut process = EvaluatorProcess::spawn(EvaluatorProcessConfig {
+        module: "argv_probe".to_owned(),
+        working_dir: dir.clone(),
+        socket_path: socket.clone(),
+        extra_args: vec![
+            "--flag".to_owned(),
+            "value".to_owned(),
+            "--argv-out".to_owned(),
+            argv_out.display().to_string(),
+        ],
+        ..EvaluatorProcessConfig::default()
+    })
+    .unwrap();
+
+    let status = process.wait().unwrap();
+    assert!(status.success());
+    let argv = fs::read_to_string(&argv_out).unwrap();
+    let args = argv.lines().collect::<Vec<_>>();
+    let socket_index = args.iter().position(|arg| *arg == "--socket").unwrap();
+
+    assert_eq!(args[socket_index + 1], socket.display().to_string());
+    assert_eq!(args[socket_index + 2], "--flag");
+    assert_eq!(args[socket_index + 3], "value");
+    assert_eq!(args[socket_index + 4], "--argv-out");
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

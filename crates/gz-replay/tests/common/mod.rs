@@ -5,6 +5,10 @@ use gz_engine::{
     MeasureSummary, PortableCandidateRef, PortableGraphId, PortableSearchActionRef,
     ReplayGraphContext, SearchConfigHash, SearchStepRef,
 };
+use gz_features::{
+    ActionFeature, FeatureEdge, FeatureRow, FeatureSchema, FeatureSchemaConfig, PositionFeatures,
+    encode_feature_row,
+};
 use gz_replay::{
     ReplayEpisodeRecord, ReplayOutcome, ReplayReference, ReplayReferenceKind, ReplayRow,
 };
@@ -106,6 +110,7 @@ pub fn episode_with_rows(row_count: usize) -> (ReplayEpisodeRecord, Vec<ReplayRo
             final_measure: final_measure.clone(),
             model_version: None,
             search_config_hash: search_hash(),
+            feature_row: None,
         });
         history.push(action);
     }
@@ -131,5 +136,64 @@ pub fn episode_with_rows(row_count: usize) -> (ReplayEpisodeRecord, Vec<ReplayRo
         row_count: row_count as u32,
     };
 
+    (record, rows)
+}
+
+pub fn feature_schema_config() -> FeatureSchemaConfig {
+    FeatureSchemaConfig {
+        name: "replay-test-v1".to_string(),
+        node_vocab_size: 8,
+        node_attr_dim: 1,
+        edge_type_count: 2,
+        action_kind_vocab_size: 16,
+        max_nodes: 4,
+        max_edges: 4,
+        max_actions: 4,
+        max_subjects: 3,
+    }
+}
+
+pub fn feature_row_bytes(step_index: u32, action_count: usize) -> Vec<u8> {
+    let schema = FeatureSchema::new(feature_schema_config()).unwrap();
+    let mut row = FeatureRow {
+        node_count: 2,
+        node_tokens: vec![1, 3],
+        node_attrs: vec![0.5, 1.5],
+        edges: vec![FeatureEdge {
+            src: 0,
+            dst: 1,
+            edge_type: 0,
+        }],
+        actions: Vec::new(),
+        position: PositionFeatures {
+            root_step: step_index,
+            leaf_depth: 0,
+            budget_fraction: 1.0,
+            budget_step: 0.5,
+        },
+    };
+    for index in 0..action_count.saturating_sub(1) {
+        row.actions.push(ActionFeature {
+            kind_token: 2 + index as u32,
+            static_prior: 0.0,
+            subjects: vec![0],
+        });
+    }
+    row.actions.push(ActionFeature {
+        kind_token: 1,
+        static_prior: 0.0,
+        subjects: Vec::new(),
+    });
+
+    let mut bytes = Vec::new();
+    encode_feature_row(&row, &schema, &mut bytes).unwrap();
+    bytes
+}
+
+pub fn episode_with_feature_rows(row_count: usize) -> (ReplayEpisodeRecord, Vec<ReplayRow>) {
+    let (record, mut rows) = episode_with_rows(row_count);
+    for row in &mut rows {
+        row.feature_row = Some(feature_row_bytes(row.step_index, row.legal_actions.len()));
+    }
     (record, rows)
 }

@@ -219,7 +219,14 @@ SAMPLE_PROTOCOL_VERSION = 1
 
 1 SHELLO       client -> server: protocol_version u32, encoding_version u32
 2 SHELLO_ACK   server -> client: protocol_version u32,
-               feature_schema_hash 32B, max_batch u32, produced_rows u64
+               feature_schema_hash 32B, max_batch u32, produced_rows u64,
+               then the full serialized FeatureSchemaConfig: name_len u16 +
+               utf8 name, node_vocab_size u16, node_attr_dim u16,
+               edge_type_count u8, action_kind_vocab_size u32,
+               max_nodes u32, max_edges u32, max_actions u32,
+               max_subjects u32, expander_degree u8, expander_seed u64
+               (the trainer builds its model from this config; Python never
+               reconstructs it from anywhere else)
 3 SAMPLE       client -> server: batch u32 (<= max_batch), window u64,
                seed u64
 4 SAMPLE_RESULT server -> client: gzfb_len u32, GZFB bytes, GZFT bytes

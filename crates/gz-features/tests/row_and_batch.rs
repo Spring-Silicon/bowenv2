@@ -1,6 +1,8 @@
 use gz_features::{
     ActionFeature, FeatureBatchView, FeatureCollator, FeatureEdge, FeatureError, FeatureRow,
-    FeatureSchema, FeatureSchemaConfig, PositionFeatures, validate_batch_action_counts,
+    FeatureSchema, FeatureSchemaConfig, PositionFeatures, RowTargets, TrainingTargetsView,
+    decode_feature_row, encode_feature_row, encode_training_targets, validate_batch_action_counts,
+    validate_feature_row_header,
 };
 use std::num::NonZeroUsize;
 
@@ -126,6 +128,133 @@ fn collate_rejects_empty_and_overflow() {
     assert!(matches!(
         collator.collate_into(&[row(), row()], &mut bytes),
         Err(FeatureError::BatchOverflow { .. })
+    ));
+}
+
+#[test]
+fn feature_row_codec_roundtrips_and_checks_header() {
+    let schema = schema();
+    let row = row();
+    let mut bytes = Vec::new();
+
+    encode_feature_row(&row, &schema, &mut bytes).unwrap();
+    validate_feature_row_header(&bytes, &schema.hash()).unwrap();
+    assert_eq!(decode_feature_row(&bytes).unwrap(), row);
+
+    let mut bad_magic = bytes.clone();
+    bad_magic[0] = b'X';
+    assert!(matches!(
+        validate_feature_row_header(&bad_magic, &schema.hash()),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
+
+    let mut bad_version = bytes.clone();
+    bad_version[4..8].copy_from_slice(&2u32.to_le_bytes());
+    assert!(matches!(
+        validate_feature_row_header(&bad_version, &schema.hash()),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
+
+    let mut other_config = schema.config().clone();
+    other_config.max_nodes += 1;
+    let other_schema = FeatureSchema::new(other_config).unwrap();
+    assert!(matches!(
+        validate_feature_row_header(&bytes, &other_schema.hash()),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
+}
+
+#[test]
+fn feature_row_codec_has_stable_layout() {
+    let schema = schema();
+    let row = row();
+    let mut bytes = Vec::new();
+    encode_feature_row(&row, &schema, &mut bytes).unwrap();
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"GZFR");
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(schema.hash().as_bytes());
+    expected.extend_from_slice(&3u32.to_le_bytes());
+    expected.extend_from_slice(&3u32.to_le_bytes());
+    for token in [1u16, 3, 6] {
+        expected.extend_from_slice(&token.to_le_bytes());
+    }
+    expected.extend_from_slice(&3u32.to_le_bytes());
+    for value in [0.5f32, 1.5, 2.5] {
+        expected.extend_from_slice(&value.to_le_bytes());
+    }
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    for (src, dst, edge_type) in [(0u32, 1u32, 0u8), (1, 2, 1)] {
+        expected.extend_from_slice(&src.to_le_bytes());
+        expected.extend_from_slice(&dst.to_le_bytes());
+        expected.push(edge_type);
+    }
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(&4u32.to_le_bytes());
+    expected.extend_from_slice(&0.25f32.to_le_bytes());
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&0.0f32.to_le_bytes());
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(&3u32.to_le_bytes());
+    expected.extend_from_slice(&0.75f32.to_le_bytes());
+    expected.extend_from_slice(&0.125f32.to_le_bytes());
+
+    assert_eq!(bytes, expected);
+}
+
+#[test]
+fn training_targets_codec_writes_padded_sections() {
+    let targets = [
+        RowTargets {
+            policy: vec![1.0, 2.0, 3.0],
+            value: Some(1.0),
+            reward: 0.25,
+        },
+        RowTargets {
+            policy: vec![-1.0],
+            value: None,
+            reward: -0.5,
+        },
+    ];
+    let mut bytes = Vec::new();
+
+    encode_training_targets(&targets, 2, 3, &mut bytes).unwrap();
+    let view = TrainingTargetsView::parse(&bytes).unwrap();
+
+    assert_eq!(view.capacity, 2);
+    assert_eq!(view.row_count, 2);
+    assert_eq!(view.max_actions, 3);
+    assert_eq!(view.policy, vec![1.0, 2.0, 3.0, -1.0, 0.0, 0.0]);
+    assert_eq!(view.value, vec![1.0, 0.0]);
+    assert_eq!(view.value_valid, vec![1, 0]);
+    assert_eq!(view.reward, vec![0.25, -0.5]);
+    assert_eq!(
+        fingerprint(&bytes),
+        "7b1a39e0671d158ddc5a17a615a402ebcf6239dad7ad28fb361b85534076f2bc"
+    );
+}
+
+#[test]
+fn training_targets_codec_rejects_bad_policy_width() {
+    let mut bytes = Vec::new();
+
+    assert!(matches!(
+        encode_training_targets(
+            &[RowTargets {
+                policy: vec![1.0, 2.0],
+                value: Some(1.0),
+                reward: 0.0,
+            }],
+            1,
+            1,
+            &mut bytes,
+        ),
+        Err(FeatureError::ActionOverflow { .. })
     ));
 }
 

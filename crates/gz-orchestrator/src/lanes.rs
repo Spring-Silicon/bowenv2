@@ -10,9 +10,10 @@ use gz_eval::{EvalOutput, EvalRequest, Evaluator, eval_error_to_engine_error, va
 use gz_eval_service::{BackendOutputs, FeatureEvalBackend};
 use gz_features::{
     FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaHash,
+    PositionFeatures, encode_feature_row,
 };
 use gz_replay::{ReplayEpisodeRecord, ReplayError, ReplayRow, ReplayStore};
-use gz_search::{EngineIdentity, GumbelEpisodeContext, GumbelMcts, WorkToken};
+use gz_search::{EngineIdentity, GumbelEpisode, GumbelEpisodeContext, GumbelMcts, WorkToken};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
@@ -353,10 +354,8 @@ where
         let backend = featurized.backend;
         let extractors = featurized.extractors;
         let engines = self.engines;
-        let collator = FeatureCollator::new(
-            first_schema::<E, X>(&extractors, schema_hash)?,
-            config.max_batch,
-        );
+        let feature_schema = first_schema::<E, X>(&extractors, schema_hash)?;
+        let collator = FeatureCollator::new(feature_schema, config.max_batch);
         validate_collator_capacity(&collator, config)?;
         let _ = self.evaluator;
 
@@ -462,10 +461,11 @@ where
         let providers = replay.providers;
         let store = replay.store;
         let backpressure = replay.backpressure;
-        let collator = FeatureCollator::new(
-            first_schema::<E, X>(&extractors, schema_hash)?,
-            config.max_batch,
-        );
+        let feature_schema = first_schema::<E, X>(&extractors, schema_hash)?;
+        store
+            .ensure_feature_schema(feature_schema.config())
+            .map_err(map_replay_error)?;
+        let collator = FeatureCollator::new(feature_schema, config.max_batch);
         validate_collator_capacity(&collator, config)?;
         let _ = self.evaluator;
 
@@ -713,7 +713,9 @@ where
                 .remove(&completed.episode_id)
                 .ok_or_else(|| internal("missing replay reference"))?;
 
-            if let Some((record, rows)) = project_episode(&completed.episode, reference.as_ref()) {
+            if let Some((record, rows)) =
+                project_episode(&completed.episode, reference.as_ref(), None)
+            {
                 runtime
                     .replay_tx
                     .send(ReplayJob { record, rows })
@@ -861,7 +863,16 @@ where
                 .remove(&completed.episode_id)
                 .ok_or_else(|| internal("missing replay reference"))?;
 
-            if let Some((record, rows)) = project_episode(&completed.episode, reference.as_ref()) {
+            let feature_rows = feature_rows_for_episode(
+                &mut engine,
+                &mut extractor,
+                runtime.search,
+                &completed.episode,
+            )?;
+
+            if let Some((record, rows)) =
+                project_episode(&completed.episode, reference.as_ref(), Some(&feature_rows))
+            {
                 runtime
                     .replay_tx
                     .send(ReplayJob { record, rows })
@@ -913,6 +924,55 @@ where
             .map_err(|_| internal("eval backend unavailable"))?;
     }
     Ok(())
+}
+
+fn feature_rows_for_episode<E, X>(
+    engine: &mut E,
+    extractor: &mut X,
+    search: &GumbelMcts,
+    episode: &GumbelEpisode<E::Graph, E::Candidate>,
+) -> EngineResult<Vec<Vec<u8>>>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let schema = extractor.schema().clone();
+    let mut out = Vec::with_capacity(episode.steps.len());
+    let mut candidates = Vec::new();
+
+    for (index, step) in episode.steps.iter().enumerate() {
+        candidates.clear();
+        engine.candidates(
+            step.before,
+            search.config().candidate_options,
+            &mut candidates,
+        )?;
+        let (budget_fraction, budget_step) = search.root_budget(index);
+        let root_step = u32::try_from(index).map_err(|_| internal("root step overflow"))?;
+        let row = extractor
+            .extract(
+                engine,
+                step.before,
+                &candidates,
+                PositionFeatures {
+                    root_step,
+                    leaf_depth: 0,
+                    budget_fraction,
+                    budget_step,
+                },
+            )
+            .map_err(|_| internal("feature extraction failed"))?;
+        if row.actions.len() != step.legal_actions.len() {
+            return Err(internal("feature row action count mismatch"));
+        }
+
+        let mut bytes = Vec::new();
+        encode_feature_row(&row, &schema, &mut bytes)
+            .map_err(|_| internal("feature row encoding failed"))?;
+        out.push(bytes);
+    }
+
+    Ok(out)
 }
 
 fn receive_replies<G, C>(

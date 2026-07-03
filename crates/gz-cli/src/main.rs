@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use gz_cli::selfplay::{SelfplayConfig, run};
+use gz_cli::serve::{ReplayServeConfig, run as run_replay_serve};
 use std::path::PathBuf;
 
 fn main() {
@@ -30,6 +31,7 @@ fn main() {
                 summary.counters.consumed_rows,
             );
         }),
+        "replay-serve" => parse_replay_serve(args.collect()).and_then(run_replay_serve),
         _ => Err(format!("unknown command: {command}\n{}", usage())),
     };
 
@@ -37,6 +39,39 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
+}
+
+fn parse_replay_serve(args: Vec<String>) -> Result<ReplayServeConfig, String> {
+    let mut replay_dir = None;
+    let mut socket = None;
+    let mut max_batch = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = &args[index];
+        index += 1;
+
+        let Some(value) = args.get(index) else {
+            return Err(format!("missing value for {flag}\n{}", usage()));
+        };
+        index += 1;
+
+        match flag.as_str() {
+            "--replay-dir" => replay_dir = Some(PathBuf::from(value)),
+            "--socket" => socket = Some(PathBuf::from(value)),
+            "--max-batch" => max_batch = Some(parse_usize(flag, value)?),
+            _ => return Err(format!("unknown flag: {flag}\n{}", usage())),
+        }
+    }
+
+    let config = ReplayServeConfig {
+        replay_dir: replay_dir
+            .ok_or_else(|| format!("missing required --replay-dir\n{}", usage()))?,
+        socket: socket.ok_or_else(|| format!("missing required --socket\n{}", usage()))?,
+        max_batch: max_batch.ok_or_else(|| format!("missing required --max-batch\n{}", usage()))?,
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 fn parse_selfplay(args: Vec<String>) -> Result<SelfplayConfig, String> {
@@ -87,5 +122,5 @@ fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--evaluator random|stub|process-stub] [--python-dir PATH] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]"
+    "usage: graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--evaluator random|stub|process-stub] [--python-dir PATH] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]\n       graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B"
 }

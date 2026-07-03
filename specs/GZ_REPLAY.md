@@ -86,6 +86,7 @@ Allowed:
 ```text
 std
 gz-engine with the serde feature
+gz-features (FeatureSchemaConfig plus GZFR header validation only)
 rocksdb
 serde
 postcard
@@ -103,8 +104,10 @@ concrete engine adapters
 rand crates; sampling uses a small internal deterministic RNG
 ```
 
-`gz-replay` depends only on `gz-engine`. `GumbelEpisode` lives in
-`gz-search`, so projection into replay records belongs to
+`gz-replay` depends only on `gz-engine` plus the light `gz-features` schema
+and row-header API. It does not depend on concrete extractors or feature
+extraction. `GumbelEpisode` lives in `gz-search`, so projection into replay
+records belongs to
 `gz-orchestrator`; `gz-replay` accepts already-portable records and never
 sees an engine handle.
 
@@ -161,6 +164,7 @@ pub struct ReplayRow {
     pub final_measure: MeasureSummary,
     pub model_version: Option<ModelVersion>,
     pub search_config_hash: SearchConfigHash,
+    pub feature_row: Option<Vec<u8>>,     // GZFR bytes
 }
 ```
 
@@ -180,7 +184,11 @@ row so sampling never needs a join.
 model_version is the step's root eval model version; it may differ across
 rows if a checkpoint swap lands mid-episode.
 No engine-local handles, graph bodies, artifacts, display strings, or
-adapter metadata anywhere in stored records.
+adapter metadata anywhere in stored records. `feature_row` is the sole
+exception to the old "no graph bodies" wording: it stores a portable encoded
+FeatureRow (GZFR), not an engine body or artifact. Replay data with feature
+rows is bound to one FeatureSchemaHash; changing the feature schema means
+regenerating replay data.
 ```
 
 ## Outcome Rules
@@ -231,13 +239,14 @@ rows.
 
 ## Storage Layout
 
-Schema version: 2. Version 2 records the reference provider kind plus
-optional reference search_config_hash/model_version so mixed reference pools
-can be distinguished. Version 1 stores fail to open with SchemaMismatch.
+Schema version: 3. Version 3 adds optional per-row GZFR feature payloads and
+the persisted FeatureSchemaConfig metadata. Version 1 and 2 stores fail to
+open with SchemaMismatch.
 
 ```text
 RocksDB, one database directory, column families:
-  meta      schema version, next episode seq, produced/consumed counters
+  meta      schema version, next episode seq, produced/consumed counters,
+            optional feature schema config
   episodes  key: episode_seq u64 BE            value: ReplayEpisodeRecord
   rows      key: episode_seq u64 BE || step_index u32 BE   value: ReplayRow
   row_index key: row_seq u64 BE                value: rows key
@@ -256,6 +265,11 @@ meta stores a schema version written at creation; opening a store with a
 mismatched version fails with SchemaMismatch, never migrates silently.
 next episode seq is recovered from the last episodes key on open; no
 counter can drift from the data.
+feature schema config is persisted once. `ensure_feature_schema(config)` is
+idempotent for the same config and rejects mismatches with InvalidRecord.
+Rows with `feature_row = Some(bytes)` require a configured schema and the
+GZFR header hash must match it. Featureless rows remain legal. One episode
+must be all featured or all featureless.
 ```
 
 ## Write And Sample API
@@ -273,6 +287,9 @@ impl ReplayStore {
     ) -> ReplayResult<ReplayEpisodeId>;
 
     pub fn episode(&self, id: ReplayEpisodeId) -> ReplayResult<Option<ReplayEpisodeRecord>>;
+
+    pub fn ensure_feature_schema(&self, config: &FeatureSchemaConfig) -> ReplayResult<()>;
+    pub fn feature_schema(&self) -> ReplayResult<Option<FeatureSchemaConfig>>;
 
     pub fn sample_rows(
         &self,

@@ -1,12 +1,13 @@
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::{
-    CF_EPISODES, CF_META, CF_ROW_INDEX, CF_ROWS, META_CONSUMED_ROWS, META_NEXT_EPISODE_SEQ,
-    META_PRODUCED_ROWS, META_SCHEMA_VERSION, SCHEMA_VERSION, decode_episode_from_row_key,
-    decode_u32, decode_u64, decode_u64_key, encode_u32, encode_u64, episode_key, row_index_key,
-    row_key,
+    CF_EPISODES, CF_META, CF_ROW_INDEX, CF_ROWS, META_CONSUMED_ROWS, META_FEATURE_SCHEMA,
+    META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_SCHEMA_VERSION, SCHEMA_VERSION,
+    decode_episode_from_row_key, decode_u32, decode_u64, decode_u64_key, encode_u32, encode_u64,
+    episode_key, row_index_key, row_key,
 };
 use crate::records::{ReplayEpisodeId, ReplayEpisodeRecord, ReplayRow, validate_episode};
 use crate::sample::{ReplayRng, SampleConfig};
+use gz_features::{FeatureSchema, FeatureSchemaConfig};
 use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,9 +50,15 @@ impl ReplayStore {
         record: &ReplayEpisodeRecord,
         rows: &[ReplayRow],
     ) -> ReplayResult<ReplayEpisodeId> {
-        validate_episode(record, rows)?;
-
         let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
+        let feature_schema = read_feature_schema(&self.db)?;
+        let feature_schema_hash = feature_schema
+            .as_ref()
+            .map(|config| FeatureSchema::new(config.clone()).map(|schema| schema.hash()))
+            .transpose()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        validate_episode(record, rows, feature_schema_hash)?;
+
         let episode_seq = recover_next_episode_seq(&self.db)?;
         let row_seq = recover_next_row_seq(&self.db)?;
         let next_episode_seq = episode_seq
@@ -90,6 +97,33 @@ impl ReplayStore {
         self.produced_rows.store(produced_rows, Ordering::Release);
 
         Ok(id)
+    }
+
+    pub fn ensure_feature_schema(&self, config: &FeatureSchemaConfig) -> ReplayResult<()> {
+        FeatureSchema::new(config.clone()).map_err(|_| ReplayError::InvalidRecord)?;
+
+        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
+        let Some(stored) = read_feature_schema(&self.db)? else {
+            let meta = self.cf(CF_META)?;
+            self.db
+                .put_cf(
+                    &meta,
+                    META_FEATURE_SCHEMA,
+                    postcard::to_allocvec(&StoredFeatureSchemaConfig::from(config))?,
+                )
+                .map_err(ReplayError::from)?;
+            return Ok(());
+        };
+
+        if &stored == config {
+            Ok(())
+        } else {
+            Err(ReplayError::InvalidRecord)
+        }
+    }
+
+    pub fn feature_schema(&self) -> ReplayResult<Option<FeatureSchemaConfig>> {
+        read_feature_schema(&self.db)
     }
 
     pub fn episode(&self, id: ReplayEpisodeId) -> ReplayResult<Option<ReplayEpisodeRecord>> {
@@ -161,6 +195,51 @@ impl ReplayStore {
         self.db
             .cf_handle(name)
             .ok_or_else(|| ReplayError::storage(format!("missing column family {name}")))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct StoredFeatureSchemaConfig {
+    name: String,
+    node_vocab_size: u16,
+    node_attr_dim: u16,
+    edge_type_count: u8,
+    action_kind_vocab_size: u32,
+    max_nodes: u32,
+    max_edges: u32,
+    max_actions: u32,
+    max_subjects: u32,
+}
+
+impl From<&FeatureSchemaConfig> for StoredFeatureSchemaConfig {
+    fn from(config: &FeatureSchemaConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            node_vocab_size: config.node_vocab_size,
+            node_attr_dim: config.node_attr_dim,
+            edge_type_count: config.edge_type_count,
+            action_kind_vocab_size: config.action_kind_vocab_size,
+            max_nodes: config.max_nodes,
+            max_edges: config.max_edges,
+            max_actions: config.max_actions,
+            max_subjects: config.max_subjects,
+        }
+    }
+}
+
+impl From<StoredFeatureSchemaConfig> for FeatureSchemaConfig {
+    fn from(config: StoredFeatureSchemaConfig) -> Self {
+        Self {
+            name: config.name,
+            node_vocab_size: config.node_vocab_size,
+            node_attr_dim: config.node_attr_dim,
+            edge_type_count: config.edge_type_count,
+            action_kind_vocab_size: config.action_kind_vocab_size,
+            max_nodes: config.max_nodes,
+            max_edges: config.max_edges,
+            max_actions: config.max_actions,
+            max_subjects: config.max_subjects,
+        }
     }
 }
 
@@ -248,4 +327,18 @@ fn write_meta_u64(db: &DB, key: &[u8], value: u64) -> ReplayResult<()> {
 
     db.put_cf(&meta, key, encode_u64(value))
         .map_err(ReplayError::from)
+}
+
+fn read_feature_schema(db: &DB) -> ReplayResult<Option<FeatureSchemaConfig>> {
+    let meta = db
+        .cf_handle(CF_META)
+        .ok_or_else(|| ReplayError::storage("missing meta column family"))?;
+
+    db.get_cf(&meta, META_FEATURE_SCHEMA)?
+        .map(|bytes| {
+            postcard::from_bytes::<StoredFeatureSchemaConfig>(&bytes)
+                .map(FeatureSchemaConfig::from)
+                .map_err(ReplayError::from)
+        })
+        .transpose()
 }

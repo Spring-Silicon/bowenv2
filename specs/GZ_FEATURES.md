@@ -287,6 +287,32 @@ and never cached.
 
 ## Batch Encoding
 
+Single-row layout for replay payloads (`GZFR`), exact and versioned. This
+is the durable per-row input stored by replay; it is a portable feature row,
+not a graph body. All integers are little-endian:
+
+```text
+header:
+  magic "GZFR", encoding version u32, FeatureSchemaHash 32 bytes
+fields, in FeatureRow declaration order:
+  node_count u32
+  node_tokens_len u32, node_tokens [len] u16
+  node_attrs_len u32, node_attrs [len] f32
+  edge_count u32, then repeated:
+    src u32, dst u32, edge_type u8
+  action_count u32, then repeated:
+    kind_token u32, static_prior f32,
+    subject_count u32, subjects [subject_count] u32
+  position:
+    root_step u32, leaf_depth u32, budget_fraction f32, budget_step f32
+```
+
+`encode_feature_row(row, schema, out)` validates the row against the schema
+and writes this layout. `decode_feature_row(bytes)` validates only structural
+properties (lengths, finite floats, in-row endpoint/subject bounds) because
+the replay store owns schema admission. `validate_feature_row_header(bytes,
+expected_hash)` checks only magic, encoding version, and schema hash.
+
 ```rust
 pub struct FeatureCollator { /* schema + batch capacity + scratch */ }
 
@@ -359,6 +385,31 @@ A read-side parser (`FeatureBatchView::parse(&[u8])`) is public: it
 validates the header and exposes typed section slices. It exists for tests,
 diagnostics, and the future Python conformance test; the hot path never
 parses its own batches.
+
+Training target layout (`GZFT`) is the trainer-side companion to GZFB. It
+is produced by replay serving, not by the evaluator:
+
+```rust
+pub struct RowTargets {
+    pub policy: Vec<f32>,       // true action count; padded on encode
+    pub value: Option<f32>,     // -1.0 | 0.0 | +1.0 when present
+    pub reward: f32,
+}
+```
+
+```text
+header:
+  magic "GZFT", encoding version u32, capacity u32, row_count u32,
+  max_actions u32
+sections, 4-byte aligned:
+  policy      [capacity, max_actions] f32, zero-padded
+  value       [capacity] f32, 0.0 when invalid/missing
+  value_valid [capacity] u8, 1 when value is present
+  reward      [capacity] f32
+```
+
+Rows beyond `row_count` are padding. `TrainingTargetsView::parse` is public
+for tests and diagnostics.
 
 Performance rules:
 

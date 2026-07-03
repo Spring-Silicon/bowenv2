@@ -308,6 +308,7 @@ name = "gz-replay"
 version = "0.1.0"
 dependencies = [
  "gz-engine",
+ "gz-features",
  "postcard",
  "rocksdb",
  "serde",

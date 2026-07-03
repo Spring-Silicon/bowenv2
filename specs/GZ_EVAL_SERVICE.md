@@ -175,14 +175,15 @@ pub struct EvaluatorProcessConfig {
     pub socket_path: PathBuf,
     pub ready_timeout: Duration,   // default 10s
     pub io_timeout: Duration,      // default 30s
+    pub extra_args: Vec<String>,   // appended after --socket <path>
 }
 ```
 
 Rules:
 
 ```text
-spawn starts the child with --socket <path>, inherits stdout/stderr, and
-does not probe readiness.
+spawn starts the child with --socket <path> plus extra_args, inherits
+stdout/stderr, and does not probe readiness.
 connect retries UnixStream::connect on the configured socket path until
 ready_timeout, then sends HELLO on that same connection and requires
 HELLO_ACK.

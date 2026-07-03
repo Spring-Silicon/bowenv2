@@ -225,6 +225,7 @@ pub struct EvaluatorProcessConfig {
     pub socket_path: PathBuf,
     pub ready_timeout: Duration,  // default 10s
     pub io_timeout: Duration,     // default 30s, read+write on the stream
+    pub extra_args: Vec<String>,  // appended after --socket <path>
 }
 
 pub struct EvaluatorProcess { /* Child; kill-and-reap on Drop */ }

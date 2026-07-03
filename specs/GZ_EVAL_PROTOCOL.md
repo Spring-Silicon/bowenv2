@@ -146,3 +146,67 @@ Stub model version:
 ```
 
 That is ascii `gz-stub-v1` zero-padded to 16 bytes.
+
+## Sample Protocol
+
+Replay sampling for the trainer uses the same Unix-socket framing:
+
+```text
+u32 LE body_length, then body: u8 frame_type + fields
+```
+
+Constants:
+
+```text
+SAMPLE_PROTOCOL_VERSION = 1
+ENCODING_VERSION = 1
+MAX_FRAME = 256 MiB
+```
+
+Frame types:
+
+```text
+1 HELLO       trainer -> server, once:
+              protocol_version u32
+              encoding_version u32
+
+2 HELLO_ACK   server -> trainer:
+              protocol_version u32
+              feature_schema_hash 32B
+              max_batch u32
+              produced_rows u64
+
+3 SAMPLE      trainer -> server:
+              batch u32, must be 1..=max_batch
+              window u64, must be nonzero
+              seed u64
+
+4 SAMPLE_RESULT server -> trainer:
+              gzfb_len u32
+              GZFB bytes
+              GZFT bytes
+
+5 ERROR       server -> trainer:
+              code u32
+              msg_len u16
+              utf8 message, bounded to 512 bytes
+```
+
+Error codes:
+
+```text
+1 protocol
+2 encoding
+3 empty store
+4 bad request
+5 missing features
+```
+
+The server closes after sending ERROR. One client is served at a time;
+requests from that client are processed sequentially and responses are sent
+in request order. The server may accept the next client after the current
+client disconnects.
+
+`SAMPLE_RESULT` always contains one feature batch (`GZFB`) and one training
+target block (`GZFT`) with the same capacity and row_count. Samples are
+deterministic for fixed `(store contents, batch, window, seed)`.

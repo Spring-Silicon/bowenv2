@@ -132,6 +132,15 @@ fn root_baseline_replay_appends_every_eligible_episode() {
     assert_eq!(run.episodes_appended + run.episodes_dropped, total);
     assert_eq!(run.episodes_dropped, 0);
     assert_eq!(store.counters().produced_rows, row_count);
+
+    let sample = store
+        .sample_rows(SampleConfig {
+            batch: NonZeroUsize::new(1).unwrap(),
+            window_rows: NonZeroU64::new(store.counters().produced_rows).unwrap(),
+            seed: 0,
+        })
+        .unwrap();
+    assert!(sample[0].1.feature_row.is_none());
 }
 
 #[test]

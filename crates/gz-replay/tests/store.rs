@@ -1,6 +1,6 @@
 mod common;
 
-use common::{episode_with_rows, measure};
+use common::{episode_with_feature_rows, episode_with_rows, feature_schema_config, measure};
 use gz_replay::{ReplayEpisodeId, ReplayError, ReplayStore};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 
@@ -175,6 +175,98 @@ fn counters_survive_reopen() {
 }
 
 #[test]
+fn feature_schema_is_idempotent_and_survives_reopen() {
+    let dir = common::temp_dir();
+    let config = feature_schema_config();
+    {
+        let store = ReplayStore::open(dir.path()).unwrap();
+        assert_eq!(store.feature_schema().unwrap(), None);
+        store.ensure_feature_schema(&config).unwrap();
+        store.ensure_feature_schema(&config).unwrap();
+        assert_eq!(store.feature_schema().unwrap(), Some(config.clone()));
+    }
+
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(store.feature_schema().unwrap(), Some(config));
+}
+
+#[test]
+fn feature_schema_mismatch_is_rejected() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let config = feature_schema_config();
+    store.ensure_feature_schema(&config).unwrap();
+
+    let mut other = config;
+    other.max_nodes += 1;
+    assert_eq!(
+        store.ensure_feature_schema(&other).unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+}
+
+#[test]
+fn append_roundtrips_rows_with_feature_payloads() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store
+        .ensure_feature_schema(&feature_schema_config())
+        .unwrap();
+    let (record, rows) = episode_with_feature_rows(2);
+
+    let id = store.append_episode(&record, &rows).unwrap();
+    let sample = store
+        .sample_rows(gz_replay::SampleConfig {
+            batch: std::num::NonZeroUsize::new(2).unwrap(),
+            window_rows: std::num::NonZeroU64::new(2).unwrap(),
+            seed: 3,
+        })
+        .unwrap();
+
+    assert_eq!(id, ReplayEpisodeId::new(0));
+    assert!(sample.iter().all(|(_, row)| row.feature_row.is_some()));
+}
+
+#[test]
+fn featured_rows_require_configured_schema_and_matching_header() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let (record, rows) = episode_with_feature_rows(1);
+
+    assert_eq!(
+        store.append_episode(&record, &rows).unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+
+    store
+        .ensure_feature_schema(&feature_schema_config())
+        .unwrap();
+    let (record, mut rows) = episode_with_feature_rows(1);
+    rows[0].feature_row.as_mut().unwrap()[8] ^= 0xff;
+
+    assert_eq!(
+        store.append_episode(&record, &rows).unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+}
+
+#[test]
+fn mixed_feature_and_featureless_rows_are_rejected() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store
+        .ensure_feature_schema(&feature_schema_config())
+        .unwrap();
+    let (record, mut rows) = episode_with_feature_rows(2);
+    rows[1].feature_row = None;
+
+    assert_eq!(
+        store.append_episode(&record, &rows).unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+}
+
+#[test]
 fn schema_version_mismatch_fails_open() {
     let dir = common::temp_dir();
     drop(ReplayStore::open(dir.path()).unwrap());
@@ -182,6 +274,23 @@ fn schema_version_mismatch_fails_open() {
     let db = raw_db(dir.path());
     let meta = db.cf_handle("meta").unwrap();
     db.put_cf(&meta, b"schema_version", 999u32.to_be_bytes())
+        .unwrap();
+    drop(db);
+
+    assert!(matches!(
+        ReplayStore::open(dir.path()),
+        Err(ReplayError::SchemaMismatch)
+    ));
+}
+
+#[test]
+fn v2_store_fails_open() {
+    let dir = common::temp_dir();
+    drop(ReplayStore::open(dir.path()).unwrap());
+
+    let db = raw_db(dir.path());
+    let meta = db.cf_handle("meta").unwrap();
+    db.put_cf(&meta, b"schema_version", 2u32.to_be_bytes())
         .unwrap();
     drop(db);
 

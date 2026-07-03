@@ -71,6 +71,17 @@ impl GumbelMcts {
         self.search_config_hash
     }
 
+    #[must_use]
+    pub fn root_budget(&self, step: usize) -> (f32, f32) {
+        let budget_step = if self.config.max_steps == 0 {
+            0.0
+        } else {
+            1.0 / self.config.max_steps as f32
+        };
+
+        (budget_fraction(self.config.max_steps, step), budget_step)
+    }
+
     pub fn run_from_root<E, V>(
         &self,
         engine: &mut E,
@@ -1684,7 +1695,7 @@ fn budget_fraction(max_steps: usize, step: usize) -> f32 {
     if max_steps == 0 {
         1.0
     } else {
-        (max_steps - step) as f32 / max_steps as f32
+        max_steps.saturating_sub(step) as f32 / max_steps as f32
     }
 }
 

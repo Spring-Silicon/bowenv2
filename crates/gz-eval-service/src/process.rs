@@ -20,6 +20,7 @@ pub struct EvaluatorProcessConfig {
     pub socket_path: PathBuf,
     pub ready_timeout: Duration,
     pub io_timeout: Duration,
+    pub extra_args: Vec<String>,
 }
 
 impl Default for EvaluatorProcessConfig {
@@ -31,6 +32,7 @@ impl Default for EvaluatorProcessConfig {
             socket_path: PathBuf::new(),
             ready_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(30),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -53,6 +55,7 @@ impl EvaluatorProcess {
             .arg(&config.module)
             .arg("--socket")
             .arg(&config.socket_path)
+            .args(&config.extra_args)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         if !config.working_dir.as_os_str().is_empty() {
