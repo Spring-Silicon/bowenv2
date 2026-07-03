@@ -12,7 +12,7 @@ use gz_orchestrator::reference::{
     ReferenceProvider, RootBaselineProvider, SelfAverageProvider,
 };
 use gz_orchestrator::{
-    FeaturizedRuntime, ReplayRuntime, RootSource, ThreadedGumbelOrchestrator,
+    FeaturizedRuntime, ReplayBackpressure, ReplayRuntime, RootSource, ThreadedGumbelOrchestrator,
     ThreadedOrchestratorConfig,
 };
 use gz_replay::{ReplayCounters, ReplayEpisodeId, ReplayStore};
@@ -41,6 +41,9 @@ pub struct SelfplayConfig {
     pub max_batch: usize,
     pub evaluator: EvaluatorMode,
     pub python_dir: Option<PathBuf>,
+    pub serve_socket: Option<PathBuf>,
+    pub serve_max_batch: usize,
+    pub replay_backlog: Option<u64>,
 }
 
 impl Default for SelfplayConfig {
@@ -58,6 +61,9 @@ impl Default for SelfplayConfig {
             max_batch: 16,
             evaluator: EvaluatorMode::Random,
             python_dir: None,
+            serve_socket: None,
+            serve_max_batch: 512,
+            replay_backlog: None,
         }
     }
 }
@@ -87,6 +93,25 @@ impl SelfplayConfig {
             || self.reference_ema_decay >= 1.0
         {
             return Err("--reference-ema-decay must be in (0, 1)".to_owned());
+        }
+        if self.serve_socket.is_some() {
+            if self.episodes != 0 {
+                return Err("--serve-socket requires --episodes 0 (unbounded)".to_owned());
+            }
+            if self.evaluator == EvaluatorMode::Random {
+                return Err(
+                    "--serve-socket requires a featurized evaluator (stub|process-stub)".to_owned(),
+                );
+            }
+        }
+        if self.episodes == 0 && self.serve_socket.is_none() {
+            return Err("--episodes 0 (unbounded) requires --serve-socket".to_owned());
+        }
+        if self.serve_max_batch == 0 {
+            return Err("--serve-max-batch must be greater than zero".to_owned());
+        }
+        if self.replay_backlog == Some(0) {
+            return Err("--replay-backlog must be greater than zero".to_owned());
         }
 
         Ok(())
@@ -171,7 +196,8 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         .replay_dir
         .as_ref()
         .expect("validated replay_dir exists");
-    let store = ReplayStore::open(replay_dir).map_err(|error| error.to_string())?;
+    let store =
+        std::sync::Arc::new(ReplayStore::open(replay_dir).map_err(|error| error.to_string())?);
     let engines = (0..config.lanes)
         .map(|_| WhittleEngine::new(whittle_engine_config()).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
@@ -182,6 +208,25 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         .enumerate()
         .map(|(lane, engine)| provider(engine, &config, lane))
         .collect::<Result<Vec<_>, _>>()?;
+
+    if let Some(socket) = config.serve_socket.clone() {
+        // The featurized run registers the schema itself, but the sample
+        // service binds before the run starts and needs it already stored.
+        let extractor = WhittleFeatureExtractor::new(&engines[0]);
+        store
+            .ensure_feature_schema(extractor.schema().config())
+            .map_err(|error| error.to_string())?;
+        let serve_store = store.clone();
+        let serve_max_batch = config.serve_max_batch;
+        std::thread::spawn(move || {
+            if let Err(error) = crate::serve::run_shared(serve_store, socket, serve_max_batch) {
+                // The trainer depends on this service; fail the whole
+                // process loudly rather than starving it silently.
+                eprintln!("sample service failed: {error}");
+                std::process::exit(1);
+            }
+        });
+    }
 
     match config.evaluator {
         EvaluatorMode::Random => run_random(config, store, engines, search, roots, providers),
@@ -194,7 +239,7 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
 
 fn run_random(
     config: SelfplayConfig,
-    store: ReplayStore,
+    store: std::sync::Arc<ReplayStore>,
     engines: Vec<WhittleEngine>,
     search: GumbelMcts,
     roots: Vec<GeneratedRoots>,
@@ -222,7 +267,7 @@ fn run_random(
             ReplayRuntime {
                 store: &store,
                 providers,
-                backpressure: None,
+                backpressure: replay_backpressure(&config),
             },
         )
         .map_err(|error| error.to_string())?;
@@ -232,7 +277,7 @@ fn run_random(
 
 fn run_stub(
     config: SelfplayConfig,
-    store: ReplayStore,
+    store: std::sync::Arc<ReplayStore>,
     engines: Vec<WhittleEngine>,
     search: GumbelMcts,
     roots: Vec<GeneratedRoots>,
@@ -259,7 +304,7 @@ fn run_stub(
             ReplayRuntime {
                 store: &store,
                 providers,
-                backpressure: None,
+                backpressure: replay_backpressure(&config),
             },
         )
         .map_err(|error| error.to_string())?;
@@ -269,7 +314,7 @@ fn run_stub(
 
 fn run_process_stub(
     config: SelfplayConfig,
-    store: ReplayStore,
+    store: std::sync::Arc<ReplayStore>,
     engines: Vec<WhittleEngine>,
     search: GumbelMcts,
     roots: Vec<GeneratedRoots>,
@@ -319,7 +364,7 @@ fn run_process_stub(
             ReplayRuntime {
                 store: &store,
                 providers,
-                backpressure: None,
+                backpressure: replay_backpressure(&config),
             },
         )
         .map_err(|error| error.to_string())?;
@@ -360,6 +405,13 @@ fn summarize(
         eval_batch_count: run.run.batch_sizes.len(),
         mean_eval_batch_size,
         counters,
+    })
+}
+
+fn replay_backpressure(config: &SelfplayConfig) -> Option<ReplayBackpressure> {
+    config.replay_backlog.map(|cap| ReplayBackpressure {
+        max_row_backlog: std::num::NonZeroU64::new(cap).expect("validated nonzero"),
+        gate_poll: Duration::from_millis(1),
     })
 }
 
@@ -472,7 +524,7 @@ fn root_sources(config: &SelfplayConfig) -> Vec<GeneratedRoots> {
         .map(|lane| {
             let count = base + u64::from((lane as u64) < extra);
             GeneratedRoots {
-                remaining: count,
+                remaining: (config.episodes != 0).then_some(count),
                 generator: WhittleGraphGenerator::from_seed(
                     whittle_generator_config(),
                     config.seed ^ ((lane as u64 + 1).wrapping_mul(0xd1b5_4a32_d192_ed03)),
@@ -527,17 +579,21 @@ fn nonzero(value: usize, name: &str) -> Result<NonZeroUsize, String> {
 }
 
 struct GeneratedRoots {
-    remaining: u64,
+    /// None = unbounded: the run ends only by signal (kill-safe: every
+    /// append is one atomic WriteBatch, so a store killed mid-write
+    /// reopens intact).
+    remaining: Option<u64>,
     generator: WhittleGraphGenerator,
 }
 
 impl RootSource<WhittleEngine> for GeneratedRoots {
     fn next_root(&mut self, engine: &mut WhittleEngine) -> EngineResult<Option<WhittleGraphId>> {
-        if self.remaining == 0 {
-            return Ok(None);
+        match self.remaining.as_mut() {
+            Some(0) => return Ok(None),
+            Some(remaining) => *remaining -= 1,
+            None => {}
         }
 
-        self.remaining -= 1;
         self.generator
             .sample_into(engine)
             .map(|generated| Some(generated.graph))

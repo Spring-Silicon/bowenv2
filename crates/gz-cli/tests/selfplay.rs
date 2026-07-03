@@ -46,6 +46,9 @@ fn selfplay_run_writes_replay_rows() {
         max_batch: 4,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
+        serve_socket: None,
+        serve_max_batch: 512,
+        replay_backlog: None,
     })
     .unwrap();
     let store = ReplayStore::open(dir.path()).unwrap();
@@ -73,6 +76,9 @@ fn selfplay_run_supports_stub_evaluator() {
         max_batch: 2,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
+        serve_socket: None,
+        serve_max_batch: 512,
+        replay_backlog: None,
     })
     .unwrap();
 
@@ -97,6 +103,9 @@ fn selfplay_run_supports_self_average_reference() {
         max_batch: 1,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
+        serve_socket: None,
+        serve_max_batch: 512,
+        replay_backlog: None,
     })
     .unwrap();
 
@@ -104,4 +113,67 @@ fn selfplay_run_supports_self_average_reference() {
     let labeled = summary.wins + summary.losses + summary.ties;
     // The first admission per lane has no EMA yet and stays unlabeled.
     assert_eq!(labeled, 3);
+}
+
+fn serving_config(dir: &TestDir) -> SelfplayConfig {
+    SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 0,
+        lanes: 1,
+        workers_per_lane: 1,
+        reference: ReferenceMode::Root,
+        reference_ema_decay: 0.99,
+        seed: 3,
+        max_steps: 2,
+        simulations: 2,
+        max_batch: 1,
+        evaluator: EvaluatorMode::Stub,
+        python_dir: None,
+        serve_socket: Some(dir.path().join("live.sock")),
+        serve_max_batch: 512,
+        replay_backlog: None,
+    }
+}
+
+#[test]
+fn selfplay_config_rejects_serve_socket_with_bounded_episodes() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.episodes = 4;
+
+    let error = config.validate().unwrap_err();
+    assert!(
+        error.contains("--serve-socket requires --episodes 0"),
+        "{error}"
+    );
+}
+
+#[test]
+fn selfplay_config_rejects_unbounded_episodes_without_serve_socket() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.serve_socket = None;
+
+    let error = config.validate().unwrap_err();
+    assert!(error.contains("requires --serve-socket"), "{error}");
+}
+
+#[test]
+fn selfplay_config_rejects_serve_socket_with_random_evaluator() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.evaluator = EvaluatorMode::Random;
+
+    let error = config.validate().unwrap_err();
+    assert!(error.contains("featurized evaluator"), "{error}");
+}
+
+#[test]
+fn selfplay_config_rejects_zero_replay_backlog() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.replay_backlog = Some(0);
+
+    let error = config.validate().unwrap_err();
+    assert!(error.contains("--replay-backlog"), "{error}");
 }

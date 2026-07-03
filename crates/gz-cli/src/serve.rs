@@ -57,9 +57,24 @@ pub fn run_one(config: ReplayServeConfig) -> Result<(), String> {
     ReplaySampleServer::bind(config)?.accept_one()
 }
 
+/// Serve loop over a store shared with a live producer (the in-process
+/// sample service of `graphzero selfplay --serve-socket`). Append and
+/// sample are `&self` and internally serialized, so one process owning
+/// the store dissolves the RocksDB single-writer constraint.
+pub fn run_shared(
+    store: std::sync::Arc<ReplayStore>,
+    socket: PathBuf,
+    max_batch: usize,
+) -> Result<(), String> {
+    let mut server = ReplaySampleServer::bind_shared(store, socket, max_batch)?;
+    loop {
+        server.accept_one()?;
+    }
+}
+
 struct ReplaySampleServer {
     listener: UnixListener,
-    store: ReplayStore,
+    store: std::sync::Arc<ReplayStore>,
     collator: FeatureCollator,
     max_batch: NonZeroUsize,
 }
@@ -68,19 +83,27 @@ impl ReplaySampleServer {
     fn bind(config: ReplayServeConfig) -> Result<Self, String> {
         config.validate()?;
         let store = ReplayStore::open(&config.replay_dir).map_err(|error| error.to_string())?;
+        Self::bind_shared(std::sync::Arc::new(store), config.socket, config.max_batch)
+    }
+
+    fn bind_shared(
+        store: std::sync::Arc<ReplayStore>,
+        socket: PathBuf,
+        max_batch: usize,
+    ) -> Result<Self, String> {
         let schema_config = store
             .feature_schema()
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "store was not produced by featurized selfplay".to_owned())?;
         let schema = FeatureSchema::new(schema_config).map_err(|error| error.to_string())?;
-        let max_batch = NonZeroUsize::new(config.max_batch)
+        let max_batch = NonZeroUsize::new(max_batch)
             .ok_or_else(|| "--max-batch must be greater than zero".to_owned())?;
         let collator = FeatureCollator::new(schema, max_batch);
 
-        if config.socket.exists() {
-            std::fs::remove_file(&config.socket).map_err(|error| error.to_string())?;
+        if socket.exists() {
+            std::fs::remove_file(&socket).map_err(|error| error.to_string())?;
         }
-        let listener = UnixListener::bind(&config.socket).map_err(|error| error.to_string())?;
+        let listener = UnixListener::bind(&socket).map_err(|error| error.to_string())?;
 
         Ok(Self {
             listener,
