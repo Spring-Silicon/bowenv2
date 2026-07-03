@@ -31,9 +31,12 @@ graphzero_bin = "graphzero-test"
     assert config.trainer.batch == 4
     assert config.trainer.total_steps == 3
     assert config.selfplay.lanes == 1
-    assert config.paths.run_dir == Path("run")
-    assert config.paths.replay_dir == Path("run/replay")
-    assert config.paths.checkpoint_dir == Path("run/checkpoints")
+    # Paths are pinned to the trainer's cwd: children (the evaluator) run in
+    # their own working directories, so relative paths must not cross over.
+    assert config.paths.run_dir == Path.cwd() / "run"
+    assert config.paths.replay_dir == Path.cwd() / "run/replay"
+    assert config.paths.checkpoint_dir == Path.cwd() / "run/checkpoints"
+    assert config.paths.sample_socket == Path.cwd() / "run/sample.sock"
     assert config.paths.graphzero_bin == "graphzero-test"
 
 
