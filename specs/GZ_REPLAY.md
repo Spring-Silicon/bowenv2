@@ -204,6 +204,10 @@ reference kinds:
   Greedy/Beam/Random: algorithmic reference trajectories for cheap-measure
   engines; their search_config_hash records the reference kernel config
   Gumbel: future frozen-checkpoint opponent trajectory reference
+  SelfAverage: a reward EMA of the learner's own recent episode rewards
+  on that lane; adaptive, so labels do not saturate on repeated or single
+  roots; unlabeled until the EMA seeds (the first in-flight admissions per
+  lane); carries no reference graph or trajectory
 value_target = sign(learner_reward - reference.reward): +1.0 win, -1.0
 loss, 0.0 exact tie
 no reference configured, or reference measurement missing/invalid:

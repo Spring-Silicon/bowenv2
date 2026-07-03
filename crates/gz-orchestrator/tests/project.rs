@@ -180,7 +180,7 @@ fn reference(
     Reference {
         kind: ReplayReferenceKind::RootBaseline,
         final_reward,
-        final_graph: episode.root_context,
+        final_graph: Some(episode.root_context),
         steps: vec![ReferenceStep {
             graph: episode.root,
             context: episode.root_context,

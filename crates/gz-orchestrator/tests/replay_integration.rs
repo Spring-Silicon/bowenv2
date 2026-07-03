@@ -1,7 +1,9 @@
 use gz_engine::{CandidateOptions, EngineResult, GraphEngine};
 use gz_engine_whittle::{WhittleEngine, WhittleEngineConfig, WhittleGraphId};
 use gz_eval::{RandomValueEvaluator, RandomValueEvaluatorConfig};
-use gz_orchestrator::reference::{GreedyReferenceProvider, RootBaselineProvider};
+use gz_orchestrator::reference::{
+    GreedyReferenceProvider, ReferenceProvider, RootBaselineProvider,
+};
 use gz_orchestrator::{
     CountedRoots, ReplayBackpressure, ReplayRuntime, ThreadedGumbelOrchestrator,
     ThreadedOrchestratorConfig,
@@ -288,4 +290,74 @@ fn replay_records(store: &ReplayStore, count: u64) -> Vec<ReplayEpisodeRecord> {
                 .unwrap()
         })
         .collect()
+}
+
+struct CountingSelfAverage {
+    inner: gz_orchestrator::reference::SelfAverageProvider,
+    observed: std::sync::Arc<AtomicU64>,
+}
+
+impl ReferenceProvider<WhittleEngine> for CountingSelfAverage {
+    fn reference(
+        &mut self,
+        engine: &mut WhittleEngine,
+        root: WhittleGraphId,
+    ) -> EngineResult<Option<gz_orchestrator::reference::Reference<WhittleGraphId>>> {
+        self.inner.reference(engine, root)
+    }
+
+    fn observe(&mut self, learner_reward: f32) {
+        self.observed.fetch_add(1, Ordering::Relaxed);
+        ReferenceProvider::<WhittleEngine>::observe(&mut self.inner, learner_reward);
+    }
+}
+
+#[test]
+fn self_average_reference_labels_after_the_first_episode() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let search = search(&engines[0]);
+    let observed = std::sync::Arc::new(AtomicU64::new(0));
+    let providers = vec![CountingSelfAverage {
+        inner: gz_orchestrator::reference::SelfAverageProvider::new(0.9),
+        observed: observed.clone(),
+    }];
+    // workers_per_lane = 1 makes admission order deterministic: exactly the
+    // first episode is admitted before any completion can seed the EMA.
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+    let run = orchestrator
+        .run_with_replay(
+            vec![roots(5)],
+            GumbelEpisodeContext::default(),
+            ReplayRuntime {
+                store: &store,
+                providers,
+                backpressure: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(run.episodes_appended, 5);
+    assert_eq!(observed.load(Ordering::Relaxed), 5);
+
+    let mut labeled = 0;
+    for id in 0..5 {
+        let record = store
+            .episode(gz_replay::ReplayEpisodeId::new(id))
+            .unwrap()
+            .unwrap();
+        let value_target = record.outcome.value_target;
+        if id == 0 {
+            assert_eq!(value_target, None, "first admission has no EMA yet");
+            assert!(record.outcome.reference.is_none());
+        } else if let Some(target) = value_target {
+            assert!(target == 1.0 || target == 0.0 || target == -1.0);
+            let reference = record.outcome.reference.unwrap();
+            assert_eq!(reference.kind, gz_replay::ReplayReferenceKind::SelfAverage);
+            assert!(reference.final_graph.is_none());
+            labeled += 1;
+        }
+    }
+    assert!(labeled >= 1, "later episodes must be labeled");
 }

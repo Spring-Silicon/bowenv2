@@ -39,6 +39,7 @@ fn selfplay_run_writes_replay_rows() {
         lanes: 2,
         workers_per_lane: 2,
         reference: ReferenceMode::Root,
+        reference_ema_decay: 0.99,
         seed: 3,
         max_steps: 2,
         simulations: 2,
@@ -65,6 +66,7 @@ fn selfplay_run_supports_stub_evaluator() {
         lanes: 1,
         workers_per_lane: 2,
         reference: ReferenceMode::Root,
+        reference_ema_decay: 0.99,
         seed: 4,
         max_steps: 2,
         simulations: 2,
@@ -77,4 +79,29 @@ fn selfplay_run_supports_stub_evaluator() {
     assert_eq!(summary.evaluator, EvaluatorMode::Stub);
     assert!(summary.model_version.is_some());
     assert_eq!(summary.episodes_appended + summary.episodes_dropped, 2);
+}
+
+#[test]
+fn selfplay_run_supports_self_average_reference() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 4,
+        lanes: 1,
+        workers_per_lane: 1,
+        reference: ReferenceMode::SelfAverage,
+        reference_ema_decay: 0.9,
+        seed: 11,
+        max_steps: 2,
+        simulations: 2,
+        max_batch: 1,
+        evaluator: EvaluatorMode::Random,
+        python_dir: None,
+    })
+    .unwrap();
+
+    assert_eq!(summary.episodes_appended, 4);
+    let labeled = summary.wins + summary.losses + summary.ties;
+    // The first admission per lane has no EMA yet and stays unlabeled.
+    assert_eq!(labeled, 3);
 }

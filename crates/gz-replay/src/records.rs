@@ -58,6 +58,10 @@ pub enum ReplayReferenceKind {
     Beam,
     Random,
     Gumbel,
+    // Appended last: postcard encodes enum variant indexes, so adding at
+    // the end keeps every existing store's bytes decoding unchanged. Any
+    // future variant must also be appended, never inserted.
+    SelfAverage,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]

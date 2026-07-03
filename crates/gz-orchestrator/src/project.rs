@@ -25,7 +25,7 @@ pub fn project_episode<G, C>(
     let replay_reference = reference.map(|reference| ReplayReference {
         kind: reference.kind,
         reward: reference.final_reward,
-        final_graph: Some(reference.final_graph),
+        final_graph: reference.final_graph,
         trajectory_id: None,
         search_config_hash: reference.search_config_hash,
         model_version: reference.model_version,

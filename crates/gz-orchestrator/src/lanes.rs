@@ -716,6 +716,7 @@ where
             if let Some((record, rows)) =
                 project_episode(&completed.episode, reference.as_ref(), None)
             {
+                provider.observe(record.outcome.learner_reward);
                 runtime
                     .replay_tx
                     .send(ReplayJob { record, rows })
@@ -873,6 +874,7 @@ where
             if let Some((record, rows)) =
                 project_episode(&completed.episode, reference.as_ref(), Some(&feature_rows))
             {
+                provider.observe(record.outcome.learner_reward);
                 runtime
                     .replay_tx
                     .send(ReplayJob { record, rows })

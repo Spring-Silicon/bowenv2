@@ -94,6 +94,7 @@ fn parse_selfplay(args: Vec<String>) -> Result<SelfplayConfig, String> {
             "--lanes" => config.lanes = parse_usize(flag, value)?,
             "--workers-per-lane" => config.workers_per_lane = parse_usize(flag, value)?,
             "--reference" => config.reference = value.parse()?,
+            "--reference-ema-decay" => config.reference_ema_decay = parse_f32(flag, value)?,
             "--evaluator" => config.evaluator = value.parse()?,
             "--python-dir" => config.python_dir = Some(PathBuf::from(value)),
             "--seed" => config.seed = parse_u64(flag, value)?,
@@ -121,6 +122,12 @@ fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
         .map_err(|_| format!("{flag} expects a positive integer"))
 }
 
+fn parse_f32(flag: &str, value: &str) -> Result<f32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} expects a number"))
+}
+
 fn usage() -> &'static str {
-    "usage: graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--evaluator random|stub|process-stub] [--python-dir PATH] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]\n       graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B"
+    "usage: graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|self-average|none] [--reference-ema-decay D] [--evaluator random|stub|process-stub] [--python-dir PATH] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]\n       graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B"
 }

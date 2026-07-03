@@ -65,7 +65,7 @@ fn root_baseline_reward_matches_engine_measure() {
     assert_eq!(reference.final_reward, expected);
     assert_eq!(reference.steps.len(), 1);
     assert_eq!(reference.steps[0].graph, root);
-    assert_eq!(reference.final_graph, reference.steps[0].context);
+    assert_eq!(reference.final_graph, Some(reference.steps[0].context));
     assert_eq!(reference.search_config_hash, None);
 }
 
@@ -86,7 +86,7 @@ fn greedy_provider_matches_direct_run() {
         reference.final_reward,
         direct.final_measure.scalar_reward.unwrap()
     );
-    assert_eq!(reference.final_graph, direct.final_context);
+    assert_eq!(reference.final_graph, Some(direct.final_context));
     assert_eq!(
         reference.search_config_hash,
         Some(direct.search_config_hash)
@@ -111,7 +111,7 @@ fn beam_provider_matches_direct_run() {
         reference.final_reward,
         direct.final_measure.scalar_reward.unwrap()
     );
-    assert_eq!(reference.final_graph, direct.final_context);
+    assert_eq!(reference.final_graph, Some(direct.final_context));
     assert_eq!(
         reference.search_config_hash,
         Some(direct.search_config_hash)
@@ -136,7 +136,7 @@ fn random_provider_matches_direct_run() {
         reference.final_reward,
         direct.final_measure.scalar_reward.unwrap()
     );
-    assert_eq!(reference.final_graph, direct.final_context);
+    assert_eq!(reference.final_graph, Some(direct.final_context));
     assert_eq!(
         reference.search_config_hash,
         Some(direct.search_config_hash)
@@ -301,4 +301,38 @@ impl GraphEngine for UnscoreableEngine {
             bytes: vec![graph],
         })
     }
+}
+
+#[test]
+fn self_average_is_unlabeled_until_observed_then_tracks_ema() {
+    use gz_orchestrator::reference::SelfAverageProvider;
+
+    let mut engine = whittle();
+    let root = engine.root();
+    let mut provider = SelfAverageProvider::new(0.5);
+
+    assert!(provider.reference(&mut engine, root).unwrap().is_none());
+
+    ReferenceProvider::<WhittleEngine>::observe(&mut provider, 2.0);
+    let reference = provider.reference(&mut engine, root).unwrap().unwrap();
+    assert_eq!(reference.kind, gz_replay::ReplayReferenceKind::SelfAverage);
+    assert_eq!(reference.final_reward, 2.0);
+    assert_eq!(reference.final_graph, None);
+    assert!(reference.steps.is_empty());
+    assert_eq!(reference.search_config_hash, None);
+    assert_eq!(reference.model_version, None);
+
+    ReferenceProvider::<WhittleEngine>::observe(&mut provider, 4.0);
+    let reference = provider.reference(&mut engine, root).unwrap().unwrap();
+    assert_eq!(reference.final_reward, 3.0);
+
+    ReferenceProvider::<WhittleEngine>::observe(&mut provider, 3.0);
+    let reference = provider.reference(&mut engine, root).unwrap().unwrap();
+    assert_eq!(reference.final_reward, 3.0);
+}
+
+#[test]
+#[should_panic(expected = "self-average decay must be in (0, 1)")]
+fn self_average_rejects_decay_of_one() {
+    let _ = gz_orchestrator::reference::SelfAverageProvider::new(1.0);
 }

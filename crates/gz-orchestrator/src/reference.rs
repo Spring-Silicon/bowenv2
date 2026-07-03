@@ -11,13 +11,19 @@ pub trait ReferenceProvider<E: GraphEngine> {
         engine: &mut E,
         root: E::Graph,
     ) -> EngineResult<Option<Reference<E::Graph>>>;
+
+    /// Called by the replay drivers for every replay-eligible completed
+    /// episode with the learner's final measured reward. Default: no-op.
+    fn observe(&mut self, learner_reward: f32) {
+        let _ = learner_reward;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reference<G> {
     pub kind: ReplayReferenceKind,
     pub final_reward: f32,
-    pub final_graph: ReplayGraphContext,
+    pub final_graph: Option<ReplayGraphContext>,
     pub steps: Vec<ReferenceStep<G>>,
     pub search_config_hash: Option<SearchConfigHash>,
     pub model_version: Option<ModelVersion>,
@@ -59,7 +65,7 @@ where
         Ok(Some(Reference {
             kind: ReplayReferenceKind::RootBaseline,
             final_reward,
-            final_graph,
+            final_graph: Some(final_graph),
             steps: vec![ReferenceStep {
                 graph: root,
                 context: final_graph,
@@ -211,11 +217,65 @@ where
     Some(Reference {
         kind,
         final_reward,
-        final_graph,
+        final_graph: Some(final_graph),
         steps: reference_steps,
         search_config_hash,
         model_version: None,
     })
+}
+
+/// Adaptive reference: a reward EMA of the learner's own recent episodes
+/// on this provider's lane. Unlabeled until the first observed episode
+/// seeds the EMA. Never touches the engine.
+pub struct SelfAverageProvider {
+    decay: f64,
+    ema: Option<f64>,
+}
+
+impl SelfAverageProvider {
+    #[must_use]
+    pub fn new(decay: f32) -> Self {
+        assert!(
+            decay.is_finite() && decay > 0.0 && decay < 1.0,
+            "self-average decay must be in (0, 1)"
+        );
+        Self {
+            decay: f64::from(decay),
+            ema: None,
+        }
+    }
+}
+
+impl<E> ReferenceProvider<E> for SelfAverageProvider
+where
+    E: GraphEngine,
+{
+    fn reference(
+        &mut self,
+        _engine: &mut E,
+        _root: E::Graph,
+    ) -> EngineResult<Option<Reference<E::Graph>>> {
+        let Some(ema) = self.ema else {
+            return Ok(None);
+        };
+
+        Ok(Some(Reference {
+            kind: ReplayReferenceKind::SelfAverage,
+            final_reward: ema as f32,
+            final_graph: None,
+            steps: Vec::new(),
+            search_config_hash: None,
+            model_version: None,
+        }))
+    }
+
+    fn observe(&mut self, learner_reward: f32) {
+        let reward = f64::from(learner_reward);
+        self.ema = Some(match self.ema {
+            None => reward,
+            Some(ema) => self.decay * ema + (1.0 - self.decay) * reward,
+        });
+    }
 }
 
 fn score(measured: bool, valid: bool, scalar_reward: Option<f32>) -> Option<f32> {

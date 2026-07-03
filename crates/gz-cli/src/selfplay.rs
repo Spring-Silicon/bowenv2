@@ -9,7 +9,7 @@ use gz_eval_service::{
 };
 use gz_orchestrator::reference::{
     BeamReferenceProvider, GreedyReferenceProvider, RandomReferenceProvider, Reference,
-    ReferenceProvider, RootBaselineProvider,
+    ReferenceProvider, RootBaselineProvider, SelfAverageProvider,
 };
 use gz_orchestrator::{
     FeaturizedRuntime, ReplayRuntime, RootSource, ThreadedGumbelOrchestrator,
@@ -34,6 +34,7 @@ pub struct SelfplayConfig {
     pub lanes: usize,
     pub workers_per_lane: usize,
     pub reference: ReferenceMode,
+    pub reference_ema_decay: f32,
     pub seed: u64,
     pub max_steps: usize,
     pub simulations: usize,
@@ -50,6 +51,7 @@ impl Default for SelfplayConfig {
             lanes: 2,
             workers_per_lane: 8,
             reference: ReferenceMode::Root,
+            reference_ema_decay: 0.99,
             seed: 0,
             max_steps: 8,
             simulations: 8,
@@ -80,6 +82,12 @@ impl SelfplayConfig {
         if self.max_batch == 0 {
             return Err("--max-batch must be greater than zero".to_owned());
         }
+        if !self.reference_ema_decay.is_finite()
+            || self.reference_ema_decay <= 0.0
+            || self.reference_ema_decay >= 1.0
+        {
+            return Err("--reference-ema-decay must be in (0, 1)".to_owned());
+        }
 
         Ok(())
     }
@@ -92,6 +100,7 @@ pub enum ReferenceMode {
     Greedy,
     Beam,
     Random,
+    SelfAverage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +143,7 @@ impl FromStr for ReferenceMode {
             "greedy" => Ok(Self::Greedy),
             "beam" => Ok(Self::Beam),
             "random" => Ok(Self::Random),
+            "self-average" => Ok(Self::SelfAverage),
             _ => Err(format!("unknown reference: {value}")),
         }
     }
@@ -446,6 +456,9 @@ fn provider(
                 measure_options,
             }),
         )),
+        ReferenceMode::SelfAverage => {
+            CliReferenceProvider::SelfAverage(SelfAverageProvider::new(config.reference_ema_decay))
+        }
     };
 
     Ok(provider)
@@ -537,6 +550,7 @@ enum CliReferenceProvider {
     Greedy(GreedyReferenceProvider),
     Beam(BeamReferenceProvider),
     Random(RandomReferenceProvider),
+    SelfAverage(SelfAverageProvider),
 }
 
 impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
@@ -551,6 +565,19 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
             Self::Greedy(provider) => provider.reference(engine, root),
             Self::Beam(provider) => provider.reference(engine, root),
             Self::Random(provider) => provider.reference(engine, root),
+            Self::SelfAverage(provider) => provider.reference(engine, root),
+        }
+    }
+
+    // The enum must forward observe explicitly: the trait default is a
+    // no-op, which would silently starve the self-average EMA. Any future
+    // stateful provider variant must be forwarded here.
+    fn observe(&mut self, learner_reward: f32) {
+        match self {
+            Self::None | Self::Root(_) | Self::Greedy(_) | Self::Beam(_) | Self::Random(_) => {}
+            Self::SelfAverage(provider) => {
+                ReferenceProvider::<WhittleEngine>::observe(provider, learner_reward);
+            }
         }
     }
 }
