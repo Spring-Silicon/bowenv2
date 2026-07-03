@@ -38,6 +38,7 @@ pub struct SelfplayConfig {
     pub seed: u64,
     pub max_steps: usize,
     pub simulations: usize,
+    pub gumbel_scale: f32,
     pub tree_reuse: bool,
     pub max_candidates: usize,
     pub max_batch: usize,
@@ -63,6 +64,7 @@ impl Default for SelfplayConfig {
             seed: 0,
             max_steps: 8,
             simulations: 8,
+            gumbel_scale: 0.0,
             tree_reuse: true,
             max_candidates: WHITTLE_FEATURE_MAX_ENGINE_CANDIDATES,
             max_batch: 16,
@@ -100,6 +102,9 @@ impl SelfplayConfig {
         }
         if self.max_candidates == 0 {
             return Err("--max-candidates must be greater than zero".to_owned());
+        }
+        if !self.gumbel_scale.is_finite() || self.gumbel_scale < 0.0 {
+            return Err("--gumbel-scale must be zero or positive".to_owned());
         }
         if !self.reference_ema_decay.is_finite()
             || self.reference_ema_decay <= 0.0
@@ -515,7 +520,7 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         simulations: nonzero(config.simulations, "simulations")?,
         max_considered_actions: NonZeroUsize::new(16).unwrap(),
         seed: config.seed,
-        gumbel_scale: 0.0,
+        gumbel_scale: config.gumbel_scale,
         c_visit: 50.0,
         c_scale: 1.0,
         temperature_moves: 0,

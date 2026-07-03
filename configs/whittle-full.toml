@@ -1,0 +1,52 @@
+# Full-scale Whittle training test.
+# Selfplay sizing from sweep 20260703T043645Z (32 workers/lane and eval
+# batch 16 won); simulations/model scaled up from the first-curve run.
+
+[arch]
+dim = 256
+layers = 6
+heads = 8
+ffn_dim = 1024
+dropout = 0.1
+
+[trainer]
+lr = 0.0003
+warmup_steps = 1000
+batch = 256
+window_rows = 500000
+total_steps = 50000
+publish_interval = 500
+value_weight = 1.0
+ema_decay = 0.999
+grad_clip = 1.0
+min_startup_rows = 4096
+seed = 1
+device = "cuda:1"
+startup_timeout = 300.0
+reconnect_limit = 5
+log_interval = 10
+step_sleep = 0.0
+bootstrap_episodes = 512
+
+[selfplay]
+lanes = 2
+workers_per_lane = 32
+simulations = 32
+gumbel_scale = 1.0
+max_steps = 16
+reference = "self-average"
+reference_ema_decay = 0.99
+max_row_backlog = 400000
+eval_device = "cuda:0"
+eval_poll_interval = 10.0
+seed = 1
+max_batch = 16
+python_dir = "python"
+
+[wandb]
+project = "graphzero"
+run_name = "whittle-full-1"
+
+[paths]
+run_dir = "runs/whittle-full"
+graphzero_bin = "target/release/graphzero"

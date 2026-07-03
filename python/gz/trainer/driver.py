@@ -43,6 +43,7 @@ class SelfplayConfig:
     lanes: int = 2
     workers_per_lane: int = 8
     simulations: int = 8
+    gumbel_scale: float = 0.0
     max_steps: int = 8
     reference: str = "self-average"
     reference_ema_decay: float = 0.99
@@ -77,6 +78,7 @@ class RunConfig:
     selfplay: SelfplayConfig
     paths: PathsConfig
     wandb: WandbConfig
+    arch: ArchConfig
 
 
 def run(config_path: str | Path) -> None:
@@ -97,7 +99,7 @@ def run(config_path: str | Path) -> None:
             config.trainer.min_startup_rows,
             alive_check=lambda: check_child(serve, "replay-serve"),
         )
-        arch = ArchConfig()
+        arch = config.arch
         model = build_model(sampler.feature_schema, arch).to(config.trainer.device)
         ema = EmaWeights(model, config.trainer.ema_decay)
         first = publish_ema(
@@ -308,6 +310,7 @@ class WandbRun:
                 config={
                     "trainer": asdict(config.trainer),
                     "selfplay": asdict(config.selfplay),
+                    "arch": asdict(config.arch),
                     "run_dir": str(config.paths.run_dir),
                 },
             )
@@ -336,6 +339,7 @@ def load_config(path: str | Path) -> RunConfig:
     trainer = _dataclass_from_dict(TrainerConfig, data.get("trainer", {}))
     selfplay = _dataclass_from_dict(SelfplayConfig, data.get("selfplay", {}))
     wandb = _dataclass_from_dict(WandbConfig, data.get("wandb", {}))
+    arch = _dataclass_from_dict(ArchConfig, data.get("arch", {}))
     raw_paths = data.get("paths", {})
     if not isinstance(raw_paths, dict):
         raise ValueError("[paths] must be a table")
@@ -362,6 +366,7 @@ def load_config(path: str | Path) -> RunConfig:
             graphzero_bin=graphzero_bin,
         ),
         wandb=wandb,
+        arch=arch,
     )
 
 
@@ -441,6 +446,8 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             str(config.selfplay.max_steps),
             "--simulations",
             str(config.selfplay.simulations),
+            "--gumbel-scale",
+            str(config.selfplay.gumbel_scale),
             "--max-batch",
             str(config.selfplay.max_batch),
             "--serve-socket",

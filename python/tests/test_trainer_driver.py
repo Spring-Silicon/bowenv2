@@ -115,3 +115,17 @@ def test_wandb_run_maps_step_records_to_grouped_keys() -> None:
     assert publish_step == 10
     assert publish_payload == {"publish/count": 1, "publish/training_step": 10}
     assert fake.finished
+
+
+def test_load_config_parses_arch_table(tmp_path: Path) -> None:
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(
+        '[arch]\ndim = 64\nlayers = 2\n\n[paths]\nrun_dir = "run"\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.arch.dim == 64
+    assert config.arch.layers == 2
+    assert config.arch.heads == 4
