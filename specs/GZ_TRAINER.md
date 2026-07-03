@@ -10,6 +10,10 @@ loop: one long-lived selfplay process (torch evaluator + in-process sample
 service) and one long-lived trainer process, coupled only through the
 sample socket and the checkpoint directory.
 
+Implemented by `python/gz/trainer/` for the initial concurrent trainer
+path: sample client, target parsing, tensor staging, loss step, EMA
+checkpoint publishing, and supervisor CLI.
+
 Assumes implemented: GZ_FEATURES_EXPANDER_IMPL, GZ_TRAINING_DATA_IMPL,
 GZ_MODEL_TORCH_IMPL.
 

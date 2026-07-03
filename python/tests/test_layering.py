@@ -12,12 +12,16 @@ LAYERS = {
     "model": {"common", "codec"},
     "checkpoints": {"common", "codec"},
     "evaluator": {"common", "proto", "codec", "model", "checkpoints"},
+    "trainer": {"common", "proto", "codec", "model", "checkpoints"},
 }
 
 TORCH_ALLOWED = {
     PACKAGE_ROOT / "model" / "exphormer.py",
     PACKAGE_ROOT / "checkpoints" / "weights.py",
     PACKAGE_ROOT / "evaluator" / "backends.py",
+    PACKAGE_ROOT / "trainer" / "data.py",
+    PACKAGE_ROOT / "trainer" / "driver.py",
+    PACKAGE_ROOT / "trainer" / "loop.py",
 }
 
 

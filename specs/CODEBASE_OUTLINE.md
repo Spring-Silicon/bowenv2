@@ -69,7 +69,7 @@ graphzero/
   python/
     pyproject.toml
     gz/
-      common/ proto/ codec/ model/ evaluator/
+      common/ proto/ codec/ model/ evaluator/ trainer/
     tests/
     benches/
   configs/
