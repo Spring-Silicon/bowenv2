@@ -582,8 +582,16 @@ Human entry points.
 Implemented:
 
 ```bash
-graphzero selfplay --replay-dir PATH [--episodes N] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|none] [--evaluator random|stub|process-stub] [--python-dir PATH] [--seed S] [--max-steps M] [--simulations K] [--max-batch B]
+graphzero selfplay --replay-dir PATH [--episodes N; 0 = unbounded] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|self-average|none] [--reference-ema-decay D] [--evaluator random|stub|process-stub|torch] [--python-dir PATH] [--checkpoint-dir DIR] [--eval-device DEV] [--seed S] [--max-steps M] [--simulations K] [--max-batch B] [--serve-socket PATH] [--serve-max-batch B] [--replay-backlog ROWS]
+graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B
 ```
+
+`--serve-socket` hosts the trainer's sample service inside the selfplay
+process over the shared store; it requires `--episodes 0` (unbounded
+production) and a featurized evaluator. `--replay-backlog` caps
+produced-minus-consumed rows so unbounded selfplay cannot outrun the
+trainer. `--evaluator torch` spawns the python evaluator child with
+`--backend torch --checkpoint-dir DIR --device DEV` (default `cuda:0`).
 
 Future diagnostics:
 
