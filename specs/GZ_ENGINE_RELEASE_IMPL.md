@@ -212,6 +212,37 @@ python3 -m pytest python/tests
 
 All commands passed for the final implementation and documentation state.
 
+Review amendments (post-implementation): the refcounted canonical
+arenas are the right call -- content dedup means an episode's rewrite
+cycle that reproduces existing content shares the slot, and per-holder
+refcounts make release sound where the specced plain slab was not (the
+first slab cut crashed with "unknown candidate" on exactly that
+sharing). Two defects found and fixed in review:
+1. Cache invalidation used full-map retain() scans per last-ref
+   candidate release -- O(cache) per candidate, quadratic per episode.
+   Invisible in the acceptance probe (fixed root + gumbel_scale 0 =
+   identical episodes = tiny caches) but a livelock under generated
+   roots with diverse in-flight episodes (a 96-episode probe ran >17
+   minutes without finishing; both lane threads pinned in
+   HashMap::retain). Candidate bodies carry their parent graph_hash
+   and candidate_hash, so both invalidations are now keyed removals,
+   and the transitions cache is nested by before-graph hash so graph
+   release drops its entries O(1). Fixed shape: 73.8s vs 72.6s
+   pre-release baseline (noise), identical episode outcomes.
+2. release() hard-errored when the released list contained the engine
+   root id. Rewrite cycles legitimately dedup episode-created graphs
+   onto the root; that reference is owned and releasable. The guard is
+   now on freeing the root's LAST reference only
+   (GraphArena::release_protected).
+Leak bound re-verified after both fixes: 6.3 GB peak at 64 episodes,
+18.9 GB at 448 (decelerating: 48 MB/ep then 22 MB/ep -- plateau-shaped
+residual from store caches, not a handle leak).
+Known minor: generated-root mode leaks one source-owned root graph per
+episode (~6 KB); sources own roots by contract and nothing releases
+them. Acceptable rate; noted for the source-release follow-up.
+Contract footnote for future engines: a rejected apply's `after` must
+still be an owned reference (the search task releases it).
+
 ## Out Of Scope
 
 ```text

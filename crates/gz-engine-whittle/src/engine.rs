@@ -415,14 +415,12 @@ impl GraphEngine for WhittleEngine {
             });
         }
 
-        let transition_key = (
-            before_hash,
-            self.action_set_hash,
-            candidate_body.candidate_hash,
-        );
-
         let after_body = if self.config.cache_transitions {
-            self.caches.transitions.get(&transition_key).cloned()
+            self.caches
+                .transitions
+                .get(&before_hash)
+                .and_then(|inner| inner.get(&candidate_body.candidate_hash))
+                .cloned()
         } else {
             None
         };
@@ -435,7 +433,9 @@ impl GraphEngine for WhittleEngine {
                 if self.config.cache_transitions {
                     self.caches
                         .transitions
-                        .insert(transition_key, after_body.clone());
+                        .entry(before_hash)
+                        .or_default()
+                        .insert(candidate_body.candidate_hash, after_body.clone());
                 }
                 after_body
             }
@@ -484,30 +484,30 @@ impl GraphEngine for WhittleEngine {
         graphs: &[Self::Graph],
         candidates: &[Self::Candidate],
     ) -> EngineResult<()> {
-        if graphs.contains(&self.root) {
-            return Err(internal_error(4, "cannot release Whittle root graph"));
-        }
-
         for candidate in candidates.iter().copied() {
             if let Some(candidate_body) = self.candidates.release(candidate)? {
                 self.caches
                     .candidates
-                    .retain(|_, cached| !cached.contains(&candidate));
-                self.caches.transitions.retain(|key, _| {
-                    key.0 != candidate_body.graph_hash || key.2 != candidate_body.candidate_hash
-                });
+                    .remove(&(candidate_body.graph_hash, self.action_set_hash));
+                if let Some(inner) = self.caches.transitions.get_mut(&candidate_body.graph_hash) {
+                    inner.remove(&candidate_body.candidate_hash);
+                    if inner.is_empty() {
+                        self.caches.transitions.remove(&candidate_body.graph_hash);
+                    }
+                }
             }
         }
 
         for graph in graphs.iter().copied() {
-            let (graph_hash, last_ref) = self.graphs.release(graph)?;
+            // Rewrite cycles can dedup an episode-created graph onto the
+            // engine root; the episode's reference is real and releasable.
+            // Only dropping the root's LAST reference is a caller bug.
+            let (graph_hash, last_ref) = self.graphs.release_protected(graph, self.root)?;
             if last_ref {
                 self.caches
                     .candidates
                     .remove(&(graph_hash, self.action_set_hash));
-                self.caches
-                    .transitions
-                    .retain(|(before, _, _), _| *before != graph_hash);
+                self.caches.transitions.remove(&graph_hash);
             }
         }
 
@@ -596,7 +596,11 @@ impl GraphArena {
         })
     }
 
-    fn release(&mut self, id: WhittleGraphId) -> EngineResult<(GraphHash, bool)> {
+    fn release_protected(
+        &mut self,
+        id: WhittleGraphId,
+        protected: WhittleGraphId,
+    ) -> EngineResult<(GraphHash, bool)> {
         let Some(slot) = self.items.get_mut(id.raw() as usize) else {
             return Err(EngineError::UnknownGraph { graph_hash: None });
         };
@@ -612,6 +616,9 @@ impl GraphArena {
         if *refs > 1 {
             *refs -= 1;
             return Ok((hash, false));
+        }
+        if id == protected {
+            return Err(internal_error(4, "cannot free the Whittle root graph"));
         }
         slot.graph.take();
         slot.bump_generation();
@@ -809,7 +816,7 @@ impl CandidateSlot {
 #[derive(Default)]
 struct WhittleCaches {
     candidates: HashMap<(GraphHash, ActionSetHash), Vec<WhittleCandidateId>>,
-    transitions: HashMap<(GraphHash, ActionSetHash, CandidateHash), GraphBody>,
+    transitions: HashMap<GraphHash, HashMap<CandidateHash, GraphBody>>,
 }
 
 pub struct WhittleContractFixture;
