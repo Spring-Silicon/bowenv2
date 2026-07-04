@@ -36,7 +36,9 @@ Compiler backend: future work
 5. Measurement is part of GraphEngine.
 6. Episodes enter replay only after their final graph measurement succeeds;
    rows inherit episode admission. Row graphs are never individually
-   measured.
+   measured. Engine handles created during search are lane-owned and released
+   after portable replay/projection data is copied; root sources own roots and
+   search must not release them.
 7. Replay stores portable graph/action contexts, not process-local handles.
 8. Whittle is the first concrete adapter; add a fake adapter later only when it
    materially simplifies search/orchestration tests.

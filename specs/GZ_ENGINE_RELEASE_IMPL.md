@@ -144,6 +144,74 @@ hot-path cost (bench eval-rows/s within noise of baseline)
 drop paths release; fixed root survives across episodes
 ```
 
+## Implementation Review
+
+Implemented in:
+
+```text
+351011e Add GraphEngine release contract
+1f03694 Add Whittle arena release
+c6986e3 Track Gumbel episode engine handles
+62de3e7 Release episode engine handles
+```
+
+Result:
+
+```text
+Replay rows hold ReplayGraphContext, PortableSearchActionRef, and feature
+bytes. No E::Graph handle enters replay storage.
+
+Feature rows and replay rows are projected before release. Replay append is
+acknowledged before release on replay paths.
+
+Fixed roots are excluded from GumbelEpisode.created_graphs and are not released
+by search episodes.
+
+Whittle graph and candidate arenas use refcounted canonical caches. Equivalent
+graphs or repeated candidate lists may share slots, but each returned handle
+occurrence is an owned release reference.
+
+Whittle transition cache stores GraphBody values, not graph ids. apply()
+inserts/retains a fresh graph reference for each caller.
+```
+
+Leak proof:
+
+```text
+Command:
+target/release/graphzero selfplay \
+  --replay-dir /tmp/gz-release-probe-{64,192} \
+  --episodes {64,192} \
+  --lanes 32 \
+  --workers-per-lane 8 \
+  --reference root \
+  --root-mode fixed \
+  --evaluator stub \
+  --seed 0 \
+  --max-steps 128 \
+  --simulations 48 \
+  --max-considered 8 \
+  --gumbel-scale 0 \
+  --tree-reuse true \
+  --max-candidates 1023 \
+  --max-batch 256
+
+RSS(64 episodes):  7,127,040 KB, wall 2:26.90, rows 8,192
+RSS(192 episodes): 13,255,724 KB, wall 3:29.24, rows 24,576
+Ratio: 1.86x
+```
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+python3 -m pytest python/tests
+```
+
+All commands passed for the final implementation and documentation state.
+
 ## Out Of Scope
 
 ```text

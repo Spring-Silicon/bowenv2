@@ -221,6 +221,19 @@ cheap to copy and satisfy `GraphEngine::Graph` / `GraphEngine::Candidate`.
 Replay and checkpoints must use `ReplayGraphContext`, `PortableCandidateRef`,
 and graph artifacts.
 
+Handles are owned references into engine-local slab arenas. A caller that
+receives a graph or candidate handle from `root`, `candidates`, `apply`, or
+generation owns that reference unless the API explicitly says otherwise.
+Search/orchestrator code must release episode-created handles after portable
+projection and replay append have copied all needed identities.
+
+Equivalent canonical graphs may share one `WhittleGraphId` slot through a graph
+hash refcount. Repeated candidate enumeration may also return refcounted cached
+`WhittleCandidateId` slots. Each returned handle occurrence still represents one
+owned reference and must be released exactly once. Debug builds carry a
+generation counter in handles and panic on stale dereference; release builds use
+plain `u32` slot ids.
+
 ## Graph Representation
 
 Internal graph bodies should be compact and cache-friendly:
@@ -255,7 +268,7 @@ Rules:
 2. `canonical` is the WAV1 compact serialization.
 3. `hash` is derived from canonical bytes and engine/version tags.
 4. Graph insertion must deduplicate by GraphHash when possible.
-5. Graph handles are stable for the engine instance lifetime.
+5. Graph handles are stable until their owned reference is released.
 6. Invalid graph artifacts return EngineError::Internal or UnknownGraph, never panic.
 ```
 
@@ -444,7 +457,6 @@ exception_terms_max > 0
 
 ```rust
 pub struct WhittleCandidate {
-    pub graph: WhittleGraphId,
     pub graph_hash: GraphHash,
     pub candidate_hash: CandidateHash,
     pub rule_id: u16,
@@ -483,8 +495,8 @@ Rules:
 3. CandidateInfo.subjects = matched nodes as SubjectId.
 4. CandidateInfo.display_name is debug text only.
 5. CandidateInfo.metadata stores compact binary candidate fields, not JSON.
-6. candidate_info must reject candidates whose graph handle does not match the
-   supplied graph.
+6. candidate_info must reject candidates whose graph hash does not match the
+   supplied graph's hash.
 ```
 
 ## STOP
@@ -666,19 +678,21 @@ length or fixed-size fields.
 Initial caches:
 
 ```text
-graph hash -> WhittleGraphId
-graph id -> Vec<WhittleCandidateId> when cache_candidates is true
-(graph hash, candidate hash) -> WhittleGraphId when cache_transitions is true
+graph hash -> refcounted WhittleGraphId slot in GraphArena
+(graph hash, action_set_hash) -> Vec<WhittleCandidateId> when cache_candidates is true
+(graph hash, action_set_hash, candidate hash) -> GraphBody when cache_transitions is true
 ```
 
 Rules:
 
 ```text
 1. Cache keys include action_set_hash where candidate semantics matter.
-2. Cache hit paths must not allocate graph bodies.
-3. Cache misses may allocate once into arena.
+2. Candidate cache hits retain cached candidate ids before returning them.
+3. Transition cache hits still insert/retain a graph handle for the caller.
 4. Caches are engine-instance-local.
 5. No global mutable cache.
+6. release() decrements refs and invalidates cache entries on last release.
+7. Fixed root/source handles are not released by search episodes.
 ```
 
 Eviction can be deferred for the first implementation. Add bounded caches only
