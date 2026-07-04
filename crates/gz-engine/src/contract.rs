@@ -135,14 +135,17 @@ fn check_batch_equivalence<F: EngineContractFixture>(fixture: &F) -> Result<(), 
     let mut single_candidates = Vec::new();
     engine.candidates(root, options, &mut single_candidates)?;
 
+    let single_hashes = candidate_hashes_from(&engine, root, &single_candidates)?;
     let batch_candidates = engine.candidates_batch(&[root], options);
     ensure(
         batch_candidates.len() == 1,
         "candidates_batch length mismatch",
     )?;
+    let batch_candidates = batch_candidates.into_iter().next().unwrap()?;
+    let batch_hashes = candidate_hashes_from(&engine, root, &batch_candidates)?;
     ensure(
-        batch_candidates.into_iter().next().unwrap()? == single_candidates,
-        "candidates_batch result must equal single candidates call",
+        batch_hashes == single_hashes,
+        "candidates_batch candidate hashes must equal single candidates call",
     )?;
 
     if let Some(candidate) = single_candidates.first().copied() {
@@ -198,8 +201,17 @@ fn candidate_hashes<E: GraphEngine>(
     let mut candidates = Vec::new();
     engine.candidates(graph, options, &mut candidates)?;
 
+    candidate_hashes_from(engine, graph, &candidates)
+}
+
+fn candidate_hashes_from<E: GraphEngine>(
+    engine: &E,
+    graph: E::Graph,
+    candidates: &[E::Candidate],
+) -> Result<Vec<CandidateHash>, ContractError> {
     candidates
-        .into_iter()
+        .iter()
+        .copied()
         .map(|candidate| {
             Ok(engine
                 .candidate_info(graph, candidate)?

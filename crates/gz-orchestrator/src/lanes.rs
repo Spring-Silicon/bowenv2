@@ -94,6 +94,7 @@ struct EvalReply {
 struct ReplayJob {
     record: ReplayEpisodeRecord,
     rows: Vec<ReplayRow>,
+    ack: SyncSender<EngineResult<()>>,
 }
 
 impl<E, V> ThreadedGumbelOrchestrator<E, V>
@@ -594,6 +595,11 @@ struct ReplayLaneResult<G, C> {
     episodes_dropped: u64,
 }
 
+struct EpisodeFeatureRows<C> {
+    rows: Vec<Vec<u8>>,
+    candidates: Vec<C>,
+}
+
 fn run_lane<E, R>(
     mut engine: E,
     mut roots: R,
@@ -621,7 +627,10 @@ where
             roots_exhausted = pool.admit(&mut engine, &mut roots, &mut admission)?.1;
         }
 
-        episodes.extend(pool.drive(&mut engine, "worker blocked", None)?);
+        for completed in pool.drive(&mut engine, "worker blocked", None)? {
+            release_episode_handles(&mut engine, &completed.episode, &[])?;
+            episodes.push(completed);
+        }
 
         for parked in pool.take_unsent_parked() {
             runtime
@@ -708,7 +717,7 @@ where
             }
         }
 
-        for completed in pool.drive(&mut engine, "worker blocked", None)? {
+        for mut completed in pool.drive(&mut engine, "worker blocked", None)? {
             let reference = references
                 .remove(&completed.episode_id)
                 .ok_or_else(|| internal("missing replay reference"))?;
@@ -716,15 +725,17 @@ where
             if let Some((record, rows)) =
                 project_episode(&completed.episode, reference.as_ref(), None)
             {
-                provider.observe(record.outcome.learner_reward);
-                runtime
-                    .replay_tx
-                    .send(ReplayJob { record, rows })
-                    .map_err(|_| internal("replay sink failed"))?;
+                let reward = record.outcome.learner_reward;
+                let append = append_replay_job(&runtime.replay_tx, record, rows);
+                release_episode_handles(&mut engine, &completed.episode, &[])?;
+                append?;
+                provider.observe(reward);
             } else {
                 episodes_dropped += 1;
+                release_episode_handles(&mut engine, &completed.episode, &[])?;
             }
 
+            clear_replayed_episode_trace(&mut completed.episode);
             episodes.push(completed);
         }
 
@@ -799,7 +810,10 @@ where
             roots_exhausted = pool.admit(&mut engine, &mut roots, &mut admission)?.1;
         }
 
-        episodes.extend(pool.drive(&mut engine, "worker blocked", Some(&mut extractor))?);
+        for completed in pool.drive(&mut engine, "worker blocked", Some(&mut extractor))? {
+            release_episode_handles(&mut engine, &completed.episode, &[])?;
+            episodes.push(completed);
+        }
         send_featurized_parked(runtime.lane, &mut pool, &runtime.intake_tx)?;
 
         if roots_exhausted && !pool.active() {
@@ -859,7 +873,7 @@ where
             }
         }
 
-        for completed in pool.drive(&mut engine, "worker blocked", Some(&mut extractor))? {
+        for mut completed in pool.drive(&mut engine, "worker blocked", Some(&mut extractor))? {
             let reference = references
                 .remove(&completed.episode_id)
                 .ok_or_else(|| internal("missing replay reference"))?;
@@ -871,18 +885,22 @@ where
                 &completed.episode,
             )?;
 
-            if let Some((record, rows)) =
-                project_episode(&completed.episode, reference.as_ref(), Some(&feature_rows))
-            {
-                provider.observe(record.outcome.learner_reward);
-                runtime
-                    .replay_tx
-                    .send(ReplayJob { record, rows })
-                    .map_err(|_| internal("replay sink failed"))?;
+            if let Some((record, rows)) = project_episode(
+                &completed.episode,
+                reference.as_ref(),
+                Some(&feature_rows.rows),
+            ) {
+                let reward = record.outcome.learner_reward;
+                let append = append_replay_job(&runtime.replay_tx, record, rows);
+                release_episode_handles(&mut engine, &completed.episode, &feature_rows.candidates)?;
+                append?;
+                provider.observe(reward);
             } else {
                 episodes_dropped += 1;
+                release_episode_handles(&mut engine, &completed.episode, &feature_rows.candidates)?;
             }
 
+            clear_replayed_episode_trace(&mut completed.episode);
             episodes.push(completed);
         }
 
@@ -910,7 +928,7 @@ fn send_featurized_parked<G, C>(
     intake_tx: &SyncSender<FeaturizedEvalJob>,
 ) -> EngineResult<()>
 where
-    G: Copy,
+    G: Copy + Eq,
     C: Copy,
 {
     for parked in pool.take_unsent_parked() {
@@ -933,7 +951,7 @@ fn feature_rows_for_episode<E, X>(
     extractor: &mut X,
     search: &GumbelMcts,
     episode: &GumbelEpisode<E::Graph, E::Candidate>,
-) -> EngineResult<Vec<Vec<u8>>>
+) -> EngineResult<EpisodeFeatureRows<E::Candidate>>
 where
     E: GraphEngine,
     X: FeatureExtractor<E>,
@@ -941,6 +959,7 @@ where
     let schema = extractor.schema().clone();
     let mut out = Vec::with_capacity(episode.steps.len());
     let mut candidates = Vec::new();
+    let mut created_candidates = Vec::new();
 
     for (index, step) in episode.steps.iter().enumerate() {
         candidates.clear();
@@ -949,6 +968,7 @@ where
             search.config().candidate_options,
             &mut candidates,
         )?;
+        created_candidates.extend(candidates.iter().copied());
         let (budget_fraction, budget_step) = search.root_budget(index);
         let root_step = u32::try_from(index).map_err(|_| internal("root step overflow"))?;
         let row = extractor
@@ -974,7 +994,48 @@ where
         out.push(bytes);
     }
 
-    Ok(out)
+    Ok(EpisodeFeatureRows {
+        rows: out,
+        candidates: created_candidates,
+    })
+}
+
+fn release_episode_handles<E>(
+    engine: &mut E,
+    episode: &GumbelEpisode<E::Graph, E::Candidate>,
+    extra_candidates: &[E::Candidate],
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    if extra_candidates.is_empty() {
+        return engine.release(&episode.created_graphs, &episode.created_candidates);
+    }
+
+    let mut candidates =
+        Vec::with_capacity(episode.created_candidates.len() + extra_candidates.len());
+    candidates.extend_from_slice(&episode.created_candidates);
+    candidates.extend_from_slice(extra_candidates);
+    engine.release(&episode.created_graphs, &candidates)
+}
+
+fn clear_replayed_episode_trace<G, C>(episode: &mut GumbelEpisode<G, C>) {
+    episode.steps.clear();
+    episode.root_stats.clear();
+    episode.created_graphs.clear();
+    episode.created_candidates.clear();
+}
+
+fn append_replay_job(
+    replay_tx: &SyncSender<ReplayJob>,
+    record: ReplayEpisodeRecord,
+    rows: Vec<ReplayRow>,
+) -> EngineResult<()> {
+    let (ack, done) = sync_channel(1);
+    replay_tx
+        .send(ReplayJob { record, rows, ack })
+        .map_err(|_| internal("replay sink failed"))?;
+    done.recv().map_err(|_| internal("replay sink failed"))?
 }
 
 fn receive_replies<G, C>(
@@ -982,7 +1043,7 @@ fn receive_replies<G, C>(
     reply_rx: &Receiver<EvalReply>,
 ) -> EngineResult<()>
 where
-    G: Copy,
+    G: Copy + Eq,
     C: Copy,
 {
     let reply = reply_rx
@@ -1146,9 +1207,15 @@ fn run_replay_sink(store: &ReplayStore, replay_rx: Receiver<ReplayJob>) -> Engin
     let mut episodes_appended = 0;
 
     while let Ok(job) = replay_rx.recv() {
-        store
+        let result = store
             .append_episode(&job.record, &job.rows)
-            .map_err(map_replay_error)?;
+            .map(|_| ())
+            .map_err(map_replay_error);
+        let failed = result.clone().err();
+        let _ = job.ack.send(result);
+        if let Some(error) = failed {
+            return Err(error);
+        }
         episodes_appended += 1;
     }
 

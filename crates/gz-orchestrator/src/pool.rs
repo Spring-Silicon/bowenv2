@@ -90,7 +90,7 @@ impl<G, C> SlotState<G, C> {
 
 impl<G, C> WorkerPool<G, C>
 where
-    G: Copy,
+    G: Copy + Eq,
     C: Copy,
 {
     pub(crate) fn new(workers: NonZeroUsize, worker_id_base: u64) -> Self {

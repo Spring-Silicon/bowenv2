@@ -5,8 +5,8 @@ use crate::work::{
 };
 use crate::{SearchAction, SearchCandidateSummary, gumbel_search_config_hash};
 use gz_engine::{
-    ApplyResult, CandidateOptions, EngineResult, GraphEngine, MeasureOptions, MeasureResult,
-    ModelVersion, PortableCandidateRef, PortableSearchActionRef, ReplayGraphContext,
+    ApplyResult, CandidateHash, CandidateOptions, EngineResult, GraphEngine, MeasureOptions,
+    MeasureResult, ModelVersion, PortableCandidateRef, PortableSearchActionRef, ReplayGraphContext,
     SearchConfigHash, SearchStepRef,
 };
 use gz_eval::{
@@ -291,7 +291,7 @@ pub struct GumbelRootStats {
     pub carried_root_visits: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GumbelEpisode<G, C> {
     pub root: G,
     pub final_graph: G,
@@ -306,7 +306,30 @@ pub struct GumbelEpisode<G, C> {
     pub search_config_hash: SearchConfigHash,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl<G, C> PartialEq for GumbelEpisode<G, C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.root_context == other.root_context
+            && self.final_context == other.final_context
+            && self.steps == other.steps
+            && self.root_stats == other.root_stats
+            && measure_result_eq(&self.final_measure, &other.final_measure)
+            && self.stop_reason == other.stop_reason
+            && self.search_config_hash == other.search_config_hash
+    }
+}
+
+fn measure_result_eq<G>(left: &MeasureResult<G>, right: &MeasureResult<G>) -> bool {
+    left.graph_hash == right.graph_hash
+        && left.config_hash == right.config_hash
+        && left.measured == right.measured
+        && left.valid == right.valid
+        && left.latency == right.latency
+        && left.scalar_reward == right.scalar_reward
+        && left.failure == right.failure
+        && left.metadata == right.metadata
+}
+
+#[derive(Clone, Debug)]
 pub struct GumbelStep<G, C> {
     pub before: G,
     pub after: G,
@@ -324,6 +347,24 @@ pub struct GumbelStep<G, C> {
     pub root_search_value: f32,
     pub root_q_max: f32,
     pub model_version: ModelVersion,
+}
+
+impl<G, C> PartialEq for GumbelStep<G, C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.step_ref == other.step_ref
+            && self.selected_action == other.selected_action
+            && self.selected_candidate == other.selected_candidate
+            && self.engine_candidate_count == other.engine_candidate_count
+            && self.action_count == other.action_count
+            && self.selected_rank == other.selected_rank
+            && self.legal_actions == other.legal_actions
+            && self.policy_target == other.policy_target
+            && self.considered_action_indices == other.considered_action_indices
+            && self.root_value == other.root_value
+            && self.root_search_value == other.root_search_value
+            && self.root_q_max == other.root_q_max
+            && self.model_version == other.model_version
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,7 +395,7 @@ pub struct GumbelEpisodeTask<G, C> {
 
 impl<G, C> GumbelEpisodeTask<G, C>
 where
-    G: Copy,
+    G: Copy + Eq,
     C: Copy,
 {
     pub fn new(
@@ -529,7 +570,11 @@ where
                         .map(|candidate| candidate.candidate),
                 );
             }
-            SearchWorkResult::Apply(applied) => self.created_graphs.push(applied.after),
+            SearchWorkResult::Apply(applied) => {
+                if applied.after != self.root {
+                    self.created_graphs.push(applied.after);
+                }
+            }
             SearchWorkResult::Measure(_) | SearchWorkResult::Eval(_) => {}
         }
     }
@@ -1038,20 +1083,19 @@ where
 
         let mut candidates = Vec::with_capacity(result.candidates.len());
         let mut eval_actions = Vec::with_capacity(result.candidates.len() + 1);
-        let mut action_refs = Vec::with_capacity(result.candidates.len() + 1);
+        let mut candidate_hashes = Vec::with_capacity(result.candidates.len());
         let mut summaries = Vec::with_capacity(result.candidates.len() + 1);
 
         for expanded in result.candidates {
             candidates.push(expanded.candidate);
             let candidate_ref = PortableCandidateRef::new(context, expanded.candidate_hash);
-            let action_ref = PortableSearchActionRef::candidate(candidate_ref);
+            candidate_hashes.push(expanded.candidate_hash);
             eval_actions.push(EvalAction::candidate(
                 candidate_ref,
                 expanded.kind,
                 expanded.tags,
                 expanded.static_prior,
             ));
-            action_refs.push(action_ref);
             summaries.push(Some(SearchCandidateSummary {
                 kind: expanded.kind,
                 tags: expanded.tags,
@@ -1060,7 +1104,6 @@ where
         }
 
         eval_actions.push(EvalAction::stop(context));
-        action_refs.push(PortableSearchActionRef::stop(context));
         summaries.push(None);
 
         self.state = RootTaskState::EmitNodeEval {
@@ -1070,7 +1113,7 @@ where
                 depth,
                 candidates,
                 eval_actions,
-                action_refs,
+                candidate_hashes,
                 summaries,
             },
             run,
@@ -1203,8 +1246,12 @@ where
             graph: expansion.graph,
             context: expansion.context,
             candidates: expansion.candidates,
-            eval_actions: expansion.eval_actions,
-            action_refs: expansion.action_refs,
+            eval_actions: if self.context.opponent.is_some() {
+                expansion.eval_actions
+            } else {
+                Vec::new()
+            },
+            candidate_hashes: expansion.candidate_hashes,
             summaries: expansion.summaries,
             logits: output.policy_logits,
             priors,
@@ -1305,12 +1352,12 @@ where
             selected_after,
             selected_after_context,
             selected_action,
-            selected_action_ref: root_node.action_refs[selected],
+            selected_action_ref: root_node.action_ref(selected)?,
             selected_candidate: root_node.summaries[selected],
             selected_action_index: selected,
             engine_candidate_count: root_node.candidates.len(),
             action_count: root_node.action_count(),
-            legal_actions: root_node.action_refs.clone(),
+            legal_actions: root_node.action_refs(),
             considered_action_indices: run.considered,
             policy_target,
             root_value: root_node.value,
@@ -1386,7 +1433,7 @@ struct NodeExpansion<G, C> {
     depth: usize,
     candidates: Vec<C>,
     eval_actions: Vec<EvalAction>,
-    action_refs: Vec<PortableSearchActionRef>,
+    candidate_hashes: Vec<CandidateHash>,
     summaries: Vec<Option<SearchCandidateSummary>>,
 }
 
@@ -1609,7 +1656,7 @@ struct Node<G, C> {
     context: ReplayGraphContext,
     candidates: Vec<C>,
     eval_actions: Vec<EvalAction>,
-    action_refs: Vec<PortableSearchActionRef>,
+    candidate_hashes: Vec<CandidateHash>,
     summaries: Vec<Option<SearchCandidateSummary>>,
     logits: Vec<f32>,
     priors: Vec<f32>,
@@ -1643,6 +1690,32 @@ where
                 .map(SearchAction::Candidate)
                 .ok_or_else(|| internal("invalid selected action"))
         }
+    }
+
+    fn action_ref(&self, action: usize) -> EngineResult<PortableSearchActionRef> {
+        if self.is_stop(action) {
+            Ok(PortableSearchActionRef::stop(self.context))
+        } else {
+            self.candidate_hashes
+                .get(action)
+                .copied()
+                .map(|hash| {
+                    PortableSearchActionRef::candidate(PortableCandidateRef::new(
+                        self.context,
+                        hash,
+                    ))
+                })
+                .ok_or_else(|| internal("invalid selected action"))
+        }
+    }
+
+    fn action_refs(&self) -> Vec<PortableSearchActionRef> {
+        let mut refs = Vec::with_capacity(self.candidate_hashes.len() + 1);
+        refs.extend(self.candidate_hashes.iter().copied().map(|hash| {
+            PortableSearchActionRef::candidate(PortableCandidateRef::new(self.context, hash))
+        }));
+        refs.push(PortableSearchActionRef::stop(self.context));
+        refs
     }
 }
 

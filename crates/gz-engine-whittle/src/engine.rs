@@ -289,23 +289,24 @@ impl WhittleEngine {
         if self.config.cache_candidates
             && let Some(cached) = self.caches.candidates.get(&cache_key)
         {
+            for candidate in cached {
+                self.candidates.retain(*candidate)?;
+            }
             return Ok(cached.clone());
         }
 
-        let graph_body = self.graph(graph)?.body();
-        let raw = enumerate_graph(&graph_body, self.config.include_reverse_constant_folding)
-            .map_err(internal_rule)?;
-        let ids: Vec<_> = raw
+        let raw = {
+            let graph_body = self.graph(graph)?.body();
+            enumerate_graph(&graph_body, self.config.include_reverse_constant_folding)
+                .map_err(internal_rule)?
+        };
+        let ids = raw
             .into_iter()
             .map(|raw| {
-                self.candidates.insert(WhittleCandidate::new(
-                    graph,
-                    graph_hash,
-                    self.action_set_hash,
-                    raw,
-                ))
+                self.candidates
+                    .insert(WhittleCandidate::new(graph_hash, self.action_set_hash, raw))
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         if self.config.cache_candidates {
             self.caches.candidates.insert(cache_key, ids.clone());
@@ -369,7 +370,7 @@ impl GraphEngine for WhittleEngine {
         let graph_hash = self.hash(graph)?;
         let candidate = self.candidate(candidate)?;
 
-        if candidate.graph != graph || candidate.graph_hash != graph_hash {
+        if candidate.graph_hash != graph_hash {
             return Err(EngineError::StaleCandidate {
                 expected_graph_hash: candidate.graph_hash,
                 actual_graph_hash: graph_hash,
@@ -420,24 +421,26 @@ impl GraphEngine for WhittleEngine {
             candidate_body.candidate_hash,
         );
 
-        let after = if self.config.cache_transitions {
-            self.caches.transitions.get(&transition_key).copied()
+        let after_body = if self.config.cache_transitions {
+            self.caches.transitions.get(&transition_key).cloned()
         } else {
             None
         };
 
-        let after = match after {
-            Some(after) => after,
+        let after_body = match after_body {
+            Some(after_body) => after_body,
             None => {
                 let before = self.graph(graph)?.body();
                 let after_body = apply_graph(&before, candidate_body.raw).map_err(internal_rule)?;
-                let after = self.graphs.insert(after_body).map_err(internal_graph)?;
                 if self.config.cache_transitions {
-                    self.caches.transitions.insert(transition_key, after);
+                    self.caches
+                        .transitions
+                        .insert(transition_key, after_body.clone());
                 }
-                after
+                after_body
             }
         };
+        let after = self.graphs.insert(after_body).map_err(internal_graph)?;
         let after_hash = self.hash(after)?;
 
         Ok(ApplyResult {
@@ -485,30 +488,26 @@ impl GraphEngine for WhittleEngine {
             return Err(internal_error(4, "cannot release Whittle root graph"));
         }
 
-        let mut released_graphs = HashSet::with_capacity(graphs.len());
-        for graph in graphs.iter().copied() {
-            if !released_graphs.insert(graph) {
-                continue;
-            }
-            let graph_hash = self.graphs.release(graph)?;
-            self.caches
-                .candidates
-                .remove(&(graph_hash, self.action_set_hash));
-            self.caches
-                .transitions
-                .retain(|(before, _, _), after| *before != graph_hash && *after != graph);
-        }
-
-        let mut released_candidates = HashSet::with_capacity(candidates.len());
         for candidate in candidates.iter().copied() {
-            if released_candidates.insert(candidate) {
-                let candidate_body = self.candidates.release(candidate)?;
+            if let Some(candidate_body) = self.candidates.release(candidate)? {
                 self.caches
                     .candidates
                     .retain(|_, cached| !cached.contains(&candidate));
                 self.caches.transitions.retain(|key, _| {
                     key.0 != candidate_body.graph_hash || key.2 != candidate_body.candidate_hash
                 });
+            }
+        }
+
+        for graph in graphs.iter().copied() {
+            let (graph_hash, last_ref) = self.graphs.release(graph)?;
+            if last_ref {
+                self.caches
+                    .candidates
+                    .remove(&(graph_hash, self.action_set_hash));
+                self.caches
+                    .transitions
+                    .retain(|(before, _, _), _| *before != graph_hash);
             }
         }
 
@@ -532,6 +531,7 @@ struct GraphArena {
     items: Vec<GraphSlot>,
     free: Vec<u32>,
     by_hash: HashMap<GraphHash, WhittleGraphId>,
+    hash_refs: HashMap<GraphHash, u32>,
     engine_id: EngineId,
     engine_version: EngineVersion,
 }
@@ -542,6 +542,7 @@ impl GraphArena {
             items: Vec::new(),
             free: Vec::new(),
             by_hash: HashMap::new(),
+            hash_refs: HashMap::new(),
             engine_id,
             engine_version,
         }
@@ -553,6 +554,13 @@ impl GraphArena {
         let hash = graph_hash(self.engine_id, self.engine_version, &canonical);
 
         if let Some(id) = self.by_hash.get(&hash).copied() {
+            let refs = self
+                .hash_refs
+                .get_mut(&hash)
+                .ok_or(GraphError::InvalidInput("missing graph refcount"))?;
+            *refs = refs
+                .checked_add(1)
+                .ok_or(GraphError::InvalidInput("graph refcount overflow"))?;
             return Ok(id);
         }
 
@@ -577,6 +585,7 @@ impl GraphArena {
             WhittleGraphId::from_slot(index, 0)
         };
         self.by_hash.insert(hash, id);
+        *self.hash_refs.entry(hash).or_insert(0) += 1;
         Ok(id)
     }
 
@@ -587,18 +596,29 @@ impl GraphArena {
         })
     }
 
-    fn release(&mut self, id: WhittleGraphId) -> EngineResult<GraphHash> {
+    fn release(&mut self, id: WhittleGraphId) -> EngineResult<(GraphHash, bool)> {
         let Some(slot) = self.items.get_mut(id.raw() as usize) else {
             return Err(EngineError::UnknownGraph { graph_hash: None });
         };
         slot.assert_generation(id.generation(), "stale WhittleGraphId");
-        let Some(graph) = slot.graph.take() else {
+        let Some(graph) = slot.graph.as_ref() else {
             return Err(EngineError::UnknownGraph { graph_hash: None });
         };
+        let hash = graph.hash;
+        let refs = self
+            .hash_refs
+            .get_mut(&hash)
+            .ok_or_else(|| internal_error(5, "missing Whittle graph hash refcount"))?;
+        if *refs > 1 {
+            *refs -= 1;
+            return Ok((hash, false));
+        }
+        slot.graph.take();
         slot.bump_generation();
         self.free.push(id.raw());
-        self.by_hash.remove(&graph.hash);
-        Ok(graph.hash)
+        self.hash_refs.remove(&hash);
+        self.by_hash.remove(&hash);
+        Ok((hash, true))
     }
 }
 
@@ -646,7 +666,6 @@ impl GraphSlot {
 
 #[derive(Clone, Copy, Debug)]
 struct WhittleCandidate {
-    graph: WhittleGraphId,
     graph_hash: GraphHash,
     candidate_hash: CandidateHash,
     rule_id: u16,
@@ -657,14 +676,8 @@ struct WhittleCandidate {
 }
 
 impl WhittleCandidate {
-    fn new(
-        graph: WhittleGraphId,
-        graph_hash: GraphHash,
-        action_set_hash: ActionSetHash,
-        raw: RawCandidate,
-    ) -> Self {
+    fn new(graph_hash: GraphHash, action_set_hash: ActionSetHash, raw: RawCandidate) -> Self {
         Self {
-            graph,
             graph_hash,
             candidate_hash: candidate_hash(graph_hash, action_set_hash, raw),
             rule_id: raw.rule_id,
@@ -692,12 +705,32 @@ impl CandidateArena {
             let slot = &mut self.items[index as usize];
             debug_assert!(slot.candidate.is_none());
             slot.candidate = Some(candidate);
+            slot.refs = 1;
             WhittleCandidateId::from_slot(index, slot.generation())
         } else {
             let index = self.items.len() as u32;
             self.items.push(CandidateSlot::new(candidate));
             WhittleCandidateId::from_slot(index, 0)
         }
+    }
+
+    fn retain(&mut self, id: WhittleCandidateId) -> EngineResult<()> {
+        let Some(slot) = self.items.get_mut(id.raw() as usize) else {
+            return Err(EngineError::UnknownCandidate {
+                candidate_hash: None,
+            });
+        };
+        slot.assert_generation(id.generation(), "stale WhittleCandidateId");
+        if slot.candidate.is_none() {
+            return Err(EngineError::UnknownCandidate {
+                candidate_hash: None,
+            });
+        }
+        slot.refs = slot
+            .refs
+            .checked_add(1)
+            .ok_or_else(|| internal_error(6, "Whittle candidate refcount overflow"))?;
+        Ok(())
     }
 
     fn get(&self, id: WhittleCandidateId) -> Option<&WhittleCandidate> {
@@ -707,25 +740,31 @@ impl CandidateArena {
         })
     }
 
-    fn release(&mut self, id: WhittleCandidateId) -> EngineResult<WhittleCandidate> {
+    fn release(&mut self, id: WhittleCandidateId) -> EngineResult<Option<WhittleCandidate>> {
         let Some(slot) = self.items.get_mut(id.raw() as usize) else {
             return Err(EngineError::UnknownCandidate {
                 candidate_hash: None,
             });
         };
         slot.assert_generation(id.generation(), "stale WhittleCandidateId");
+        if slot.refs > 1 {
+            slot.refs -= 1;
+            return Ok(None);
+        }
         let candidate = slot.candidate.take().ok_or(EngineError::UnknownCandidate {
             candidate_hash: None,
         })?;
+        slot.refs = 0;
         slot.bump_generation();
         self.free.push(id.raw());
-        Ok(candidate)
+        Ok(Some(candidate))
     }
 }
 
 #[derive(Default)]
 struct CandidateSlot {
     candidate: Option<WhittleCandidate>,
+    refs: u32,
     #[cfg(debug_assertions)]
     generation: u32,
 }
@@ -734,6 +773,7 @@ impl CandidateSlot {
     fn new(candidate: WhittleCandidate) -> Self {
         Self {
             candidate: Some(candidate),
+            refs: 1,
             #[cfg(debug_assertions)]
             generation: 0,
         }
@@ -769,7 +809,7 @@ impl CandidateSlot {
 #[derive(Default)]
 struct WhittleCaches {
     candidates: HashMap<(GraphHash, ActionSetHash), Vec<WhittleCandidateId>>,
-    transitions: HashMap<(GraphHash, ActionSetHash, CandidateHash), WhittleGraphId>,
+    transitions: HashMap<(GraphHash, ActionSetHash, CandidateHash), GraphBody>,
 }
 
 pub struct WhittleContractFixture;

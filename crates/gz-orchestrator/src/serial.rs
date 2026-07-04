@@ -69,6 +69,8 @@ where
                 SearchPoll::Done(episode) => {
                     let episode_id = EpisodeId::new(self.next_episode_id);
                     self.next_episode_id += 1;
+                    self.engine
+                        .release(&episode.created_graphs, &episode.created_candidates)?;
                     return Ok(OrchestratedEpisode {
                         worker_id: self.worker_id,
                         episode_id,
