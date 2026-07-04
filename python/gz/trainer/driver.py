@@ -203,8 +203,11 @@ def run(config_path: str | Path) -> None:
                     "stop_rate_ema": ack.stop_rate_ema,
                     "best_cost": ack.best_cost,
                 }
-                if ack.root is not None and ack.episodes:
+                # Outcome gauges are per-store-open; a zero means unseeded
+                # (no episode appended by this selfplay process yet).
+                if ack.root is not None and ack.episode_cost_ema > 0.0:
                     record["reduction_ema"] = ack.root.cost - ack.episode_cost_ema
+                if ack.root is not None and ack.best_cost > 0.0:
                     record["reduction_best"] = ack.root.cost - ack.best_cost
                 record.update(window.drain(produced, ack.episodes))
                 metrics.write(record)
