@@ -218,6 +218,7 @@ fn g3_opponent_stop_reeval_episode_golden() {
                     trajectory_id: 11,
                     row_count: 4,
                 }),
+                noise_seed: 0,
             },
         )
         .unwrap();

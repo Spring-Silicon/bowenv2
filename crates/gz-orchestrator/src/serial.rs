@@ -52,6 +52,10 @@ where
         context: GumbelEpisodeContext,
     ) -> EngineResult<SerialEpisode<E::Graph, E::Candidate>> {
         let identity = EngineIdentity::from_engine(&self.engine);
+        let context = GumbelEpisodeContext {
+            noise_seed: crate::root::episode_noise_seed(self.next_episode_id),
+            ..context
+        };
         let mut task = GumbelEpisodeTask::new(&self.search, identity, root, context);
 
         loop {

@@ -1,4 +1,6 @@
-use gz_cli::selfplay::{EvaluatorMode, ReferenceMode, SelfplayConfig, run as run_selfplay};
+use gz_cli::selfplay::{
+    EvaluatorMode, ReferenceMode, RootMode, SelfplayConfig, run as run_selfplay,
+};
 use gz_cli::serve::{ReplayServeConfig, SAMPLE_PROTOCOL_VERSION, run_one};
 use gz_features::{
     ENCODING_VERSION, FeatureBatchView, TrainingTargetsView, decode_feature_schema_config,
@@ -46,6 +48,7 @@ fn replay_serve_returns_feature_batch_and_targets() {
         lanes: 1,
         workers_per_lane: 2,
         reference: ReferenceMode::Root,
+        root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
         seed: 5,
         max_steps: 2,
@@ -137,6 +140,7 @@ fn replay_serve_rejects_featureless_store() {
         lanes: 1,
         workers_per_lane: 1,
         reference: ReferenceMode::Root,
+        root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
         seed: 7,
         max_steps: 1,

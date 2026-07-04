@@ -132,7 +132,10 @@ where
                     admission.search,
                     admission.identity,
                     root,
-                    admission.context,
+                    gz_search::GumbelEpisodeContext {
+                        noise_seed: crate::root::episode_noise_seed(episode_id.value()),
+                        ..admission.context
+                    },
                 ),
                 episode_id,
             });

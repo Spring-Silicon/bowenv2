@@ -1,4 +1,4 @@
-use gz_cli::selfplay::{EvaluatorMode, ReferenceMode, SelfplayConfig, run};
+use gz_cli::selfplay::{EvaluatorMode, ReferenceMode, RootMode, SelfplayConfig, run};
 use gz_replay::ReplayStore;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,6 +72,7 @@ fn selfplay_run_writes_replay_rows() {
         lanes: 2,
         workers_per_lane: 2,
         reference: ReferenceMode::Root,
+        root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
         seed: 3,
         max_steps: 2,
@@ -110,6 +111,7 @@ fn selfplay_run_supports_stub_evaluator() {
         lanes: 1,
         workers_per_lane: 2,
         reference: ReferenceMode::Root,
+        root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
         seed: 4,
         max_steps: 2,
@@ -145,6 +147,7 @@ fn selfplay_run_supports_self_average_reference() {
         lanes: 1,
         workers_per_lane: 1,
         reference: ReferenceMode::SelfAverage,
+        root_mode: RootMode::Generated,
         reference_ema_decay: 0.9,
         seed: 11,
         max_steps: 2,
@@ -179,6 +182,7 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         lanes: 1,
         workers_per_lane: 1,
         reference: ReferenceMode::Root,
+        root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
         seed: 3,
         max_steps: 2,
@@ -348,4 +352,57 @@ fn selfplay_config_rejects_zero_max_candidates() {
 
     let error = config.validate().unwrap_err();
     assert!(error.contains("--max-candidates"), "{error}");
+}
+
+#[test]
+fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 6,
+        lanes: 2,
+        workers_per_lane: 2,
+        reference: ReferenceMode::SelfAverage,
+        root_mode: RootMode::Fixed,
+        reference_ema_decay: 0.9,
+        seed: 11,
+        max_steps: 3,
+        simulations: 4,
+        max_considered: 4,
+        gumbel_scale: 1.0,
+        tree_reuse: true,
+        max_candidates: 255,
+        max_batch: 2,
+        evaluator: EvaluatorMode::Stub,
+        python_dir: None,
+        checkpoint_dir: None,
+        eval_device: None,
+        eval_poll_interval: None,
+        serve_socket: None,
+        serve_max_batch: 512,
+        replay_backlog: None,
+        replay_retain: None,
+    })
+    .unwrap();
+    assert_eq!(summary.episodes_appended, 6);
+
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let mut roots = std::collections::HashSet::new();
+    let mut step_sets = std::collections::HashSet::new();
+    for id in 0..6 {
+        let record = store
+            .episode(gz_replay::ReplayEpisodeId::new(id))
+            .unwrap()
+            .expect("episode exists");
+        roots.insert(record.root);
+        step_sets.insert(format!("{:?}", record.steps));
+    }
+
+    // Every episode starts from the same graph...
+    assert_eq!(roots.len(), 1, "fixed mode must share one root");
+    // ...but per-episode Gumbel noise makes trajectories diverge.
+    assert!(
+        step_sets.len() > 1,
+        "episodes from a fixed root must not be identical"
+    );
 }

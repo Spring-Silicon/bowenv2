@@ -48,6 +48,7 @@ class SelfplayConfig:
     max_steps: int = 8
     max_candidates: int = 255
     reference: str = "self-average"
+    root_mode: str = "generated"
     reference_ema_decay: float = 0.99
     max_row_backlog: int = 200_000
     replay_retain: int = 0
@@ -403,6 +404,8 @@ def bootstrap_selfplay(config: RunConfig) -> None:
         str(config.selfplay.workers_per_lane),
         "--reference",
         "root",
+        "--root-mode",
+        config.selfplay.root_mode,
         "--evaluator",
         "stub",
         "--seed",
@@ -453,6 +456,8 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             str(config.selfplay.workers_per_lane),
             "--reference",
             config.selfplay.reference,
+            "--root-mode",
+            config.selfplay.root_mode,
             "--reference-ema-decay",
             str(config.selfplay.reference_ema_decay),
             "--evaluator",

@@ -34,6 +34,7 @@ pub struct SelfplayConfig {
     pub lanes: usize,
     pub workers_per_lane: usize,
     pub reference: ReferenceMode,
+    pub root_mode: RootMode,
     pub reference_ema_decay: f32,
     pub seed: u64,
     pub max_steps: usize,
@@ -62,6 +63,7 @@ impl Default for SelfplayConfig {
             lanes: 2,
             workers_per_lane: 8,
             reference: ReferenceMode::Root,
+            root_mode: RootMode::Generated,
             reference_ema_decay: 0.99,
             seed: 0,
             max_steps: 8,
@@ -189,6 +191,24 @@ impl SelfplayConfig {
                 }
                 args
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootMode {
+    Generated,
+    Fixed,
+}
+
+impl FromStr for RootMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "generated" => Ok(Self::Generated),
+            "fixed" => Ok(Self::Fixed),
+            _ => Err(format!("unknown root mode: {value}")),
         }
     }
 }
@@ -322,7 +342,7 @@ fn run_random(
     store: std::sync::Arc<ReplayStore>,
     engines: Vec<WhittleEngine>,
     search: GumbelMcts,
-    roots: Vec<GeneratedRoots>,
+    roots: Vec<CliRoots>,
     providers: Vec<CliReferenceProvider>,
 ) -> Result<SelfplaySummary, String> {
     let evaluator = RandomValueEvaluator::new(RandomValueEvaluatorConfig {
@@ -360,7 +380,7 @@ fn run_stub(
     store: std::sync::Arc<ReplayStore>,
     engines: Vec<WhittleEngine>,
     search: GumbelMcts,
-    roots: Vec<GeneratedRoots>,
+    roots: Vec<CliRoots>,
     providers: Vec<CliReferenceProvider>,
 ) -> Result<SelfplaySummary, String> {
     let extractors = engines
@@ -397,7 +417,7 @@ fn run_process(
     store: std::sync::Arc<ReplayStore>,
     engines: Vec<WhittleEngine>,
     search: GumbelMcts,
-    roots: Vec<GeneratedRoots>,
+    roots: Vec<CliRoots>,
     providers: Vec<CliReferenceProvider>,
 ) -> Result<SelfplaySummary, String> {
     let extractors = engines
@@ -609,19 +629,30 @@ fn provider(
     Ok(provider)
 }
 
-fn root_sources(config: &SelfplayConfig) -> Vec<GeneratedRoots> {
+fn root_sources(config: &SelfplayConfig) -> Vec<CliRoots> {
     let base = config.episodes / config.lanes as u64;
     let extra = config.episodes % config.lanes as u64;
 
     (0..config.lanes)
         .map(|lane| {
             let count = base + u64::from((lane as u64) < extra);
-            GeneratedRoots {
-                remaining: (config.episodes != 0).then_some(count),
-                generator: WhittleGraphGenerator::from_seed(
-                    whittle_generator_config(),
-                    config.seed ^ ((lane as u64 + 1).wrapping_mul(0xd1b5_4a32_d192_ed03)),
-                ),
+            let remaining = (config.episodes != 0).then_some(count);
+            match config.root_mode {
+                RootMode::Generated => CliRoots::Generated(GeneratedRoots {
+                    remaining,
+                    generator: WhittleGraphGenerator::from_seed(
+                        whittle_generator_config(),
+                        config.seed ^ ((lane as u64 + 1).wrapping_mul(0xd1b5_4a32_d192_ed03)),
+                    ),
+                }),
+                RootMode::Fixed => CliRoots::Fixed {
+                    remaining,
+                    generator: WhittleGraphGenerator::from_seed(
+                        whittle_generator_config(),
+                        config.seed,
+                    ),
+                    root: None,
+                },
             }
         })
         .collect()
@@ -679,17 +710,46 @@ struct GeneratedRoots {
     generator: WhittleGraphGenerator,
 }
 
-impl RootSource<WhittleEngine> for GeneratedRoots {
+enum CliRoots {
+    /// A fresh generated root per episode (the default).
+    Generated(GeneratedRoots),
+    /// One graph, sampled lazily on the first episode and shared by every
+    /// episode after it. Lanes seed the generator identically, so all
+    /// lanes optimize the same graph -- the single-graph compiler regime.
+    /// Episode diversity comes from per-episode Gumbel noise seeds.
+    Fixed {
+        remaining: Option<u64>,
+        generator: WhittleGraphGenerator,
+        root: Option<WhittleGraphId>,
+    },
+}
+
+impl RootSource<WhittleEngine> for CliRoots {
     fn next_root(&mut self, engine: &mut WhittleEngine) -> EngineResult<Option<WhittleGraphId>> {
-        match self.remaining.as_mut() {
+        let remaining = match self {
+            Self::Generated(source) => &mut source.remaining,
+            Self::Fixed { remaining, .. } => remaining,
+        };
+        match remaining.as_mut() {
             Some(0) => return Ok(None),
             Some(remaining) => *remaining -= 1,
             None => {}
         }
 
-        self.generator
-            .sample_into(engine)
-            .map(|generated| Some(generated.graph))
+        match self {
+            Self::Generated(source) => source
+                .generator
+                .sample_into(engine)
+                .map(|generated| Some(generated.graph)),
+            Self::Fixed {
+                generator, root, ..
+            } => {
+                if root.is_none() {
+                    *root = Some(generator.sample_into(engine)?.graph);
+                }
+                Ok(*root)
+            }
+        }
     }
 }
 

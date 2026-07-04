@@ -216,6 +216,10 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub struct GumbelEpisodeContext {
     pub opponent: Option<GumbelOpponentContext>,
+    /// Mixed into the root Gumbel RNG so episodes sharing a root explore
+    /// differently. Zero (the default) preserves the historical seeding;
+    /// drivers derive it from the episode id.
+    pub noise_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -225,6 +229,7 @@ pub struct GumbelSearchContext {
     pub budget_step: f32,
     pub selection_temperature: f32,
     pub opponent: Option<GumbelOpponentContext>,
+    pub noise_seed: u64,
 }
 
 impl Default for GumbelSearchContext {
@@ -235,6 +240,7 @@ impl Default for GumbelSearchContext {
             budget_step: 0.0,
             selection_temperature: 0.0,
             opponent: None,
+            noise_seed: 0,
         }
     }
 }
@@ -526,6 +532,7 @@ where
                 } else {
                     0.0
                 },
+                noise_seed: self.context.noise_seed,
                 opponent: self.context.opponent,
             },
         )
@@ -1209,7 +1216,10 @@ where
     fn start_run_state(&self) -> RunState<G, C> {
         let root_index = 0;
         let action_count = self.tree.nodes[root_index].action_count();
-        let mut rng = GumbelRng::new(root_seed(self.config.seed, self.context.root_step));
+        let mut rng = GumbelRng::new(root_seed(
+            self.config.seed ^ self.context.noise_seed,
+            self.context.root_step,
+        ));
         let root_gumbels = sample_root_gumbels(action_count, self.config.gumbel_scale, &mut rng);
         let mut base_scores = Vec::with_capacity(action_count);
 

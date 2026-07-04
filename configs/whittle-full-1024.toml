@@ -1,4 +1,5 @@
-# Actual full-scale Whittle run: 1023 engine candidates + STOP = a clean
+# Actual full-scale Whittle run on ONE fixed graph (the compiler regime
+# rehearsal): 1023 engine candidates + STOP = a clean
 # 1024-wide static action mask, 128-move limit, model-selected STOP.
 #
 # Selfplay throughput at this action width is CPU-bound (feature
@@ -40,6 +41,7 @@ gumbel_scale = 1.0
 max_steps = 128
 max_candidates = 1023
 reference = "self-average"
+root_mode = "fixed"
 reference_ema_decay = 0.99
 max_row_backlog = 1000000
 replay_retain = 600000
