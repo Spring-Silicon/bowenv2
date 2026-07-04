@@ -28,6 +28,22 @@ class EmaWeights:
     def state_dict(self) -> dict[str, object]:
         return {name: tensor.detach().clone() for name, tensor in self.shadow.items()}
 
+    def norms(self, previous: dict[str, object] | None) -> tuple[float, float]:
+        """(L2 norm of the EMA weights, L2 norm of the delta vs `previous`).
+        The update norm is 0.0 when there is no previous snapshot."""
+        import torch
+
+        with torch.no_grad():
+            param_sq = 0.0
+            delta_sq = 0.0
+            for name, tensor in self.shadow.items():
+                if not tensor.is_floating_point():
+                    continue
+                param_sq += float(tensor.float().pow(2).sum())
+                if previous is not None:
+                    delta_sq += float((tensor.float() - previous[name].float()).pow(2).sum())
+            return param_sq**0.5, delta_sq**0.5
+
 
 @dataclass(frozen=True, slots=True)
 class PublishTags:

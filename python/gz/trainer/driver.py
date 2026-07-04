@@ -115,7 +115,17 @@ def run(config_path: str | Path) -> None:
             training_step=0,
             run_id=config.paths.run_dir.name,
         )
-        metrics.write({"event": "publish", "training_step": 0, "model_version": first.model_version.hex()})
+        param_norm, _ = ema.norms(None)
+        published_snapshot = ema.state_dict()
+        metrics.write(
+            {
+                "event": "publish",
+                "training_step": 0,
+                "model_version": first.model_version.hex(),
+                "param_norm": param_norm,
+                "update_norm": 0.0,
+            }
+        )
     finally:
         stop_child(serve)
 
@@ -175,6 +185,9 @@ def run(config_path: str | Path) -> None:
                     "produced_rows": produced,
                     "samples_per_row": ((step + 1) * config.trainer.batch / produced) if produced else 0.0,
                     "stop_rate": stop_rate,
+                    "episode_cost_ema": ack.episode_cost_ema,
+                    "episode_len_ema": ack.episode_len_ema,
+                    "stop_rate_ema": ack.stop_rate_ema,
                 }
                 record.update(window.drain(produced))
                 metrics.write(record)
@@ -188,11 +201,15 @@ def run(config_path: str | Path) -> None:
                     training_step=step + 1,
                     run_id=config.paths.run_dir.name,
                 )
+                param_norm, update_norm = ema.norms(published_snapshot)
+                published_snapshot = ema.state_dict()
                 metrics.write(
                     {
                         "event": "publish",
                         "training_step": step + 1,
                         "model_version": manifest.model_version.hex(),
+                        "param_norm": param_norm,
+                        "update_norm": update_norm,
                     }
                 )
             if config.trainer.step_sleep:
@@ -207,11 +224,14 @@ def run(config_path: str | Path) -> None:
                 training_step=config.trainer.total_steps,
                 run_id=config.paths.run_dir.name,
             )
+            param_norm, update_norm = ema.norms(published_snapshot)
             metrics.write(
                 {
                     "event": "publish",
                     "training_step": config.trainer.total_steps,
                     "model_version": final.model_version.hex(),
+                    "param_norm": param_norm,
+                    "update_norm": update_norm,
                 }
             )
     except BaseException:
@@ -288,6 +308,9 @@ WANDB_KEYS = {
     "terminal_cost_mean": "selfplay/terminal_cost_mean",
     "terminal_cost_best": "selfplay/terminal_cost_best",
     "stop_rate": "selfplay/stop_rate",
+    "episode_cost_ema": "selfplay/episode_cost_ema",
+    "episode_len_ema": "selfplay/episode_len_ema",
+    "stop_rate_ema": "selfplay/stop_rate_ema",
     "steps_per_s": "perf/steps_per_s",
     "rows_per_s": "perf/rows_per_s",
     "sample_ms": "perf/sample_ms",
@@ -335,10 +358,14 @@ class WandbRun:
             self.run.log(payload, step=record["step"])
         elif record.get("event") == "publish":
             self.publishes += 1
-            self.run.log(
-                {"publish/count": self.publishes, "publish/training_step": record["training_step"]},
-                step=record["training_step"],
-            )
+            payload = {
+                "publish/count": self.publishes,
+                "publish/training_step": record["training_step"],
+            }
+            for key in ("param_norm", "update_norm"):
+                if key in record:
+                    payload[f"publish/{key}"] = record[key]
+            self.run.log(payload, step=record["training_step"])
 
     def finish(self) -> None:
         self.run.finish()

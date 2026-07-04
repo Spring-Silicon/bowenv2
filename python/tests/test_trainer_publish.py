@@ -58,3 +58,25 @@ def test_publish_ema_roundtrips_and_version_changes(tmp_path: Path) -> None:
 
     assert DirectorySource(tmp_path).resolve_latest().manifest == second
     assert first.model_version != second.model_version
+
+
+def test_ema_norms_report_param_and_update_magnitudes() -> None:
+    torch = pytest.importorskip("torch")
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    ema = EmaWeights(model, 0.5)
+
+    param_norm, update_norm = ema.norms(None)
+    assert abs(param_norm - 2.0) < 1e-6  # sqrt(4 ones)
+    assert update_norm == 0.0
+
+    snapshot = ema.state_dict()
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    ema.update(model)  # shadow -> 0.5*1 + 0.5*3 = 2.0 each
+
+    param_norm, update_norm = ema.norms(snapshot)
+    assert abs(param_norm - 4.0) < 1e-6  # sqrt(4 * 4)
+    assert abs(update_norm - 2.0) < 1e-6  # delta 1.0 each -> sqrt(4)

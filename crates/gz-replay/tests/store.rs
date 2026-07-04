@@ -370,3 +370,28 @@ fn retention_deletes_old_episodes_and_clamps_sampling() {
         .unwrap();
     assert_eq!(sampled.len(), 8);
 }
+
+#[test]
+fn outcome_emas_track_recent_episodes() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store
+        .ensure_feature_schema(&feature_schema_config())
+        .unwrap();
+    assert!(store.outcome_emas().is_none());
+
+    let (record, rows) = episode_with_feature_rows(2);
+    store.append_episode(&record, &rows).unwrap();
+
+    let (cost, len, stop) = store.outcome_emas().unwrap();
+    assert!((cost - f64::from(-record.outcome.learner_reward)).abs() < 1e-9);
+    assert!((len - 2.0).abs() < 1e-9);
+    assert!((stop - f64::from(u8::from(record.outcome.stopped))).abs() < 1e-9);
+
+    store.append_episode(&record, &rows).unwrap();
+    let (cost2, _, _) = store.outcome_emas().unwrap();
+    assert!(
+        (cost2 - cost).abs() < 1e-9,
+        "same outcome keeps the EMA fixed"
+    );
+}

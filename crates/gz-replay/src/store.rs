@@ -27,7 +27,14 @@ pub struct ReplayStore {
     /// Rows below this sequence may be gone; sampling clamps to it.
     retained_floor: AtomicU64,
     retain_rows: Option<u64>,
+    /// Episode-weighted EMAs over recent appends (decay 0.99), stored as
+    /// f64 bits; zero bits = unseeded. Telemetry only: not persisted.
+    cost_ema_bits: AtomicU64,
+    len_ema_bits: AtomicU64,
+    stop_ema_bits: AtomicU64,
 }
+
+const OUTCOME_EMA_DECAY: f64 = 0.99;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplayCounters {
@@ -64,6 +71,9 @@ impl ReplayStore {
             consumed_rows: AtomicU64::new(consumed_rows),
             retained_floor: AtomicU64::new(retained_floor),
             retain_rows,
+            cost_ema_bits: AtomicU64::new(0),
+            len_ema_bits: AtomicU64::new(0),
+            stop_ema_bits: AtomicU64::new(0),
         })
     }
 
@@ -125,6 +135,11 @@ impl ReplayStore {
             .store(next_episode_seq, Ordering::Release);
         self.produced_rows.store(produced_rows, Ordering::Release);
         self.enforce_retention(produced_rows)?;
+        self.update_outcome_emas(
+            f64::from(-record.outcome.learner_reward),
+            rows.len() as f64,
+            f64::from(u8::from(record.outcome.stopped)),
+        );
 
         Ok(id)
     }
@@ -284,6 +299,37 @@ impl ReplayStore {
         write_meta_u64(&self.db, META_CONSUMED_ROWS, consumed_rows)?;
 
         Ok(out)
+    }
+
+    fn update_outcome_emas(&self, cost: f64, len: f64, stopped: f64) {
+        for (bits, value) in [
+            (&self.cost_ema_bits, cost),
+            (&self.len_ema_bits, len),
+            (&self.stop_ema_bits, stopped),
+        ] {
+            let previous = bits.load(Ordering::Acquire);
+            let next = if previous == 0 {
+                value
+            } else {
+                OUTCOME_EMA_DECAY * f64::from_bits(previous) + (1.0 - OUTCOME_EMA_DECAY) * value
+            };
+            bits.store(next.to_bits(), Ordering::Release);
+        }
+    }
+
+    /// Episode-weighted EMAs over recent appends:
+    /// (terminal cost, episode length, stop rate). None until seeded.
+    #[must_use]
+    pub fn outcome_emas(&self) -> Option<(f64, f64, f64)> {
+        let cost = self.cost_ema_bits.load(Ordering::Acquire);
+        if cost == 0 {
+            return None;
+        }
+        Some((
+            f64::from_bits(cost),
+            f64::from_bits(self.len_ema_bits.load(Ordering::Acquire)),
+            f64::from_bits(self.stop_ema_bits.load(Ordering::Acquire)),
+        ))
     }
 
     /// (episodes appended, episodes that ended by selecting STOP).

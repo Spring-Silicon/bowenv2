@@ -9,7 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const SAMPLE_PROTOCOL_VERSION: u32 = 2;
+pub const SAMPLE_PROTOCOL_VERSION: u32 = 3;
 
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const FRAME_HELLO: u8 = 1;
@@ -211,13 +211,18 @@ impl ReplaySampleServer {
         encode_feature_schema_config(self.collator.schema().config(), &mut schema_config)
             .map_err(|_| (ERROR_ENCODING, "failed to encode schema config"))?;
         let (episodes, episodes_stopped) = self.store.episode_counters();
-        let mut payload = Vec::with_capacity(64 + schema_config.len());
+        // Unseeded EMAs surface as zeros; consumers gate on the episode count.
+        let (cost_ema, len_ema, stop_ema) = self.store.outcome_emas().unwrap_or((0.0, 0.0, 0.0));
+        let mut payload = Vec::with_capacity(76 + schema_config.len());
         payload.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
         payload.extend_from_slice(self.collator.schema().hash().as_bytes());
         payload.extend_from_slice(&(self.max_batch.get() as u32).to_le_bytes());
         payload.extend_from_slice(&self.store.counters().produced_rows.to_le_bytes());
         payload.extend_from_slice(&episodes.to_le_bytes());
         payload.extend_from_slice(&episodes_stopped.to_le_bytes());
+        payload.extend_from_slice(&(cost_ema as f32).to_le_bytes());
+        payload.extend_from_slice(&(len_ema as f32).to_le_bytes());
+        payload.extend_from_slice(&(stop_ema as f32).to_le_bytes());
         payload.extend_from_slice(&schema_config);
         write_frame(stream, write_buf, FRAME_HELLO_ACK, &[&payload])
             .map_err(|_| (ERROR_PROTOCOL, "failed to write HELLO_ACK"))

@@ -17,7 +17,7 @@ from gz.proto import (
     write_frame,
 )
 
-SAMPLE_PROTOCOL_VERSION = 2
+SAMPLE_PROTOCOL_VERSION = 3
 
 FRAME_HELLO = 1
 FRAME_HELLO_ACK = 2
@@ -44,6 +44,9 @@ class SampleAck:
     produced_rows: int
     episodes: int
     episodes_stopped: int
+    episode_cost_ema: float
+    episode_len_ema: float
+    stop_rate_ema: float
     feature_schema: FeatureSchemaConfig
 
 
@@ -185,7 +188,7 @@ class SampleClient:
 
 
 def decode_ack(payload: memoryview) -> SampleAck:
-    if len(payload) < 64:
+    if len(payload) < 76:
         raise SampleError("sample HELLO_ACK truncated")
     protocol_version = struct.unpack_from("<I", payload, 0)[0]
     if protocol_version != SAMPLE_PROTOCOL_VERSION:
@@ -194,13 +197,17 @@ def decode_ack(payload: memoryview) -> SampleAck:
     produced_rows = struct.unpack_from("<Q", payload, 40)[0]
     episodes = struct.unpack_from("<Q", payload, 48)[0]
     episodes_stopped = struct.unpack_from("<Q", payload, 56)[0]
+    cost_ema, len_ema, stop_ema = struct.unpack_from("<fff", payload, 64)
     return SampleAck(
         feature_schema_hash=FeatureSchemaHash.from_bytes(payload[4:36]),
         max_batch=max_batch,
         produced_rows=produced_rows,
         episodes=episodes,
         episodes_stopped=episodes_stopped,
-        feature_schema=FeatureSchemaConfig.decode(payload[64:]),
+        episode_cost_ema=cost_ema,
+        episode_len_ema=len_ema,
+        stop_rate_ema=stop_ema,
+        feature_schema=FeatureSchemaConfig.decode(payload[76:]),
     )
 
 

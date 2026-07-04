@@ -22,6 +22,7 @@ TORCH_ALLOWED = {
     PACKAGE_ROOT / "trainer" / "data.py",
     PACKAGE_ROOT / "trainer" / "driver.py",
     PACKAGE_ROOT / "trainer" / "loop.py",
+    PACKAGE_ROOT / "trainer" / "publish.py",
 }
 
 
