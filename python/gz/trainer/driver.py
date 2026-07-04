@@ -189,7 +189,7 @@ def run(config_path: str | Path) -> None:
                     "episode_len_ema": ack.episode_len_ema,
                     "stop_rate_ema": ack.stop_rate_ema,
                 }
-                record.update(window.drain(produced))
+                record.update(window.drain(produced, ack.episodes))
                 metrics.write(record)
             if (step + 1) % config.trainer.publish_interval == 0:
                 manifest = publish_ema(
@@ -267,6 +267,7 @@ class PerfWindow:
     def __init__(self) -> None:
         self.window_started = time.perf_counter()
         self.last_produced = 0
+        self.last_episodes = 0
         self.steps = 0
         self.sample_seconds = 0.0
         self.train_seconds = 0.0
@@ -276,18 +277,20 @@ class PerfWindow:
         self.sample_seconds += train_started - sample_started
         self.train_seconds += finished - train_started
 
-    def drain(self, produced: int) -> dict[str, float]:
+    def drain(self, produced: int, episodes: int) -> dict[str, float]:
         now = time.perf_counter()
         elapsed = max(now - self.window_started, 1e-9)
         steps = max(self.steps, 1)
         perf = {
             "steps_per_s": self.steps / elapsed,
             "rows_per_s": max(produced - self.last_produced, 0) / elapsed if self.last_produced else 0.0,
+            "episodes_per_s": max(episodes - self.last_episodes, 0) / elapsed if self.last_episodes else 0.0,
             "sample_ms": 1000.0 * self.sample_seconds / steps,
             "train_ms": 1000.0 * self.train_seconds / steps,
         }
         self.window_started = now
         self.last_produced = produced
+        self.last_episodes = episodes
         self.steps = 0
         self.sample_seconds = 0.0
         self.train_seconds = 0.0
@@ -313,6 +316,7 @@ WANDB_KEYS = {
     "stop_rate_ema": "selfplay/stop_rate_ema",
     "steps_per_s": "perf/steps_per_s",
     "rows_per_s": "perf/rows_per_s",
+    "episodes_per_s": "perf/episodes_per_s",
     "sample_ms": "perf/sample_ms",
     "train_ms": "perf/train_ms",
     "produced_rows": "perf/produced_rows",
