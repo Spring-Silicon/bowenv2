@@ -158,6 +158,8 @@ orchestration.
 
 Severity: Medium
 
+Status: Fixed in `8dfa9f1`.
+
 File:
 
 - `crates/gz-orchestrator/src/lanes.rs`
@@ -238,6 +240,8 @@ Do this after the release leaks are fixed, because it is lower-risk cleanup.
 ## 6. Replay Errors Are Erased At The Orchestrator Seam
 
 Severity: Low
+
+Status: Fixed in `8dfa9f1`.
 
 File:
 
