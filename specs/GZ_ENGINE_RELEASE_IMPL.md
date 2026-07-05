@@ -242,6 +242,25 @@ episode (~6 KB); sources own roots by contract and nothing releases
 them. Acceptable rate; noted for the source-release follow-up.
 Contract footnote for future engines: a rejected apply's `after` must
 still be an owned reference (the search task releases it).
+Second amendment (2026-07-05, found in production): candidates() used
+to enumerate EVERY candidate (one owned reference each) and then
+truncate to options.max_candidates -- the cut tail's references were
+stranded. Any graph with more candidates than the mask leaked its
+tail slots on every cache-miss expand (~14% of inserts at the 1023
+mask, ~355K slots per episode, 206 GB RSS in 20 minutes at production
+rate). Every acceptance probe had run gumbel_scale 0, where identical
+episodes re-expand identical graphs and content dedup turns the
+stranded tail into refcount bumps on existing slots -- structurally
+invisible. Fix: the limit moves into enumeration, so tail candidates
+never enter the arena, and truncated cache entries are marked so a
+larger request re-enumerates (tests/release.rs pins both). Probe
+discipline going forward: leak probes run with noise on (scale > 0)
+so episodes explore unique subtrees.
+Measured non-leak, for the record: peak candidate-arena occupancy is
+one episode's full creation history (~3M slots at sims 48 /
+max_steps 128) per concurrent episode, released only at episode end;
+at 32x8 that is a large but bounded working set. Mid-episode release
+of non-carried subtrees is the follow-up lever if it needs shrinking.
 
 ## Out Of Scope
 

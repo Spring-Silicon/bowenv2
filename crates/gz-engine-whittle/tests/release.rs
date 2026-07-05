@@ -32,6 +32,109 @@ fn and_engine() -> WhittleEngine {
     .unwrap()
 }
 
+fn and_chain_engine() -> WhittleEngine {
+    WhittleEngine::new(WhittleEngineConfig {
+        root: WhittleRoot::Artifact(wav1(
+            1,
+            16,
+            3,
+            &[(0, 0, NO_NODE), (2, 0, 0), (2, 1, 1), (5, 2, NO_NODE)],
+        )),
+        ..WhittleEngineConfig::default()
+    })
+    .unwrap()
+}
+
+fn limited(limit: usize) -> CandidateOptions {
+    CandidateOptions {
+        max_candidates: Some(limit),
+        ..CandidateOptions::default()
+    }
+}
+
+#[test]
+fn candidate_limit_never_strands_slots() {
+    let mut engine = and_chain_engine();
+    let root = engine.root();
+    let mut all = Vec::new();
+    engine
+        .candidates(root, CandidateOptions::default(), &mut all)
+        .unwrap();
+    let full_count = all.len();
+    assert!(
+        full_count >= 2,
+        "fixture must enumerate at least two candidates"
+    );
+    engine.release(&[], &all).unwrap();
+
+    let limit = full_count - 1;
+    for _ in 0..8 {
+        let mut cut = Vec::new();
+        engine.candidates(root, limited(limit), &mut cut).unwrap();
+        assert_eq!(cut.len(), limit);
+        engine.release(&[], &cut).unwrap();
+    }
+
+    // Slots recycle across limited rounds: had the cut tail entered the
+    // arena each round, the arena would have grown past the full count
+    // and this enumeration would hand out fresh, higher slot indices.
+    let mut fresh = Vec::new();
+    engine
+        .candidates(root, CandidateOptions::default(), &mut fresh)
+        .unwrap();
+    assert_eq!(fresh.len(), full_count);
+    assert!(
+        fresh
+            .iter()
+            .all(|candidate| (candidate.raw() as usize) < full_count)
+    );
+    engine.release(&[], &fresh).unwrap();
+}
+
+#[test]
+fn limited_cache_entry_does_not_serve_larger_requests() {
+    let mut engine = and_chain_engine();
+    let root = engine.root();
+    let mut all = Vec::new();
+    engine
+        .candidates(root, CandidateOptions::default(), &mut all)
+        .unwrap();
+    let full_count = all.len();
+    let full_hashes = all
+        .iter()
+        .map(|candidate| {
+            engine
+                .candidate_info(root, *candidate)
+                .unwrap()
+                .candidate_hash
+        })
+        .collect::<Vec<_>>();
+    engine.release(&[], &all).unwrap();
+
+    let limit = full_count - 1;
+    let mut cut = Vec::new();
+    engine.candidates(root, limited(limit), &mut cut).unwrap();
+    let cut_hashes = cut
+        .iter()
+        .map(|candidate| {
+            engine
+                .candidate_info(root, *candidate)
+                .unwrap()
+                .candidate_hash
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cut_hashes, full_hashes[..limit]);
+
+    // The truncated cache entry must not satisfy a larger request.
+    let mut refetched = Vec::new();
+    engine
+        .candidates(root, CandidateOptions::default(), &mut refetched)
+        .unwrap();
+    assert_eq!(refetched.len(), full_count);
+    engine.release(&[], &cut).unwrap();
+    engine.release(&[], &refetched).unwrap();
+}
+
 #[test]
 fn release_reuses_graph_and_candidate_slots() {
     let mut engine = and_engine();

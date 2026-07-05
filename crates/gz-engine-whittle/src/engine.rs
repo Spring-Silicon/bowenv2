@@ -221,6 +221,37 @@ pub struct WhittleEngine {
     measure_config_hash: MeasureConfigHash,
 }
 
+impl Drop for WhittleEngine {
+    fn drop(&mut self) {
+        if std::env::var_os("GZ_ARENA_STATS").is_none() {
+            return;
+        }
+        let graph_refs: u64 = self.graphs.hash_refs.values().map(|r| u64::from(*r)).sum();
+        let cand_live = self.candidates.items.len() - self.candidates.free.len();
+        let cand_refs: u64 = self
+            .candidates
+            .items
+            .iter()
+            .map(|s| u64::from(s.refs))
+            .sum();
+        let cache_cand_ids: usize = self.caches.candidates.values().map(|c| c.ids.len()).sum();
+        let cache_trans_bodies: usize = self.caches.transitions.values().map(HashMap::len).sum();
+        eprintln!(
+            "arena_stats graphs_live={} graphs_slots={} graph_refs={} cands_live={} cands_slots={} cand_refs={} cache_cand_keys={} cache_cand_ids={} cache_trans_keys={} cache_trans_bodies={}",
+            self.graphs.by_hash.len(),
+            self.graphs.items.len(),
+            graph_refs,
+            cand_live,
+            self.candidates.items.len(),
+            cand_refs,
+            self.caches.candidates.len(),
+            cache_cand_ids,
+            self.caches.transitions.len(),
+            cache_trans_bodies,
+        );
+    }
+}
+
 impl WhittleEngine {
     pub fn new(config: WhittleEngineConfig) -> EngineResult<Self> {
         let engine_id = engine_id();
@@ -279,27 +310,38 @@ impl WhittleEngine {
             })
     }
 
+    /// Every returned id carries a reference the caller must release. The
+    /// limit applies BEFORE slots are created: candidates past it never
+    /// enter the arena, so truncation cannot strand references.
     fn enumerate_candidate_ids(
         &mut self,
         graph: WhittleGraphId,
+        limit: Option<usize>,
     ) -> EngineResult<Vec<WhittleCandidateId>> {
         let graph_hash = self.hash(graph)?;
         let cache_key = (graph_hash, self.action_set_hash);
 
         if self.config.cache_candidates
             && let Some(cached) = self.caches.candidates.get(&cache_key)
+            && !(cached.truncated && limit.is_none_or(|limit| limit > cached.ids.len()))
         {
-            for candidate in cached {
+            let take = limit.map_or(cached.ids.len(), |limit| limit.min(cached.ids.len()));
+            let ids = cached.ids[..take].to_vec();
+            for candidate in &ids {
                 self.candidates.retain(*candidate)?;
             }
-            return Ok(cached.clone());
+            return Ok(ids);
         }
 
-        let raw = {
+        let mut raw = {
             let graph_body = self.graph(graph)?.body();
             enumerate_graph(&graph_body, self.config.include_reverse_constant_folding)
                 .map_err(internal_rule)?
         };
+        let truncated = limit.is_some_and(|limit| raw.len() > limit);
+        if let Some(limit) = limit {
+            raw.truncate(limit);
+        }
         let ids = raw
             .into_iter()
             .map(|raw| {
@@ -309,7 +351,13 @@ impl WhittleEngine {
             .collect::<Vec<_>>();
 
         if self.config.cache_candidates {
-            self.caches.candidates.insert(cache_key, ids.clone());
+            self.caches.candidates.insert(
+                cache_key,
+                CachedCandidateIds {
+                    ids: ids.clone(),
+                    truncated,
+                },
+            );
         }
 
         Ok(ids)
@@ -353,12 +401,7 @@ impl GraphEngine for WhittleEngine {
         out: &mut Vec<Self::Candidate>,
     ) -> EngineResult<()> {
         out.clear();
-        out.extend(self.enumerate_candidate_ids(graph)?);
-
-        if let Some(max_candidates) = options.max_candidates {
-            out.truncate(max_candidates);
-        }
-
+        out.extend(self.enumerate_candidate_ids(graph, options.max_candidates)?);
         Ok(())
     }
 
@@ -813,9 +856,16 @@ impl CandidateSlot {
     fn bump_generation(&mut self) {}
 }
 
+struct CachedCandidateIds {
+    ids: Vec<WhittleCandidateId>,
+    /// The enumeration was cut at a caller limit; a later call with a
+    /// larger (or absent) limit must re-enumerate instead of hitting.
+    truncated: bool,
+}
+
 #[derive(Default)]
 struct WhittleCaches {
-    candidates: HashMap<(GraphHash, ActionSetHash), Vec<WhittleCandidateId>>,
+    candidates: HashMap<(GraphHash, ActionSetHash), CachedCandidateIds>,
     transitions: HashMap<GraphHash, HashMap<CandidateHash, GraphBody>>,
 }
 
