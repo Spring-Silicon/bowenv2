@@ -111,6 +111,22 @@ replay insertion
 engine measurement implementation
 ```
 
+Implementation module map:
+
+```text
+gumbel/mod.rs owns the public `GumbelMcts` interface, serial service driver,
+and re-export surface.
+gumbel/types.rs owns public configs, contexts, episode/root records, and stop
+reasons.
+gumbel/task/episode.rs and gumbel/task/root.rs own the episode and root state
+machines, with gumbel/task/state.rs for private root task records and
+gumbel/task/run.rs for private run-budget construction.
+gumbel/tree.rs owns tree storage, visit accounting, backups, action refs, and
+subtree compaction.
+gumbel/schedule.rs owns sequential-halving schedules, root action filtering,
+value mixing, softmax, and Gumbel RNG helpers.
+```
+
 ## Public API Draft
 
 ```rust
