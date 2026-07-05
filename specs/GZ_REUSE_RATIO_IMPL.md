@@ -1,6 +1,6 @@
 # Sample Reuse Ratio Control Implementation Spec
 
-Status: implementation work order
+Status: implementation work order (deferred -- 8x reuse accepted for now)
 
 Purpose: cap samples-per-row by pausing the trainer when it gets ahead
 of production. Today nothing controls reuse: the trainer samples at
