@@ -29,9 +29,14 @@ crates/gz-replay/src/store.rs   produced/consumed atomics (both live)
 ## The Ratio And Its Two Actuators
 
 ```text
-r = consumed_rows / produced_rows, measured on deltas over a control
-window (cumulative ratios are dominated by history and respond too
-slowly to be a control signal).
+r = (consumed_rows - anchor_c) / (produced_rows - anchor_p), CUMULATIVE
+from a steady-state anchor (counters snapshotted when the trainer loop
+starts). This makes the gate a synchronous quota -- "k gradient steps
+per n new rows", the standard update-to-data control in practical
+AlphaZero-style loops -- with a built-in startup grace period from the
+bootstrap rows. Windowed (per-log-interval) reuse is REPORTED as a
+metric but never used as the control signal: delta control oscillates
+at these timescales.
 
 One target band with hysteresis, R_low < R_high:
   r > R_high  ->  the trainer is grinding stale data: TRAINER pauses
@@ -56,7 +61,8 @@ cap and composes (either gate may bind).
 ## Trainer Actuator (Python, driver loop)
 
 ```text
-Before each sample: if (consumed + batch) / produced > R_high, poll
+Before each sample: if (consumed_next - anchor_c) / (produced -
+anchor_p) > R_high, poll
 sampler.refresh() with a short sleep (0.2s) until the inequality
 clears. consumed = (step + 1) * batch is exact trainer-side knowledge;
 produced comes from the ack.
@@ -138,8 +144,11 @@ perf/gate_wait_ms visible; all suites green
 ## Out Of Scope
 
 ```text
-PID/derivative controllers -- watermark hysteresis is enough at these
-timescales
+PID/derivative controllers -- the cumulative quota is enough
 dynamic retargeting of R during a run
 gating the evaluator or publish cadence
+reanalyze (MuZero-style target regeneration) -- the eventual
+replacement for the R_high cap in the compiler regime, where stale
+rows should be re-searched with the current net instead of rationed;
+a separate future work order
 ```
