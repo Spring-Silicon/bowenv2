@@ -43,6 +43,8 @@ Findings triaged into three work orders; two items adjusted on review:
 
 Severity: High
 
+Status: Fixed in `8c9612f`.
+
 Files:
 
 - `crates/gz-search/src/greedy.rs`
@@ -88,6 +90,8 @@ arena counters return to the expected retained root/source state.
 ## 2. `WhittleMeasureEvaluator` Leaks Temporary Apply Results
 
 Severity: High
+
+Status: Fixed in `8c9612f`.
 
 File:
 
