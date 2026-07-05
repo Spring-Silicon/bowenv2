@@ -261,6 +261,16 @@ one episode's full creation history (~3M slots at sims 48 /
 max_steps 128) per concurrent episode, released only at episode end;
 at 32x8 that is a large but bounded working set. Mid-episode release
 of non-carried subtrees is the follow-up lever if it needs shrinking.
+Third amendment (2026-07-05, same production run): the "plateau-shaped
+residual from store caches" recorded above was neither plateau-shaped
+nor store caches. Replay lanes retain every completed episode for the
+run summary after clear()ing its trace Vecs -- and Vec::clear keeps
+capacity. created_candidates alone reaches millions of ids per
+episode, so every completed episode stranded ~20 MB of empty backing
+buffer (29 MB/s at production rate, unbounded). The clear now drops
+the buffers (fresh Vec::new); post-fix RSS is flat at the working-set
+plateau. Residual husk retention is ~1 KB/episode; aggregating summary
+counts instead of retaining episode husks is noted as cleanup.
 
 ## Out Of Scope
 

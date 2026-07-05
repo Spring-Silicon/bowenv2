@@ -1020,10 +1020,14 @@ where
 }
 
 fn clear_replayed_episode_trace<G, C>(episode: &mut GumbelEpisode<G, C>) {
-    episode.steps.clear();
-    episode.root_stats.clear();
-    episode.created_graphs.clear();
-    episode.created_candidates.clear();
+    // Drop the backing buffers, not just the elements: clear() keeps
+    // capacity, and created_candidates alone reaches millions of ids per
+    // episode (~20 MB). Completed episodes are retained for the run
+    // summary, so kept capacity is a per-episode leak on unbounded runs.
+    episode.steps = Vec::new();
+    episode.root_stats = Vec::new();
+    episode.created_graphs = Vec::new();
+    episode.created_candidates = Vec::new();
 }
 
 fn append_replay_job(
