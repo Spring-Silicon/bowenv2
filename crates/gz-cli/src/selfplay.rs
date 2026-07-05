@@ -490,17 +490,17 @@ fn run_process(
 
 fn summarize(
     store: &ReplayStore,
-    run: gz_orchestrator::ThreadedReplayRun<WhittleGraphId, gz_engine_whittle::WhittleCandidateId>,
+    run: gz_orchestrator::ThreadedReplayRun,
     evaluator: EvaluatorMode,
     model_version: Option<ModelVersion>,
 ) -> Result<SelfplaySummary, String> {
     let counters = store.counters();
     let (wins, losses, ties) = label_counts(store, run.episodes_appended)?;
-    let evals = run.run.batch_sizes.iter().sum::<usize>();
-    let mean_eval_batch_size = if run.run.batch_sizes.is_empty() {
+    let evals = run.batch_sizes.iter().sum::<usize>();
+    let mean_eval_batch_size = if run.batch_sizes.is_empty() {
         0.0
     } else {
-        evals as f64 / run.run.batch_sizes.len() as f64
+        evals as f64 / run.batch_sizes.len() as f64
     };
 
     Ok(SelfplaySummary {
@@ -512,7 +512,7 @@ fn summarize(
         wins,
         losses,
         ties,
-        eval_batch_count: run.run.batch_sizes.len(),
+        eval_batch_count: run.batch_sizes.len(),
         mean_eval_batch_size,
         counters,
     })

@@ -160,6 +160,41 @@ fn featurized_replay_appends_rows() {
 }
 
 #[test]
+fn featurized_replay_schema_error_includes_replay_detail() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let search = search(&engines[0]);
+    let extractors = extractors(&engines);
+    let mut stored_config = extractors[0].schema().config().clone();
+    stored_config.name = "stored-mismatch".to_owned();
+    store.ensure_feature_schema(&stored_config).unwrap();
+    let providers = engines
+        .iter()
+        .map(|engine| RootBaselineProvider::new(engine.measure_options()))
+        .collect::<Vec<_>>();
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+
+    let error = orchestrator
+        .run_featurized_with_replay(
+            vec![roots(1)],
+            GumbelEpisodeContext::default(),
+            FeaturizedRuntime {
+                extractors,
+                backend: StubBackend,
+            },
+            ReplayRuntime {
+                store: &store,
+                providers,
+                backpressure: None,
+            },
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("invalid replay record"));
+}
+
+#[test]
 fn featurized_rejects_lane_and_schema_mismatches() {
     let engine_set = engines(2);
     let gumbel = search(&engine_set[0]);

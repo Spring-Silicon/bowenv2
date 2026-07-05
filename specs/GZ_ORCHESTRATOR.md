@@ -437,6 +437,20 @@ episode admission is gated by the ratio controller at episode start, not
 inside the hot loop
 ```
 
+Threaded lane lifecycle:
+
+```text
+complete -> intercept rollout -> extract features -> project -> append (ack)
+-> release -> observe -> trace-drop
+```
+
+Batch-path `ThreadedRun` keeps completed episodes for equality and inspection
+oracles, but any engine-local graph/candidate handles inside those episodes
+have already been released by the lane. Treat them as opaque ids only; using
+them against an engine is a contract violation and debug engines may panic.
+Replay-path runs keep only per-lane counts and aggregate append/drop totals so
+completed episode husks do not grow with episode count.
+
 ## Eval Routing
 
 Serial v1 routes immediately:

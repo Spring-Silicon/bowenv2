@@ -123,16 +123,27 @@ fn root_baseline_replay_appends_every_eligible_episode() {
         )
         .unwrap();
     let total = run
-        .run
         .lanes
         .iter()
-        .map(|lane| lane.episodes.len())
-        .sum::<usize>() as u64;
+        .map(|lane| lane.episodes_completed)
+        .sum::<u64>();
     let row_count = replay_records(&store, run.episodes_appended)
         .iter()
         .map(|record| record.row_count as u64)
         .sum::<u64>();
 
+    assert_eq!(
+        run.lanes
+            .iter()
+            .map(|lane| lane.episodes_completed)
+            .collect::<Vec<_>>(),
+        vec![3, 2]
+    );
+    assert!(
+        run.lanes
+            .iter()
+            .all(|lane| lane.episodes_appended == lane.episodes_completed)
+    );
     assert_eq!(run.episodes_appended + run.episodes_dropped, total);
     assert_eq!(run.episodes_dropped, 0);
     assert_eq!(store.counters().produced_rows, row_count);

@@ -5,7 +5,7 @@ use crate::reference::{Reference, ReferenceProvider, RolloutOutcome};
 use crate::root::RootSource;
 use crate::serial::OrchestratedEpisode;
 use crate::service::internal;
-use gz_engine::{EngineResult, GraphEngine, ModelVersion};
+use gz_engine::{EngineError, EngineResult, ErrorCode, ErrorMessage, GraphEngine, ModelVersion};
 use gz_eval::{EvalOutput, EvalRequest, Evaluator, eval_error_to_engine_error, validate_outputs};
 use gz_eval_service::{BackendOutputs, FeatureEvalBackend};
 use gz_features::{
@@ -37,11 +37,15 @@ pub struct ThreadedGumbelOrchestrator<E, V> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaneEpisodes<G, C> {
     pub lane: usize,
+    /// Completed batch-path episodes. Engine handles inside each episode are
+    /// opaque identifiers only; the lane has already released them.
     pub episodes: Vec<OrchestratedEpisode<G, C>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThreadedRun<G, C> {
+    /// Batch-path episode equality surface. Engine handles inside returned
+    /// episodes have already been released and must not be dereferenced.
     pub lanes: Vec<LaneEpisodes<G, C>>,
     pub batch_sizes: Vec<usize>,
 }
@@ -64,8 +68,17 @@ pub struct ReplayBackpressure {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ThreadedReplayRun<G, C> {
-    pub run: ThreadedRun<G, C>,
+pub struct ReplayLaneSummary {
+    pub lane: usize,
+    pub episodes_completed: u64,
+    pub episodes_appended: u64,
+    pub episodes_dropped: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThreadedReplayRun {
+    pub lanes: Vec<ReplayLaneSummary>,
+    pub batch_sizes: Vec<usize>,
     pub episodes_appended: u64,
     pub episodes_dropped: u64,
 }
@@ -167,7 +180,7 @@ where
             {
                 let intake_tx = intake_tx.clone();
                 lane_handles.push(scope.spawn(move || {
-                    run_lane(
+                    run_lane_pipeline(
                         engine,
                         roots,
                         LaneRuntime {
@@ -178,6 +191,7 @@ where
                             intake_tx,
                             reply_rx,
                         },
+                        CollectMode::new(),
                     )
                 }));
             }
@@ -214,7 +228,7 @@ where
         root_sources: Vec<R>,
         context: GumbelEpisodeContext,
         replay: ReplayRuntime<'_, P>,
-    ) -> EngineResult<ThreadedReplayRun<E::Graph, E::Candidate>>
+    ) -> EngineResult<ThreadedReplayRun>
     where
         R: RootSource<E> + Send,
         P: ReferenceProvider<E> + Send,
@@ -262,21 +276,18 @@ where
                 let intake_tx = intake_tx.clone();
                 let replay_tx = replay_tx.clone();
                 lane_handles.push(scope.spawn(move || {
-                    run_lane_with_replay(
+                    run_lane_pipeline(
                         engine,
                         roots,
-                        provider,
-                        ReplayLaneRuntime {
+                        LaneRuntime {
                             lane,
                             search,
                             workers_per_lane: config.workers_per_lane,
                             context,
                             intake_tx,
                             reply_rx,
-                            replay_tx,
-                            store,
-                            backpressure,
                         },
+                        ReplayMode::new(provider, replay_tx, store, backpressure),
                     )
                 }));
             }
@@ -310,11 +321,12 @@ where
         for result in lane_results {
             let result = result?;
             episodes_dropped += result.episodes_dropped;
-            lanes.push(result.lane);
+            lanes.push(result);
         }
 
         Ok(ThreadedReplayRun {
-            run: ThreadedRun { lanes, batch_sizes },
+            lanes,
+            batch_sizes,
             episodes_appended,
             episodes_dropped,
         })
@@ -375,11 +387,10 @@ where
             {
                 let intake_tx = intake_tx.clone();
                 lane_handles.push(scope.spawn(move || {
-                    run_featurized_lane(
+                    run_lane_pipeline(
                         engine,
                         roots,
-                        extractor,
-                        FeaturizedLaneRuntime {
+                        LaneRuntime {
                             lane,
                             search,
                             workers_per_lane: config.workers_per_lane,
@@ -387,6 +398,7 @@ where
                             intake_tx,
                             reply_rx,
                         },
+                        FeaturizedCollectMode::new(extractor),
                     )
                 }));
             }
@@ -424,7 +436,7 @@ where
         context: GumbelEpisodeContext,
         featurized: FeaturizedRuntime<X, B>,
         replay: ReplayRuntime<'_, P>,
-    ) -> EngineResult<ThreadedReplayRun<E::Graph, E::Candidate>>
+    ) -> EngineResult<ThreadedReplayRun>
     where
         R: RootSource<E> + Send,
         X: FeatureExtractor<E> + Send,
@@ -488,22 +500,24 @@ where
                 let intake_tx = intake_tx.clone();
                 let replay_tx = replay_tx.clone();
                 lane_handles.push(scope.spawn(move || {
-                    run_featurized_lane_with_replay(
+                    run_lane_pipeline(
                         engine,
                         roots,
-                        extractor,
-                        provider,
-                        FeaturizedReplayLaneRuntime {
+                        LaneRuntime {
                             lane,
                             search,
                             workers_per_lane: config.workers_per_lane,
                             context,
                             intake_tx,
                             reply_rx,
+                        },
+                        FeaturizedReplayMode::new(
+                            extractor,
+                            provider,
                             replay_tx,
                             store,
                             backpressure,
-                        },
+                        ),
                     )
                 }));
             }
@@ -537,62 +551,25 @@ where
         for result in lane_results {
             let result = result?;
             episodes_dropped += result.episodes_dropped;
-            lanes.push(result.lane);
+            lanes.push(result);
         }
 
         Ok(ThreadedReplayRun {
-            run: ThreadedRun { lanes, batch_sizes },
+            lanes,
+            batch_sizes,
             episodes_appended,
             episodes_dropped,
         })
     }
 }
 
-struct LaneRuntime<'a> {
+struct LaneRuntime<'a, J> {
     lane: usize,
     search: &'a GumbelMcts,
     workers_per_lane: NonZeroUsize,
     context: GumbelEpisodeContext,
-    intake_tx: SyncSender<EvalJob>,
+    intake_tx: SyncSender<J>,
     reply_rx: Receiver<EvalReply>,
-}
-
-struct ReplayLaneRuntime<'a> {
-    lane: usize,
-    search: &'a GumbelMcts,
-    workers_per_lane: NonZeroUsize,
-    context: GumbelEpisodeContext,
-    intake_tx: SyncSender<EvalJob>,
-    reply_rx: Receiver<EvalReply>,
-    replay_tx: SyncSender<ReplayJob>,
-    store: &'a ReplayStore,
-    backpressure: Option<ReplayBackpressure>,
-}
-
-struct FeaturizedLaneRuntime<'a> {
-    lane: usize,
-    search: &'a GumbelMcts,
-    workers_per_lane: NonZeroUsize,
-    context: GumbelEpisodeContext,
-    intake_tx: SyncSender<FeaturizedEvalJob>,
-    reply_rx: Receiver<EvalReply>,
-}
-
-struct FeaturizedReplayLaneRuntime<'a> {
-    lane: usize,
-    search: &'a GumbelMcts,
-    workers_per_lane: NonZeroUsize,
-    context: GumbelEpisodeContext,
-    intake_tx: SyncSender<FeaturizedEvalJob>,
-    reply_rx: Receiver<EvalReply>,
-    replay_tx: SyncSender<ReplayJob>,
-    store: &'a ReplayStore,
-    backpressure: Option<ReplayBackpressure>,
-}
-
-struct ReplayLaneResult<G, C> {
-    lane: LaneEpisodes<G, C>,
-    episodes_dropped: u64,
 }
 
 struct EpisodeFeatureRows<C> {
@@ -600,108 +577,102 @@ struct EpisodeFeatureRows<C> {
     candidates: Vec<C>,
 }
 
-fn run_lane<E, R>(
-    mut engine: E,
-    mut roots: R,
-    runtime: LaneRuntime<'_>,
-) -> EngineResult<LaneEpisodes<E::Graph, E::Candidate>>
+trait LaneMode<E>
 where
     E: GraphEngine,
-    R: RootSource<E>,
 {
-    let identity = EngineIdentity::from_engine(&engine);
-    let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
-    let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
-    let mut episodes = Vec::new();
-    let mut roots_exhausted = false;
-    let mut next_episode_id = (runtime.lane as u64) << 32;
+    type Job;
+    type Output;
 
-    loop {
-        if !roots_exhausted {
-            let mut admission = Admission {
-                search: runtime.search,
-                identity,
-                context: runtime.context,
-                next_episode_id: &mut next_episode_id,
-            };
-            roots_exhausted = pool.admit(&mut engine, &mut roots, &mut admission)?.1;
-        }
-
-        for completed in pool.drive(&mut engine, "worker blocked", None)? {
-            release_episode_handles(&mut engine, &completed.episode, &[])?;
-            episodes.push(completed);
-        }
-
-        for parked in pool.take_unsent_parked() {
-            runtime
-                .intake_tx
-                .send(EvalJob {
-                    lane: runtime.lane,
-                    slot: parked.slot,
-                    token: parked.token,
-                    request: parked.request,
-                })
-                .map_err(|_| internal("eval backend unavailable"))?;
-        }
-
-        if roots_exhausted && !pool.active() {
-            return Ok(LaneEpisodes {
-                lane: runtime.lane,
-                episodes,
-            });
-        }
-
-        if pool.has_parked() {
-            let reply = runtime
-                .reply_rx
-                .recv()
-                .map_err(|_| internal("eval backend unavailable"))?;
-            pool.resume(reply.slot, reply.token, reply.output)?;
-
-            loop {
-                match runtime.reply_rx.try_recv() {
-                    Ok(reply) => pool.resume(reply.slot, reply.token, reply.output)?,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        return Err(internal("eval backend unavailable"));
-                    }
-                }
-            }
-        }
+    fn begin(
+        &mut self,
+        search: &GumbelMcts,
+        identity: EngineIdentity,
+        context: GumbelEpisodeContext,
+    ) {
+        let _ = (search, identity, context);
     }
+
+    fn before_root_admission<R>(
+        &mut self,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        engine: &mut E,
+        roots: &mut R,
+        next_episode_id: &mut u64,
+    ) -> EngineResult<()>
+    where
+        R: RootSource<E>,
+    {
+        let _ = (pool, engine, roots, next_episode_id);
+        Ok(())
+    }
+
+    fn gate_open(&self) -> bool {
+        true
+    }
+
+    fn gate_poll(&self) -> Option<Duration> {
+        None
+    }
+
+    fn on_admitted(
+        &mut self,
+        engine: &mut E,
+        admitted: Vec<(EpisodeId, E::Graph)>,
+    ) -> EngineResult<()> {
+        let _ = (engine, admitted);
+        Ok(())
+    }
+
+    fn drive(
+        &mut self,
+        engine: &mut E,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>>;
+
+    fn send_parked(
+        &mut self,
+        lane: usize,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        intake_tx: &SyncSender<Self::Job>,
+    ) -> EngineResult<()>;
+
+    fn observe_version(&mut self, version: ModelVersion) {
+        let _ = version;
+    }
+
+    fn complete(
+        &mut self,
+        engine: &mut E,
+        search: &GumbelMcts,
+        completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+    ) -> EngineResult<()>;
+
+    fn finish(self, lane: usize) -> Self::Output;
 }
 
-fn run_lane_with_replay<E, R, P>(
+fn run_lane_pipeline<E, R, M>(
     mut engine: E,
     mut roots: R,
-    mut provider: P,
-    runtime: ReplayLaneRuntime<'_>,
-) -> EngineResult<ReplayLaneResult<E::Graph, E::Candidate>>
+    runtime: LaneRuntime<'_, M::Job>,
+    mut mode: M,
+) -> EngineResult<M::Output>
 where
     E: GraphEngine,
     R: RootSource<E>,
-    P: ReferenceProvider<E>,
+    M: LaneMode<E>,
 {
     let identity = EngineIdentity::from_engine(&engine);
     let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
     let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
-    let mut episodes = Vec::new();
-    let mut references = HashMap::<EpisodeId, Option<Reference>>::new();
     let mut roots_exhausted = false;
     let mut next_episode_id = (runtime.lane as u64) << 32;
-    let mut episodes_dropped = 0;
-    let mut rollout = OpponentRollout::new(runtime.search, identity, runtime.context);
+    mode.begin(runtime.search, identity, runtime.context);
 
     loop {
         if !roots_exhausted {
-            rollout.try_admit(
-                &mut pool,
-                &mut engine,
-                &mut roots,
-                &mut provider,
-                &mut next_episode_id,
-            )?;
-            if replay_gate_open(runtime.store, runtime.backpressure) {
+            mode.before_root_admission(&mut pool, &mut engine, &mut roots, &mut next_episode_id)?;
+            if mode.gate_open() {
                 let mut admission = Admission {
                     search: runtime.search,
                     identity,
@@ -710,243 +681,445 @@ where
                 };
                 let (admitted, exhausted) = pool.admit(&mut engine, &mut roots, &mut admission)?;
                 roots_exhausted = exhausted;
-
-                for (episode_id, root) in admitted {
-                    references.insert(episode_id, provider.reference(&mut engine, root)?);
-                }
+                mode.on_admitted(&mut engine, admitted)?;
             } else if !pool.active()
-                && let Some(backpressure) = runtime.backpressure
+                && let Some(gate_poll) = mode.gate_poll()
             {
                 // The gate limits admission only. In-flight episodes always
                 // finish, so backlog can overshoot by at most total workers
                 // times rows per episode. This sleep is the throttled-idle
                 // path that prevents a fully gated lane from busy-spinning.
-                std::thread::sleep(backpressure.gate_poll);
+                std::thread::sleep(gate_poll);
             }
         }
 
-        for mut completed in pool.drive(&mut engine, "worker blocked", None)? {
-            if rollout.intercept(&mut engine, &mut provider, &completed)? {
-                continue;
-            }
-            let reference = references
-                .remove(&completed.episode_id)
-                .ok_or_else(|| internal("missing replay reference"))?;
-
-            if let Some((record, rows)) =
-                project_episode(&completed.episode, reference.as_ref(), None)
-            {
-                let reward = record.outcome.learner_reward;
-                let append = append_replay_job(&runtime.replay_tx, record, rows);
-                release_episode_handles(&mut engine, &completed.episode, &[])?;
-                append?;
-                provider.observe(reward);
-            } else {
-                episodes_dropped += 1;
-                release_episode_handles(&mut engine, &completed.episode, &[])?;
-            }
-
-            clear_replayed_episode_trace(&mut completed.episode);
-            episodes.push(completed);
+        for completed in mode.drive(&mut engine, &mut pool)? {
+            mode.complete(&mut engine, runtime.search, completed)?;
         }
 
-        for parked in pool.take_unsent_parked() {
-            runtime
-                .intake_tx
-                .send(EvalJob {
-                    lane: runtime.lane,
-                    slot: parked.slot,
-                    token: parked.token,
-                    request: parked.request,
-                })
-                .map_err(|_| internal("eval backend unavailable"))?;
-        }
+        mode.send_parked(runtime.lane, &mut pool, &runtime.intake_tx)?;
 
         if roots_exhausted && !pool.active() {
-            return Ok(ReplayLaneResult {
-                lane: LaneEpisodes {
-                    lane: runtime.lane,
-                    episodes,
-                },
-                episodes_dropped,
-            });
-        }
-
-        if pool.has_parked() {
-            let reply = runtime
-                .reply_rx
-                .recv()
-                .map_err(|_| internal("eval backend unavailable"))?;
-            rollout.observe_version(reply.output.model_version);
-            pool.resume(reply.slot, reply.token, reply.output)?;
-
-            loop {
-                match runtime.reply_rx.try_recv() {
-                    Ok(reply) => {
-                        rollout.observe_version(reply.output.model_version);
-                        pool.resume(reply.slot, reply.token, reply.output)?;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        return Err(internal("eval backend unavailable"));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn run_featurized_lane<E, R, X>(
-    mut engine: E,
-    mut roots: R,
-    mut extractor: X,
-    runtime: FeaturizedLaneRuntime<'_>,
-) -> EngineResult<LaneEpisodes<E::Graph, E::Candidate>>
-where
-    E: GraphEngine,
-    R: RootSource<E>,
-    X: FeatureExtractor<E>,
-{
-    let identity = EngineIdentity::from_engine(&engine);
-    let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
-    let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
-    let mut episodes = Vec::new();
-    let mut roots_exhausted = false;
-    let mut next_episode_id = (runtime.lane as u64) << 32;
-
-    loop {
-        if !roots_exhausted {
-            let mut admission = Admission {
-                search: runtime.search,
-                identity,
-                context: runtime.context,
-                next_episode_id: &mut next_episode_id,
-            };
-            roots_exhausted = pool.admit(&mut engine, &mut roots, &mut admission)?.1;
-        }
-
-        for completed in pool.drive(&mut engine, "worker blocked", Some(&mut extractor))? {
-            release_episode_handles(&mut engine, &completed.episode, &[])?;
-            episodes.push(completed);
-        }
-        send_featurized_parked(runtime.lane, &mut pool, &runtime.intake_tx)?;
-
-        if roots_exhausted && !pool.active() {
-            return Ok(LaneEpisodes {
-                lane: runtime.lane,
-                episodes,
-            });
-        }
-
-        if pool.has_parked() {
-            receive_replies(&mut pool, &runtime.reply_rx)?;
-        }
-    }
-}
-
-fn run_featurized_lane_with_replay<E, R, X, P>(
-    mut engine: E,
-    mut roots: R,
-    mut extractor: X,
-    mut provider: P,
-    runtime: FeaturizedReplayLaneRuntime<'_>,
-) -> EngineResult<ReplayLaneResult<E::Graph, E::Candidate>>
-where
-    E: GraphEngine,
-    R: RootSource<E>,
-    X: FeatureExtractor<E>,
-    P: ReferenceProvider<E>,
-{
-    let identity = EngineIdentity::from_engine(&engine);
-    let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
-    let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
-    let mut episodes = Vec::new();
-    let mut references = HashMap::<EpisodeId, Option<Reference>>::new();
-    let mut roots_exhausted = false;
-    let mut next_episode_id = (runtime.lane as u64) << 32;
-    let mut episodes_dropped = 0;
-    let mut rollout = OpponentRollout::new(runtime.search, identity, runtime.context);
-
-    loop {
-        if !roots_exhausted {
-            rollout.try_admit(
-                &mut pool,
-                &mut engine,
-                &mut roots,
-                &mut provider,
-                &mut next_episode_id,
-            )?;
-            if replay_gate_open(runtime.store, runtime.backpressure) {
-                let mut admission = Admission {
-                    search: runtime.search,
-                    identity,
-                    context: runtime.context,
-                    next_episode_id: &mut next_episode_id,
-                };
-                let (admitted, exhausted) = pool.admit(&mut engine, &mut roots, &mut admission)?;
-                roots_exhausted = exhausted;
-
-                for (episode_id, root) in admitted {
-                    references.insert(episode_id, provider.reference(&mut engine, root)?);
-                }
-            } else if !pool.active()
-                && let Some(backpressure) = runtime.backpressure
-            {
-                std::thread::sleep(backpressure.gate_poll);
-            }
-        }
-
-        for mut completed in pool.drive(&mut engine, "worker blocked", Some(&mut extractor))? {
-            if rollout.intercept(&mut engine, &mut provider, &completed)? {
-                continue;
-            }
-            let reference = references
-                .remove(&completed.episode_id)
-                .ok_or_else(|| internal("missing replay reference"))?;
-
-            let feature_rows = feature_rows_for_episode(
-                &mut engine,
-                &mut extractor,
-                runtime.search,
-                &completed.episode,
-            )?;
-
-            if let Some((record, rows)) = project_episode(
-                &completed.episode,
-                reference.as_ref(),
-                Some(&feature_rows.rows),
-            ) {
-                let reward = record.outcome.learner_reward;
-                let append = append_replay_job(&runtime.replay_tx, record, rows);
-                release_episode_handles(&mut engine, &completed.episode, &feature_rows.candidates)?;
-                append?;
-                provider.observe(reward);
-            } else {
-                episodes_dropped += 1;
-                release_episode_handles(&mut engine, &completed.episode, &feature_rows.candidates)?;
-            }
-
-            clear_replayed_episode_trace(&mut completed.episode);
-            episodes.push(completed);
-        }
-
-        send_featurized_parked(runtime.lane, &mut pool, &runtime.intake_tx)?;
-
-        if roots_exhausted && !pool.active() {
-            return Ok(ReplayLaneResult {
-                lane: LaneEpisodes {
-                    lane: runtime.lane,
-                    episodes,
-                },
-                episodes_dropped,
-            });
+            return Ok(mode.finish(runtime.lane));
         }
 
         if pool.has_parked()
             && let Some(version) = receive_replies(&mut pool, &runtime.reply_rx)?
         {
+            mode.observe_version(version);
+        }
+    }
+}
+
+struct CollectMode<G, C> {
+    episodes: Vec<OrchestratedEpisode<G, C>>,
+}
+
+impl<G, C> CollectMode<G, C> {
+    fn new() -> Self {
+        Self {
+            episodes: Vec::new(),
+        }
+    }
+}
+
+impl<E> LaneMode<E> for CollectMode<E::Graph, E::Candidate>
+where
+    E: GraphEngine,
+{
+    type Job = EvalJob;
+    type Output = LaneEpisodes<E::Graph, E::Candidate>;
+
+    fn drive(
+        &mut self,
+        engine: &mut E,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+        pool.drive(engine, "worker blocked", None)
+    }
+
+    fn send_parked(
+        &mut self,
+        lane: usize,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        intake_tx: &SyncSender<Self::Job>,
+    ) -> EngineResult<()> {
+        send_plain_parked(lane, pool, intake_tx)
+    }
+
+    fn complete(
+        &mut self,
+        engine: &mut E,
+        _search: &GumbelMcts,
+        completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+    ) -> EngineResult<()> {
+        release_episode_handles(engine, &completed.episode, &[])?;
+        self.episodes.push(completed);
+        Ok(())
+    }
+
+    fn finish(self, lane: usize) -> Self::Output {
+        LaneEpisodes {
+            lane,
+            episodes: self.episodes,
+        }
+    }
+}
+
+struct FeaturizedCollectMode<X, G, C> {
+    extractor: X,
+    episodes: Vec<OrchestratedEpisode<G, C>>,
+}
+
+impl<X, G, C> FeaturizedCollectMode<X, G, C> {
+    fn new(extractor: X) -> Self {
+        Self {
+            extractor,
+            episodes: Vec::new(),
+        }
+    }
+}
+
+impl<E, X> LaneMode<E> for FeaturizedCollectMode<X, E::Graph, E::Candidate>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    type Job = FeaturizedEvalJob;
+    type Output = LaneEpisodes<E::Graph, E::Candidate>;
+
+    fn drive(
+        &mut self,
+        engine: &mut E,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+        pool.drive(engine, "worker blocked", Some(&mut self.extractor))
+    }
+
+    fn send_parked(
+        &mut self,
+        lane: usize,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        intake_tx: &SyncSender<Self::Job>,
+    ) -> EngineResult<()> {
+        send_featurized_parked(lane, pool, intake_tx)
+    }
+
+    fn complete(
+        &mut self,
+        engine: &mut E,
+        _search: &GumbelMcts,
+        completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+    ) -> EngineResult<()> {
+        release_episode_handles(engine, &completed.episode, &[])?;
+        self.episodes.push(completed);
+        Ok(())
+    }
+
+    fn finish(self, lane: usize) -> Self::Output {
+        LaneEpisodes {
+            lane,
+            episodes: self.episodes,
+        }
+    }
+}
+
+struct ReplayMode<'a, P> {
+    provider: P,
+    replay_tx: SyncSender<ReplayJob>,
+    store: &'a ReplayStore,
+    backpressure: Option<ReplayBackpressure>,
+    references: HashMap<EpisodeId, Option<Reference>>,
+    summary: ReplayLaneSummary,
+    rollout: Option<OpponentRollout>,
+}
+
+impl<'a, P> ReplayMode<'a, P> {
+    fn new(
+        provider: P,
+        replay_tx: SyncSender<ReplayJob>,
+        store: &'a ReplayStore,
+        backpressure: Option<ReplayBackpressure>,
+    ) -> Self {
+        Self {
+            provider,
+            replay_tx,
+            store,
+            backpressure,
+            references: HashMap::new(),
+            summary: ReplayLaneSummary {
+                lane: 0,
+                episodes_completed: 0,
+                episodes_appended: 0,
+                episodes_dropped: 0,
+            },
+            rollout: None,
+        }
+    }
+}
+
+impl<E, P> LaneMode<E> for ReplayMode<'_, P>
+where
+    E: GraphEngine,
+    P: ReferenceProvider<E>,
+{
+    type Job = EvalJob;
+    type Output = ReplayLaneSummary;
+
+    fn begin(
+        &mut self,
+        search: &GumbelMcts,
+        identity: EngineIdentity,
+        context: GumbelEpisodeContext,
+    ) {
+        self.rollout = Some(OpponentRollout::new(search, identity, context));
+    }
+
+    fn before_root_admission<R>(
+        &mut self,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        engine: &mut E,
+        roots: &mut R,
+        next_episode_id: &mut u64,
+    ) -> EngineResult<()>
+    where
+        R: RootSource<E>,
+    {
+        let mut rollout = self
+            .rollout
+            .take()
+            .ok_or_else(|| internal("missing opponent rollout"))?;
+        let result = rollout.try_admit(pool, engine, roots, &mut self.provider, next_episode_id);
+        self.rollout = Some(rollout);
+        result
+    }
+
+    fn gate_open(&self) -> bool {
+        replay_gate_open(self.store, self.backpressure)
+    }
+
+    fn gate_poll(&self) -> Option<Duration> {
+        self.backpressure.map(|backpressure| backpressure.gate_poll)
+    }
+
+    fn on_admitted(
+        &mut self,
+        engine: &mut E,
+        admitted: Vec<(EpisodeId, E::Graph)>,
+    ) -> EngineResult<()> {
+        for (episode_id, root) in admitted {
+            self.references
+                .insert(episode_id, self.provider.reference(engine, root)?);
+        }
+        Ok(())
+    }
+
+    fn drive(
+        &mut self,
+        engine: &mut E,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+        pool.drive(engine, "worker blocked", None)
+    }
+
+    fn send_parked(
+        &mut self,
+        lane: usize,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        intake_tx: &SyncSender<Self::Job>,
+    ) -> EngineResult<()> {
+        send_plain_parked(lane, pool, intake_tx)
+    }
+
+    fn observe_version(&mut self, version: ModelVersion) {
+        if let Some(rollout) = &mut self.rollout {
             rollout.observe_version(version);
         }
+    }
+
+    fn complete(
+        &mut self,
+        engine: &mut E,
+        _search: &GumbelMcts,
+        mut completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+    ) -> EngineResult<()> {
+        let mut rollout = self
+            .rollout
+            .take()
+            .ok_or_else(|| internal("missing opponent rollout"))?;
+        if rollout.intercept(engine, &mut self.provider, &completed)? {
+            self.rollout = Some(rollout);
+            return Ok(());
+        }
+        self.rollout = Some(rollout);
+
+        let reference = self
+            .references
+            .remove(&completed.episode_id)
+            .ok_or_else(|| internal("missing replay reference"))?;
+        self.summary.episodes_completed += 1;
+
+        if let Some((record, rows)) = project_episode(&completed.episode, reference.as_ref(), None)
+        {
+            let reward = record.outcome.learner_reward;
+            let append = append_replay_job(&self.replay_tx, record, rows);
+            release_episode_handles(engine, &completed.episode, &[])?;
+            append?;
+            self.provider.observe(reward);
+            self.summary.episodes_appended += 1;
+        } else {
+            release_episode_handles(engine, &completed.episode, &[])?;
+            self.summary.episodes_dropped += 1;
+        }
+
+        clear_replayed_episode_trace(&mut completed.episode);
+        Ok(())
+    }
+
+    fn finish(mut self, lane: usize) -> Self::Output {
+        self.summary.lane = lane;
+        self.summary
+    }
+}
+
+struct FeaturizedReplayMode<'a, X, P> {
+    extractor: X,
+    replay: ReplayMode<'a, P>,
+}
+
+impl<'a, X, P> FeaturizedReplayMode<'a, X, P> {
+    fn new(
+        extractor: X,
+        provider: P,
+        replay_tx: SyncSender<ReplayJob>,
+        store: &'a ReplayStore,
+        backpressure: Option<ReplayBackpressure>,
+    ) -> Self {
+        Self {
+            extractor,
+            replay: ReplayMode::new(provider, replay_tx, store, backpressure),
+        }
+    }
+}
+
+impl<E, X, P> LaneMode<E> for FeaturizedReplayMode<'_, X, P>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+    P: ReferenceProvider<E>,
+{
+    type Job = FeaturizedEvalJob;
+    type Output = ReplayLaneSummary;
+
+    fn begin(
+        &mut self,
+        search: &GumbelMcts,
+        identity: EngineIdentity,
+        context: GumbelEpisodeContext,
+    ) {
+        self.replay.begin(search, identity, context);
+    }
+
+    fn before_root_admission<R>(
+        &mut self,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        engine: &mut E,
+        roots: &mut R,
+        next_episode_id: &mut u64,
+    ) -> EngineResult<()>
+    where
+        R: RootSource<E>,
+    {
+        self.replay
+            .before_root_admission(pool, engine, roots, next_episode_id)
+    }
+
+    fn gate_open(&self) -> bool {
+        self.replay.gate_open()
+    }
+
+    fn gate_poll(&self) -> Option<Duration> {
+        self.replay.gate_poll()
+    }
+
+    fn on_admitted(
+        &mut self,
+        engine: &mut E,
+        admitted: Vec<(EpisodeId, E::Graph)>,
+    ) -> EngineResult<()> {
+        self.replay.on_admitted(engine, admitted)
+    }
+
+    fn drive(
+        &mut self,
+        engine: &mut E,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+        pool.drive(engine, "worker blocked", Some(&mut self.extractor))
+    }
+
+    fn send_parked(
+        &mut self,
+        lane: usize,
+        pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        intake_tx: &SyncSender<Self::Job>,
+    ) -> EngineResult<()> {
+        send_featurized_parked(lane, pool, intake_tx)
+    }
+
+    fn observe_version(&mut self, version: ModelVersion) {
+        self.replay.observe_version(version);
+    }
+
+    fn complete(
+        &mut self,
+        engine: &mut E,
+        search: &GumbelMcts,
+        mut completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+    ) -> EngineResult<()> {
+        let mut rollout = self
+            .replay
+            .rollout
+            .take()
+            .ok_or_else(|| internal("missing opponent rollout"))?;
+        if rollout.intercept(engine, &mut self.replay.provider, &completed)? {
+            self.replay.rollout = Some(rollout);
+            return Ok(());
+        }
+        self.replay.rollout = Some(rollout);
+
+        let reference = self
+            .replay
+            .references
+            .remove(&completed.episode_id)
+            .ok_or_else(|| internal("missing replay reference"))?;
+        let feature_rows =
+            feature_rows_for_episode(engine, &mut self.extractor, search, &completed.episode)?;
+        self.replay.summary.episodes_completed += 1;
+
+        if let Some((record, rows)) = project_episode(
+            &completed.episode,
+            reference.as_ref(),
+            Some(&feature_rows.rows),
+        ) {
+            let reward = record.outcome.learner_reward;
+            let append = append_replay_job(&self.replay.replay_tx, record, rows);
+            release_episode_handles(engine, &completed.episode, &feature_rows.candidates)?;
+            append?;
+            self.replay.provider.observe(reward);
+            self.replay.summary.episodes_appended += 1;
+        } else {
+            release_episode_handles(engine, &completed.episode, &feature_rows.candidates)?;
+            self.replay.summary.episodes_dropped += 1;
+        }
+
+        clear_replayed_episode_trace(&mut completed.episode);
+        Ok(())
+    }
+
+    fn finish(mut self, lane: usize) -> Self::Output {
+        self.replay.summary.lane = lane;
+        self.replay.summary
     }
 }
 
@@ -968,6 +1141,28 @@ where
                 token: parked.token,
                 row,
                 action_count: parked.action_count,
+            })
+            .map_err(|_| internal("eval backend unavailable"))?;
+    }
+    Ok(())
+}
+
+fn send_plain_parked<G, C>(
+    lane: usize,
+    pool: &mut WorkerPool<G, C>,
+    intake_tx: &SyncSender<EvalJob>,
+) -> EngineResult<()>
+where
+    G: Copy + Eq,
+    C: Copy,
+{
+    for parked in pool.take_unsent_parked() {
+        intake_tx
+            .send(EvalJob {
+                lane,
+                slot: parked.slot,
+                token: parked.token,
+                request: parked.request,
             })
             .map_err(|_| internal("eval backend unavailable"))?;
     }
@@ -1370,8 +1565,12 @@ fn run_replay_sink(store: &ReplayStore, replay_rx: Receiver<ReplayJob>) -> Engin
     Ok(episodes_appended)
 }
 
-fn map_replay_error(_error: ReplayError) -> gz_engine::EngineError {
-    internal("replay sink failed")
+fn map_replay_error(error: ReplayError) -> EngineError {
+    EngineError::Internal {
+        code: ErrorCode::new(1),
+        message: ErrorMessage::new(format!("replay sink failed: {error}"))
+            .expect("replay error message is bounded"),
+    }
 }
 
 fn validate_engine_identities<E>(engines: &[E]) -> EngineResult<()>
