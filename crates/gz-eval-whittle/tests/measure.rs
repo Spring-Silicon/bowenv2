@@ -1,7 +1,8 @@
 use gz_engine::{
-    CandidateOptions, GraphEngine, PortableCandidateRef, PortableGraphId, ReplayGraphContext,
+    CandidateHash, CandidateKindId, CandidateOptions, CandidateTags, GraphEngine,
+    PortableCandidateRef, PortableGraphId, ReplayGraphContext,
 };
-use gz_engine_whittle::{WhittleEngine, WhittleEngineConfig, WhittleRoot};
+use gz_engine_whittle::{WhittleCandidateId, WhittleEngine, WhittleEngineConfig, WhittleRoot};
 use gz_eval::{EngineEvalRequest, EngineEvaluator, EvalAction, EvalRequest};
 use gz_eval_whittle::WhittleMeasureEvaluator;
 
@@ -16,6 +17,7 @@ fn measure_evaluator_values_current_graph_and_scores_candidates_in_order() {
     engine
         .candidates(graph, CandidateOptions::default(), &mut candidates)
         .unwrap();
+    let baseline = engine.arena_occupancy();
 
     let request = eval_request(&engine, graph, &candidates);
     let mut evaluator = WhittleMeasureEvaluator::new();
@@ -32,16 +34,51 @@ fn measure_evaluator_values_current_graph_and_scores_candidates_in_order() {
         .unwrap();
 
     output.validate_for(&request).unwrap();
+    assert_eq!(engine.arena_occupancy(), baseline);
     assert_eq!(output.model_version, evaluator.model_version());
     assert_eq!(output.value, -3.0);
     assert_eq!(output.policy_logits.last(), Some(&0.5));
 
     let expected = expected_candidate_logits(&mut engine, graph, &candidates);
+    assert_eq!(engine.arena_occupancy(), baseline);
     assert_eq!(
         &output.policy_logits[..candidates.len()],
         expected.as_slice()
     );
     assert_eq!(output.policy_logits[0], 1.0);
+    engine.release(&[], &candidates).unwrap();
+}
+
+#[test]
+fn measure_evaluator_releases_temporaries_after_mid_batch_error() {
+    let mut engine = and_engine();
+    let graph = engine.root();
+    let measure_options = engine.measure_options();
+    let mut candidates = Vec::new();
+    engine
+        .candidates(graph, CandidateOptions::default(), &mut candidates)
+        .unwrap();
+    let valid = candidates[0];
+    let invalid = WhittleCandidateId::from_raw(u32::MAX);
+    let request = eval_request_with_extra_candidate(&engine, graph, valid);
+    let baseline = engine.arena_occupancy();
+    let mut evaluator = WhittleMeasureEvaluator::new();
+
+    let error = evaluator
+        .evaluate(
+            &mut engine,
+            EngineEvalRequest {
+                graph,
+                candidates: &[valid, invalid],
+                request: &request,
+                measure_options,
+            },
+        )
+        .unwrap_err();
+
+    assert!(format!("{error:?}").contains("UnknownCandidate"));
+    assert_eq!(engine.arena_occupancy(), baseline);
+    engine.release(&[], &candidates).unwrap();
 }
 
 fn expected_candidate_logits(
@@ -60,12 +97,13 @@ fn expected_candidate_logits(
         .iter()
         .copied()
         .map(|candidate| {
+            let applied = engine.apply(graph, candidate).unwrap();
             let after = engine
-                .apply(graph, candidate)
-                .and_then(|applied| engine.measure(applied.after, options))
+                .measure(applied.after, options)
                 .unwrap()
                 .scalar_reward
                 .unwrap();
+            engine.release(&[applied.after], &[]).unwrap();
 
             if after > before {
                 1.0
@@ -99,6 +137,34 @@ fn eval_request(
 
     actions.push(EvalAction::stop(context));
     EvalRequest::new(context, actions).unwrap()
+}
+
+fn eval_request_with_extra_candidate(
+    engine: &WhittleEngine,
+    graph: gz_engine_whittle::WhittleGraphId,
+    valid: WhittleCandidateId,
+) -> EvalRequest {
+    let context = graph_context(engine, graph);
+    let info = engine.candidate_info(graph, valid).unwrap();
+    EvalRequest::new(
+        context,
+        vec![
+            EvalAction::candidate(
+                PortableCandidateRef::new(context, info.candidate_hash),
+                info.kind,
+                info.tags,
+                info.static_prior,
+            ),
+            EvalAction::candidate(
+                PortableCandidateRef::new(context, CandidateHash::from_bytes([99; 32])),
+                CandidateKindId::new(99),
+                CandidateTags::EMPTY,
+                0.0,
+            ),
+            EvalAction::stop(context),
+        ],
+    )
+    .unwrap()
 }
 
 fn graph_context(

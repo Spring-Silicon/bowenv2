@@ -17,6 +17,8 @@ pub struct BeamEpisode<G, C> {
     pub final_context: ReplayGraphContext,
     pub steps: Vec<SearchStep<G, C>>,
     pub layers: Vec<BeamLayer<G>>,
+    pub created_graphs: Vec<G>,
+    pub created_candidates: Vec<C>,
     pub final_measure: MeasureResult<G>,
     pub stop_reason: BeamStopReason,
     pub search_config_hash: SearchConfigHash,
@@ -105,6 +107,8 @@ impl BeamSearch {
                 final_context: root_context,
                 steps: Vec::new(),
                 layers: Vec::new(),
+                created_graphs: Vec::new(),
+                created_candidates: Vec::new(),
                 final_measure: root_measure,
                 stop_reason: BeamStopReason::UnscoredRoot,
                 search_config_hash: self.search_config_hash,
@@ -138,6 +142,8 @@ impl BeamSearch {
         }];
         let mut active = vec![0];
         let mut scratch = BeamScratch::default();
+        let mut created_graphs = Vec::new();
+        let mut created_candidates = Vec::new();
 
         for _ in 0..self.config.max_depth {
             scratch.entries.clear();
@@ -156,7 +162,15 @@ impl BeamSearch {
                     continue;
                 }
 
-                expand_node(engine, self.config, node_id, node, &mut scratch)?;
+                expand_node(
+                    engine,
+                    self.config,
+                    node_id,
+                    node,
+                    &mut scratch,
+                    &mut created_graphs,
+                    &mut created_candidates,
+                )?;
             }
 
             scratch.best_by_graph.reserve(scratch.entries.len());
@@ -261,6 +275,8 @@ impl BeamSearch {
             final_context: selected.context,
             steps: collect_steps(&nodes, best),
             layers,
+            created_graphs,
+            created_candidates,
             final_measure: selected.measure.clone(),
             stop_reason,
             search_config_hash: self.search_config_hash,
@@ -387,12 +403,15 @@ fn expand_node<E: GraphEngine>(
     node_id: usize,
     node: &BeamNode<E::Graph, E::Candidate>,
     scratch: &mut BeamScratch<E::Graph, E::Candidate>,
+    created_graphs: &mut Vec<E::Graph>,
+    created_candidates: &mut Vec<E::Candidate>,
 ) -> EngineResult<()> {
     engine.candidates(
         node.graph,
         config.candidate_options,
         &mut scratch.candidates,
     )?;
+    created_candidates.extend(scratch.candidates.iter().copied());
 
     let engine_candidate_count = scratch.candidates.len();
     let stop_ref = PortableSearchActionRef::stop(node.context);
@@ -409,6 +428,7 @@ fn expand_node<E: GraphEngine>(
         let action_ref = PortableSearchActionRef::candidate(candidate_ref);
 
         let applied = engine.apply(node.graph, candidate)?;
+        created_graphs.push(applied.after);
         if applied.rejected.is_some() {
             continue;
         }

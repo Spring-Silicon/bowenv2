@@ -844,7 +844,7 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
         &mut self,
         engine: &mut WhittleEngine,
         root: WhittleGraphId,
-    ) -> EngineResult<Option<Reference<WhittleGraphId>>> {
+    ) -> EngineResult<Option<Reference>> {
         match self {
             Self::None => Ok(None),
             Self::Root(provider) => provider.reference(engine, root),

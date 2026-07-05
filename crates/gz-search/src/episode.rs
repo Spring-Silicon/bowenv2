@@ -23,6 +23,8 @@ pub struct SearchEpisode<G, C, S> {
     pub root_context: ReplayGraphContext,
     pub final_context: ReplayGraphContext,
     pub steps: Vec<SearchStep<G, C>>,
+    pub created_graphs: Vec<G>,
+    pub created_candidates: Vec<C>,
     pub final_measure: MeasureResult<G>,
     pub stop_reason: S,
     pub search_config_hash: SearchConfigHash,

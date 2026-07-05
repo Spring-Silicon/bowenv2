@@ -51,6 +51,20 @@ fn random(engine: &WhittleEngine) -> RandomSearch {
     })
 }
 
+fn assert_provider_releases_created_handles<P>(mut provider: P)
+where
+    P: ReferenceProvider<WhittleEngine>,
+{
+    let mut engine = whittle();
+    let root = engine.root();
+    let baseline = engine.arena_occupancy();
+
+    for _ in 0..8 {
+        assert!(provider.reference(&mut engine, root).unwrap().is_some());
+        assert_eq!(engine.arena_occupancy(), baseline);
+    }
+}
+
 #[test]
 fn root_baseline_reward_matches_engine_measure() {
     let mut engine = whittle();
@@ -66,7 +80,6 @@ fn root_baseline_reward_matches_engine_measure() {
     assert_eq!(reference.kind, gz_replay::ReplayReferenceKind::RootBaseline);
     assert_eq!(reference.final_reward, expected);
     assert_eq!(reference.steps.len(), 1);
-    assert_eq!(reference.steps[0].graph, root);
     assert_eq!(reference.final_graph, Some(reference.steps[0].context));
     assert_eq!(reference.search_config_hash, None);
 }
@@ -97,6 +110,12 @@ fn greedy_provider_matches_direct_run() {
 }
 
 #[test]
+fn greedy_provider_releases_created_handles() {
+    let engine = whittle();
+    assert_provider_releases_created_handles(GreedyReferenceProvider::new(greedy(&engine)));
+}
+
+#[test]
 fn beam_provider_matches_direct_run() {
     let mut engine = whittle();
     let root = engine.root();
@@ -122,6 +141,12 @@ fn beam_provider_matches_direct_run() {
 }
 
 #[test]
+fn beam_provider_releases_created_handles() {
+    let engine = whittle();
+    assert_provider_releases_created_handles(BeamReferenceProvider::new(beam(&engine)));
+}
+
+#[test]
 fn random_provider_matches_direct_run() {
     let mut engine = whittle();
     let root = engine.root();
@@ -144,6 +169,12 @@ fn random_provider_matches_direct_run() {
         Some(direct.search_config_hash)
     );
     assert_eq!(contexts(&reference.steps), direct_contexts(&direct.steps));
+}
+
+#[test]
+fn random_provider_releases_created_handles() {
+    let engine = whittle();
+    assert_provider_releases_created_handles(RandomReferenceProvider::new(random(&engine)));
 }
 
 #[test]
@@ -255,8 +286,8 @@ fn policy_provider_failed_rollout_keeps_reference_and_retries() {
     assert_eq!(reference.model_version, Some(v2));
 }
 
-fn contexts<G>(
-    steps: &[gz_orchestrator::reference::ReferenceStep<G>],
+fn contexts(
+    steps: &[gz_orchestrator::reference::ReferenceStep],
 ) -> Vec<gz_engine::ReplayGraphContext> {
     steps.iter().map(|step| step.context).collect()
 }

@@ -38,20 +38,36 @@ impl EngineEvaluator<WhittleEngine> for WhittleMeasureEvaluator {
 
         let before = measure_reward(engine, input.graph, input.measure_options)?;
         let mut policy_logits = Vec::with_capacity(input.request.action_count());
+        let mut created_graphs = Vec::new();
 
-        for candidate in input.candidates.iter().copied() {
-            let applied = engine.apply(input.graph, candidate)?;
-            let after = measure_reward(engine, applied.after, input.measure_options)?;
-            policy_logits.push(logit_for_delta(before, after));
+        let result = (|| {
+            for candidate in input.candidates.iter().copied() {
+                let applied = engine.apply(input.graph, candidate)?;
+                created_graphs.push(applied.after);
+                let after = measure_reward(engine, applied.after, input.measure_options)?;
+                policy_logits.push(logit_for_delta(before, after));
+            }
+
+            policy_logits.push(0.5);
+
+            Ok(EvalOutput {
+                model_version: self.model_version(),
+                policy_logits,
+                value: before,
+            })
+        })();
+
+        let release = engine.release(&created_graphs, &[]);
+        match result {
+            Ok(output) => {
+                release?;
+                Ok(output)
+            }
+            Err(error) => {
+                let _ = release;
+                Err(error)
+            }
         }
-
-        policy_logits.push(0.5);
-
-        Ok(EvalOutput {
-            model_version: self.model_version(),
-            policy_logits,
-            value: before,
-        })
     }
 }
 

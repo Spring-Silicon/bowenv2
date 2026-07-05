@@ -587,9 +587,7 @@ where
                 );
             }
             SearchWorkResult::Apply(applied) => {
-                if applied.after != self.root {
-                    self.created_graphs.push(applied.after);
-                }
+                self.created_graphs.push(applied.after);
             }
             SearchWorkResult::Measure(_) | SearchWorkResult::Eval(_) => {}
         }

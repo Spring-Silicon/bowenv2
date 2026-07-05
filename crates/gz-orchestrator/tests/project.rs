@@ -177,13 +177,12 @@ fn measure_options(engine: &WhittleEngine) -> MeasureOptions {
 fn reference(
     episode: &GumbelEpisode<WhittleGraphId, WhittleCandidateId>,
     final_reward: f32,
-) -> Reference<WhittleGraphId> {
+) -> Reference {
     Reference {
         kind: ReplayReferenceKind::RootBaseline,
         final_reward,
         final_graph: Some(episode.root_context),
         steps: vec![ReferenceStep {
-            graph: episode.root,
             context: episode.root_context,
         }],
         search_config_hash: None,

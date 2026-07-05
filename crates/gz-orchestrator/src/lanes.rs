@@ -686,7 +686,7 @@ where
     let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
     let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
     let mut episodes = Vec::new();
-    let mut references = HashMap::<EpisodeId, Option<Reference<E::Graph>>>::new();
+    let mut references = HashMap::<EpisodeId, Option<Reference>>::new();
     let mut roots_exhausted = false;
     let mut next_episode_id = (runtime.lane as u64) << 32;
     let mut episodes_dropped = 0;
@@ -861,7 +861,7 @@ where
     let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
     let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
     let mut episodes = Vec::new();
-    let mut references = HashMap::<EpisodeId, Option<Reference<E::Graph>>>::new();
+    let mut references = HashMap::<EpisodeId, Option<Reference>>::new();
     let mut roots_exhausted = false;
     let mut next_episode_id = (runtime.lane as u64) << 32;
     let mut episodes_dropped = 0;

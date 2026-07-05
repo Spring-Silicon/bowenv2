@@ -65,6 +65,8 @@ impl GreedySearch {
         let mut current_context = root_context;
         let mut current_measure = None;
         let mut steps = Vec::new();
+        let mut created_graphs = Vec::new();
+        let mut created_candidates = Vec::new();
         let mut scratch = GreedyScratch::default();
 
         for _ in 0..self.config.max_steps {
@@ -80,6 +82,8 @@ impl GreedySearch {
                     root_context,
                     final_context: current_context,
                     steps,
+                    created_graphs,
+                    created_candidates,
                     final_measure: measure,
                     stop_reason: GreedyStopReason::UnscoredCurrentGraph,
                     search_config_hash: self.search_config_hash,
@@ -91,6 +95,7 @@ impl GreedySearch {
                 self.config.candidate_options,
                 &mut scratch.candidates,
             )?;
+            created_candidates.extend(scratch.candidates.iter().copied());
 
             let mut best = None;
 
@@ -100,6 +105,7 @@ impl GreedySearch {
                 let action_ref = PortableSearchActionRef::candidate(candidate_ref);
 
                 let applied = engine.apply(current, candidate)?;
+                created_graphs.push(applied.after);
                 if applied.rejected.is_some() {
                     continue;
                 }
@@ -188,6 +194,8 @@ impl GreedySearch {
                     root_context,
                     final_context: current_context,
                     steps,
+                    created_graphs,
+                    created_candidates,
                     final_measure: measure,
                     stop_reason: GreedyStopReason::SelectedStop,
                     search_config_hash: self.search_config_hash,
@@ -206,6 +214,8 @@ impl GreedySearch {
             root_context,
             final_context: current_context,
             steps,
+            created_graphs,
+            created_candidates,
             final_measure,
             stop_reason: GreedyStopReason::MaxSteps,
             search_config_hash: self.search_config_hash,

@@ -6,11 +6,7 @@ use gz_replay::ReplayReferenceKind;
 use gz_search::{BeamSearch, GreedySearch, RandomSearch, SearchStep};
 
 pub trait ReferenceProvider<E: GraphEngine> {
-    fn reference(
-        &mut self,
-        engine: &mut E,
-        root: E::Graph,
-    ) -> EngineResult<Option<Reference<E::Graph>>>;
+    fn reference(&mut self, engine: &mut E, root: E::Graph) -> EngineResult<Option<Reference>>;
 
     /// Called by the replay drivers for every replay-eligible completed
     /// episode with the learner's final measured reward. Default: no-op.
@@ -50,18 +46,17 @@ pub struct RolloutOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Reference<G> {
+pub struct Reference {
     pub kind: ReplayReferenceKind,
     pub final_reward: f32,
     pub final_graph: Option<ReplayGraphContext>,
-    pub steps: Vec<ReferenceStep<G>>,
+    pub steps: Vec<ReferenceStep>,
     pub search_config_hash: Option<SearchConfigHash>,
     pub model_version: Option<ModelVersion>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ReferenceStep<G> {
-    pub graph: G,
+pub struct ReferenceStep {
     pub context: ReplayGraphContext,
 }
 
@@ -80,11 +75,7 @@ impl<E> ReferenceProvider<E> for RootBaselineProvider
 where
     E: GraphEngine,
 {
-    fn reference(
-        &mut self,
-        engine: &mut E,
-        root: E::Graph,
-    ) -> EngineResult<Option<Reference<E::Graph>>> {
+    fn reference(&mut self, engine: &mut E, root: E::Graph) -> EngineResult<Option<Reference>> {
         let measure = engine.measure(root, self.measure_options)?;
         let Some(final_reward) = score(measure.measured, measure.valid, measure.scalar_reward)
         else {
@@ -97,7 +88,6 @@ where
             final_reward,
             final_graph: Some(final_graph),
             steps: vec![ReferenceStep {
-                graph: root,
                 context: final_graph,
             }],
             search_config_hash: None,
@@ -121,15 +111,10 @@ impl<E> ReferenceProvider<E> for GreedyReferenceProvider
 where
     E: GraphEngine,
 {
-    fn reference(
-        &mut self,
-        engine: &mut E,
-        root: E::Graph,
-    ) -> EngineResult<Option<Reference<E::Graph>>> {
+    fn reference(&mut self, engine: &mut E, root: E::Graph) -> EngineResult<Option<Reference>> {
         let episode = self.search.run(engine, root)?;
-        Ok(project_search_episode(
+        let reference = project_search_episode(
             ReplayReferenceKind::Greedy,
-            episode.root,
             episode.final_context,
             &episode.steps,
             score(
@@ -138,7 +123,9 @@ where
                 episode.final_measure.scalar_reward,
             ),
             Some(episode.search_config_hash),
-        ))
+        );
+        engine.release(&episode.created_graphs, &episode.created_candidates)?;
+        Ok(reference)
     }
 }
 
@@ -157,15 +144,10 @@ impl<E> ReferenceProvider<E> for BeamReferenceProvider
 where
     E: GraphEngine,
 {
-    fn reference(
-        &mut self,
-        engine: &mut E,
-        root: E::Graph,
-    ) -> EngineResult<Option<Reference<E::Graph>>> {
+    fn reference(&mut self, engine: &mut E, root: E::Graph) -> EngineResult<Option<Reference>> {
         let episode = self.search.run(engine, root)?;
-        Ok(project_search_episode(
+        let reference = project_search_episode(
             ReplayReferenceKind::Beam,
-            episode.root,
             episode.final_context,
             &episode.steps,
             score(
@@ -174,7 +156,9 @@ where
                 episode.final_measure.scalar_reward,
             ),
             Some(episode.search_config_hash),
-        ))
+        );
+        engine.release(&episode.created_graphs, &episode.created_candidates)?;
+        Ok(reference)
     }
 }
 
@@ -193,15 +177,10 @@ impl<E> ReferenceProvider<E> for RandomReferenceProvider
 where
     E: GraphEngine,
 {
-    fn reference(
-        &mut self,
-        engine: &mut E,
-        root: E::Graph,
-    ) -> EngineResult<Option<Reference<E::Graph>>> {
+    fn reference(&mut self, engine: &mut E, root: E::Graph) -> EngineResult<Option<Reference>> {
         let episode = self.search.run(engine, root)?;
-        Ok(project_search_episode(
+        let reference = project_search_episode(
             ReplayReferenceKind::Random,
-            episode.root,
             episode.final_context,
             &episode.steps,
             score(
@@ -210,37 +189,32 @@ where
                 episode.final_measure.scalar_reward,
             ),
             Some(episode.search_config_hash),
-        ))
+        );
+        engine.release(&episode.created_graphs, &episode.created_candidates)?;
+        Ok(reference)
     }
 }
 
 fn project_search_episode<G, C>(
     kind: ReplayReferenceKind,
-    root: G,
     final_graph: ReplayGraphContext,
     steps: &[SearchStep<G, C>],
     final_reward: Option<f32>,
     search_config_hash: Option<SearchConfigHash>,
-) -> Option<Reference<G>>
-where
-    G: Copy,
-{
+) -> Option<Reference> {
     let final_reward = final_reward?;
     let mut reference_steps = Vec::with_capacity(steps.len() + 1);
 
     match steps.first() {
         Some(step) => reference_steps.push(ReferenceStep {
-            graph: root,
             context: step.step_ref.before,
         }),
         None => reference_steps.push(ReferenceStep {
-            graph: root,
             context: final_graph,
         }),
     }
 
     reference_steps.extend(steps.iter().map(|step| ReferenceStep {
-        graph: step.after,
         context: step.step_ref.after,
     }));
 
@@ -280,11 +254,7 @@ impl<E> ReferenceProvider<E> for SelfAverageProvider
 where
     E: GraphEngine,
 {
-    fn reference(
-        &mut self,
-        _engine: &mut E,
-        _root: E::Graph,
-    ) -> EngineResult<Option<Reference<E::Graph>>> {
+    fn reference(&mut self, _engine: &mut E, _root: E::Graph) -> EngineResult<Option<Reference>> {
         let Some(ema) = self.ema else {
             return Ok(None);
         };
@@ -346,11 +316,7 @@ impl<E> ReferenceProvider<E> for PolicyReferenceProvider
 where
     E: GraphEngine,
 {
-    fn reference(
-        &mut self,
-        _engine: &mut E,
-        _root: E::Graph,
-    ) -> EngineResult<Option<Reference<E::Graph>>> {
+    fn reference(&mut self, _engine: &mut E, _root: E::Graph) -> EngineResult<Option<Reference>> {
         let Some(current) = &self.current else {
             return Ok(None);
         };

@@ -5,7 +5,7 @@ use gz_search::{GumbelEpisode, GumbelStopReason};
 
 pub fn project_episode<G, C>(
     episode: &GumbelEpisode<G, C>,
-    reference: Option<&Reference<G>>,
+    reference: Option<&Reference>,
     feature_rows: Option<&[Vec<u8>]>,
 ) -> Option<(ReplayEpisodeRecord, Vec<ReplayRow>)> {
     let learner_reward = score(

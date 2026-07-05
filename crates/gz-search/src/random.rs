@@ -65,6 +65,8 @@ impl RandomSearch {
         let mut current_context = root_context;
         let mut current_measure = None;
         let mut steps = Vec::new();
+        let mut created_graphs = Vec::new();
+        let mut created_candidates = Vec::new();
         let mut candidates = Vec::new();
         let mut rng = RandomRng::new(self.config.seed);
 
@@ -81,6 +83,8 @@ impl RandomSearch {
                     root_context,
                     final_context: current_context,
                     steps,
+                    created_graphs,
+                    created_candidates,
                     final_measure: measure,
                     stop_reason: RandomStopReason::UnscoredCurrentGraph,
                     search_config_hash: self.search_config_hash,
@@ -88,6 +92,7 @@ impl RandomSearch {
             }
 
             engine.candidates(current, self.config.candidate_options, &mut candidates)?;
+            created_candidates.extend(candidates.iter().copied());
 
             let engine_candidate_count = candidates.len();
             let stop_ref = PortableSearchActionRef::stop(current_context);
@@ -118,6 +123,8 @@ impl RandomSearch {
                     root_context,
                     final_context: current_context,
                     steps,
+                    created_graphs,
+                    created_candidates,
                     final_measure: measure,
                     stop_reason: RandomStopReason::SelectedStop,
                     search_config_hash: self.search_config_hash,
@@ -131,6 +138,7 @@ impl RandomSearch {
                 info.candidate_hash,
             ));
             let applied = engine.apply(current, candidate)?;
+            created_graphs.push(applied.after);
 
             if applied.rejected.is_some() {
                 return Ok(SearchEpisode {
@@ -139,6 +147,8 @@ impl RandomSearch {
                     root_context,
                     final_context: current_context,
                     steps,
+                    created_graphs,
+                    created_candidates,
                     final_measure: measure,
                     stop_reason: RandomStopReason::RejectedSelectedCandidate,
                     search_config_hash: self.search_config_hash,
@@ -176,6 +186,8 @@ impl RandomSearch {
                     root_context,
                     final_context: current_context,
                     steps,
+                    created_graphs,
+                    created_candidates,
                     final_measure: selected_measure,
                     stop_reason: RandomStopReason::UnscoredSelectedGraph,
                     search_config_hash: self.search_config_hash,
@@ -196,6 +208,8 @@ impl RandomSearch {
             root_context,
             final_context: current_context,
             steps,
+            created_graphs,
+            created_candidates,
             final_measure,
             stop_reason: RandomStopReason::MaxSteps,
             search_config_hash: self.search_config_hash,

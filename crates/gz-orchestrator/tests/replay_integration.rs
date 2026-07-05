@@ -424,7 +424,7 @@ impl ReferenceProvider<WhittleEngine> for CountingSelfAverage {
         &mut self,
         engine: &mut WhittleEngine,
         root: WhittleGraphId,
-    ) -> EngineResult<Option<gz_orchestrator::reference::Reference<WhittleGraphId>>> {
+    ) -> EngineResult<Option<gz_orchestrator::reference::Reference>> {
         self.inner.reference(engine, root)
     }
 

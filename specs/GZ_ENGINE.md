@@ -170,6 +170,8 @@ apply() and candidates created by candidates(). Orchestrator lanes call
 release() after episode projection and replay append/drop handling. release()
 is a lane-thread engine call, not a SearchWork variant; episodes are complete
 before release runs.
+All search kernels and evaluators that create handles own those handles and
+must release them; Gumbel MCTS is not special.
 ```
 
 `BatchGraphEngine` defines batch semantics, not async semantics.
