@@ -485,7 +485,7 @@ def bootstrap_selfplay(config: RunConfig) -> None:
         "--max-batch",
         str(config.selfplay.max_batch),
     ]
-    subprocess.run(command, check=True, env=dict(os.environ, MALLOC_ARENA_MAX="2"))
+    subprocess.run(command, check=True)
 
 
 def spawn_replay_serve(config: RunConfig) -> subprocess.Popen[bytes]:
@@ -504,10 +504,6 @@ def spawn_replay_serve(config: RunConfig) -> subprocess.Popen[bytes]:
 
 
 def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
-    # Selfplay churns hundreds of MB/s of transient allocations across ~300
-    # threads; default glibc grows per-thread arenas without bound (~17 MB/s
-    # RSS creep measured). Two arenas plateau it at a fraction of the RSS.
-    env = dict(os.environ, MALLOC_ARENA_MAX="2")
     return subprocess.Popen(
         [
             config.paths.graphzero_bin,
@@ -568,7 +564,6 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
         # take down the whole group instead of orphaning the evaluator (and
         # its GPU memory) when selfplay is SIGKILLed.
         start_new_session=True,
-        env=env,
     )
 
 

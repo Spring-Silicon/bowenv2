@@ -1,6 +1,13 @@
 #![forbid(unsafe_code)]
 
 use gz_cli::selfplay::{SelfplayConfig, run};
+
+// glibc malloc is pathological for this binary either way: default
+// per-thread arenas retain ~17 MB/s of fragmentation across ~300 threads,
+// and capping arenas serializes allocation (4.6x wall-clock at cap 2).
+// jemalloc gives per-thread caches AND purges retained pages.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use gz_cli::serve::{ReplayServeConfig, run as run_replay_serve};
 use std::path::PathBuf;
 

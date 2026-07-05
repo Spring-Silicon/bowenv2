@@ -16,3 +16,4 @@ gz-features = { path = "../gz-features" }
 gz-orchestrator = { path = "../gz-orchestrator" }
 gz-replay = { path = "../gz-replay" }
 gz-search = { path = "../gz-search" }
+tikv-jemallocator = "0.7.0"
