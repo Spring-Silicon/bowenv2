@@ -449,7 +449,10 @@ fn open_db(path: &Path) -> ReplayResult<DB> {
     options.increase_parallelism(8);
     options.set_max_background_jobs(8);
 
-    let cache = Cache::new_lru_cache(2 * 1024 * 1024 * 1024);
+    // Sized to hold the full sample window in RAM: 50K rows at ~90 KB is
+    // ~4.5 GB, and a window that misses cache costs the trainer ~150 ms
+    // per 256-row sample under write load (the measured segment-5 stall).
+    let cache = Cache::new_lru_cache(16 * 1024 * 1024 * 1024);
     let mut block = BlockBasedOptions::default();
     block.set_block_cache(&cache);
 

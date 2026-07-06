@@ -372,7 +372,9 @@ class SamplePrefetcher:
         self._seed = seed
         self._total_steps = total_steps
         self._start_step = start_step
-        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        # Depth 2 rides out replay-store read spikes (compaction bursts)
+        # without letting sample timing drift more than two steps.
+        self._queue: queue.Queue = queue.Queue(maxsize=2)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="sample-prefetch", daemon=True)
