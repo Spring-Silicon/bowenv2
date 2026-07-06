@@ -15,7 +15,7 @@ from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash,
 from gz.evaluator import TorchBackend, serve
 from gz.model.exphormer import ArchConfig, build_model
 from gz.proto import (
-    ENCODING_VERSION,
+    BATCH_ENCODING_VERSION,
     ERROR_SCHEMA,
     FRAME_ERROR,
     FRAME_EVAL,
@@ -294,7 +294,7 @@ def start_raw_torch_client(
 def make_hello(view: BatchView, schema_hash: FeatureSchemaHash) -> Hello:
     return Hello(
         protocol_version=PROTOCOL_VERSION,
-        encoding_version=ENCODING_VERSION,
+        encoding_version=BATCH_ENCODING_VERSION,
         feature_schema_hash=schema_hash,
         batch_capacity=view.batch_capacity,
         engine_id=EngineId.from_bytes(b"e" * 16),

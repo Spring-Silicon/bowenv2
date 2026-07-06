@@ -7,7 +7,7 @@ use gz_features::{
 use std::num::NonZeroUsize;
 
 const HAND_BUILT_BATCH_FINGERPRINT: &str =
-    "4d1690bee936faf87a5d9d68ea4fff3ad9dc5a08e841acbf4ac4b2c197d6b062";
+    "1b681a6d4b043398a86044dc74e437c88b026fcd557c3bd546142c877c4bb1bc";
 
 fn schema() -> FeatureSchema {
     FeatureSchema::new(FeatureSchemaConfig {
@@ -113,7 +113,7 @@ fn collate_parse_roundtrips_sections_and_padding() {
     assert_eq!(view.action_count, vec![2, 0]);
     assert_eq!(view.action_kind[0..4], [4, 1, 0, 0]);
     assert_eq!(view.subject_count[0..4], [2, 0, 0, 0]);
-    assert_eq!(view.action_subjects[0..3], [1, 2, u32::MAX]);
+    assert_eq!(view.action_subjects[0..3], [1, 2, u32::from(u16::MAX)]);
     assert_eq!(view.position[0], [2.0, 3.0, 0.75, 0.125]);
 }
 
@@ -266,7 +266,7 @@ fn decode_outputs_truncates_policy_by_action_count() {
     let collator = FeatureCollator::new(schema, NonZeroUsize::new(2).unwrap());
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"GZFO");
-    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&gz_features::BATCH_ENCODING_VERSION.to_le_bytes());
     bytes.extend_from_slice(&2u32.to_le_bytes());
     bytes.extend_from_slice(&4u32.to_le_bytes());
     for value in [0.5f32, -0.25] {

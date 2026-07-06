@@ -3,7 +3,13 @@ use gz_engine::HexParseError;
 use std::fmt;
 use std::str::FromStr;
 
+/// Row encoding version: rows are persisted in replay stores, so this
+/// only moves with a store migration.
 pub const ENCODING_VERSION: u32 = 1;
+/// Eval-wire batch/output encoding version. v2: f32 sections travel as
+/// bf16 and node-index/kind sections as u16 -- transient wire bytes
+/// only, never persisted, so it moves independently of the row version.
+pub const BATCH_ENCODING_VERSION: u32 = 2;
 pub const STOP_ACTION_KIND_TOKEN: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

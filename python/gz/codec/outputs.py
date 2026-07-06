@@ -4,7 +4,7 @@ import struct
 
 import numpy as np
 
-from gz.proto.frames import ENCODING_VERSION
+from gz.proto.frames import BATCH_ENCODING_VERSION
 
 OUTPUT_MAGIC = b"GZFO"
 OUTPUT_HEADER_LEN = 16
@@ -29,7 +29,7 @@ class OutputEncoder:
         if values.shape[0] < row_count or logits.shape[0] < row_count:
             raise ValueError("not enough rows")
 
-        struct.pack_into("<4sIII", self._buf, 0, OUTPUT_MAGIC, ENCODING_VERSION, row_count, self.max_actions)
+        struct.pack_into("<4sIII", self._buf, 0, OUTPUT_MAGIC, BATCH_ENCODING_VERSION, row_count, self.max_actions)
         value_view = np.frombuffer(self._buf, dtype=np.dtype("<f4"), count=self.capacity, offset=16)
         policy_view = np.frombuffer(
             self._buf,

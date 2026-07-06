@@ -56,11 +56,11 @@ def test_masks_reject_padding_edges_and_subjects(aggregation: str) -> None:
     mutated_bytes = bytearray(make_batch(attr_dim=0))
     layout = _layout(2, 3, 2, 3, 2, 0)
     struct.pack_into("<I", mutated_bytes, layout["edge_count"], 2)
-    struct.pack_into("<I", mutated_bytes, layout["edge_src"] + 4, 2)
-    struct.pack_into("<I", mutated_bytes, layout["edge_dst"] + 4, 1)
+    struct.pack_into("<H", mutated_bytes, layout["edge_src"] + 2, 2)
+    struct.pack_into("<H", mutated_bytes, layout["edge_dst"] + 2, 1)
     mutated_bytes[layout["edge_type"] + 1] = 1
     mutated_bytes[layout["subject_count"]] = 2
-    struct.pack_into("<I", mutated_bytes, layout["action_subjects"] + 4, 2)
+    struct.pack_into("<H", mutated_bytes, layout["action_subjects"] + 2, 2)
     mutated = BatchView.parse(mutated_bytes)
     schema = schema_for_view(baseline, node_vocab_size=7, edge_type_count=2, action_kind_vocab_size=8)
     arch = make_arch(aggregation)

@@ -1,6 +1,6 @@
 use crate::{PROTOCOL_VERSION, ServiceError, ServiceResult};
 use gz_engine::{ActionSetHash, EngineId, EngineVersion, ModelVersion};
-use gz_features::{ENCODING_VERSION, FeatureSchemaHash};
+use gz_features::{BATCH_ENCODING_VERSION, FeatureSchemaHash};
 
 pub const ERROR_PROTOCOL: u32 = 1;
 pub const ERROR_ENCODING: u32 = 2;
@@ -35,7 +35,7 @@ impl Hello {
     ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            encoding_version: ENCODING_VERSION,
+            encoding_version: BATCH_ENCODING_VERSION,
             feature_schema_hash,
             batch_capacity,
             engine_id,

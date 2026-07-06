@@ -1,5 +1,6 @@
 use crate::{
-    ENCODING_VERSION, FeatureError, FeatureResult, FeatureRow, FeatureSchema, FeatureSchemaHash,
+    BATCH_ENCODING_VERSION, FeatureError, FeatureResult, FeatureRow, FeatureSchema,
+    FeatureSchemaHash,
 };
 use std::num::NonZeroUsize;
 
@@ -47,6 +48,14 @@ impl FeatureCollator {
         for row in rows {
             row.validate(&self.schema)?;
         }
+        // v2 packs node indexes and kind tokens as u16 on the wire; the
+        // subject padding sentinel is 0xffff, so valid indexes must stay
+        // strictly below it.
+        if self.schema.config().max_nodes > u32::from(u16::MAX) {
+            return Err(FeatureError::InvalidEncoding(
+                "max_nodes exceeds u16 wire width",
+            ));
+        }
 
         let layout = BatchLayout::new(&self.schema, capacity);
         out.clear();
@@ -61,8 +70,8 @@ impl FeatureCollator {
                 write_u16_at(out, offset, token);
             }
             for (attr_index, value) in row.node_attrs.iter().copied().enumerate() {
-                let offset = layout.node_attrs + (row_index * layout.n * layout.d + attr_index) * 4;
-                write_f32_at(out, offset, value);
+                let offset = layout.node_attrs + (row_index * layout.n * layout.d + attr_index) * 2;
+                write_bf16_at(out, offset, value);
             }
 
             write_u32_at(
@@ -71,15 +80,15 @@ impl FeatureCollator {
                 row.edges.len() as u32,
             );
             for (edge_index, edge) in row.edges.iter().copied().enumerate() {
-                write_u32_at(
+                write_u16_at(
                     out,
-                    layout.edge_src + (row_index * layout.e + edge_index) * 4,
-                    edge.src,
+                    layout.edge_src + (row_index * layout.e + edge_index) * 2,
+                    narrow_index(edge.src, "edge src")?,
                 );
-                write_u32_at(
+                write_u16_at(
                     out,
-                    layout.edge_dst + (row_index * layout.e + edge_index) * 4,
-                    edge.dst,
+                    layout.edge_dst + (row_index * layout.e + edge_index) * 2,
+                    narrow_index(edge.dst, "edge dst")?,
                 );
                 out[layout.edge_type + row_index * layout.e + edge_index] = edge.edge_type;
             }
@@ -90,34 +99,34 @@ impl FeatureCollator {
                 row.actions.len() as u32,
             );
             for (action_index, action) in row.actions.iter().enumerate() {
-                write_u32_at(
+                write_u16_at(
                     out,
-                    layout.action_kind + (row_index * layout.a + action_index) * 4,
-                    action.kind_token,
+                    layout.action_kind + (row_index * layout.a + action_index) * 2,
+                    narrow_index(action.kind_token, "action kind token")?,
                 );
-                write_f32_at(
+                write_bf16_at(
                     out,
-                    layout.action_prior + (row_index * layout.a + action_index) * 4,
+                    layout.action_prior + (row_index * layout.a + action_index) * 2,
                     action.static_prior,
                 );
                 out[layout.subject_count + row_index * layout.a + action_index] =
                     action.subjects.len() as u8;
                 for (subject_index, subject) in action.subjects.iter().copied().enumerate() {
-                    write_u32_at(
+                    write_u16_at(
                         out,
                         layout.action_subjects
                             + ((row_index * layout.a + action_index) * layout.s + subject_index)
-                                * 4,
-                        subject,
+                                * 2,
+                        narrow_index(subject, "action subject")?,
                     );
                 }
             }
 
-            let position = layout.position + row_index * 16;
-            write_f32_at(out, position, row.position.root_step as f32);
-            write_f32_at(out, position + 4, row.position.leaf_depth as f32);
-            write_f32_at(out, position + 8, row.position.budget_fraction);
-            write_f32_at(out, position + 12, row.position.budget_step);
+            let position = layout.position + row_index * 8;
+            write_bf16_at(out, position, row.position.root_step as f32);
+            write_bf16_at(out, position + 2, row.position.leaf_depth as f32);
+            write_bf16_at(out, position + 4, row.position.budget_fraction);
+            write_bf16_at(out, position + 6, row.position.budget_step);
         }
 
         Ok(())
@@ -150,7 +159,7 @@ pub fn decode_outputs(bytes: &[u8], action_counts: &[u32]) -> FeatureResult<Vec<
         return Err(FeatureError::InvalidEncoding("bad output magic"));
     }
     let version = read_u32_at(bytes, 4)?;
-    if version != ENCODING_VERSION {
+    if version != BATCH_ENCODING_VERSION {
         return Err(FeatureError::InvalidEncoding("unsupported output version"));
     }
     let row_count = read_u32_at(bytes, 8)? as usize;
@@ -287,17 +296,17 @@ impl FeatureBatchView {
             node_attr_dim: header.node_attr_dim,
             node_count: read_u32_vec(bytes, layout.node_count, layout.b)?,
             node_tokens: read_u16_vec(bytes, layout.node_tokens, layout.b * layout.n)?,
-            node_attrs: read_f32_vec(bytes, layout.node_attrs, layout.b * layout.n * layout.d)?,
+            node_attrs: read_bf16_vec(bytes, layout.node_attrs, layout.b * layout.n * layout.d)?,
             edge_count: read_u32_vec(bytes, layout.edge_count, layout.b)?,
-            edge_src: read_u32_vec(bytes, layout.edge_src, layout.b * layout.e)?,
-            edge_dst: read_u32_vec(bytes, layout.edge_dst, layout.b * layout.e)?,
+            edge_src: read_u16_widened_vec(bytes, layout.edge_src, layout.b * layout.e)?,
+            edge_dst: read_u16_widened_vec(bytes, layout.edge_dst, layout.b * layout.e)?,
             edge_type: bytes[layout.edge_type..layout.edge_type + layout.b * layout.e].to_vec(),
             action_count: read_u32_vec(bytes, layout.action_count, layout.b)?,
-            action_kind: read_u32_vec(bytes, layout.action_kind, layout.b * layout.a)?,
-            action_prior: read_f32_vec(bytes, layout.action_prior, layout.b * layout.a)?,
+            action_kind: read_u16_widened_vec(bytes, layout.action_kind, layout.b * layout.a)?,
+            action_prior: read_bf16_vec(bytes, layout.action_prior, layout.b * layout.a)?,
             subject_count: bytes[layout.subject_count..layout.subject_count + layout.b * layout.a]
                 .to_vec(),
-            action_subjects: read_u32_vec(
+            action_subjects: read_u16_widened_vec(
                 bytes,
                 layout.action_subjects,
                 layout.b * layout.a * layout.s,
@@ -328,7 +337,7 @@ impl BatchHeader {
             return Err(FeatureError::InvalidEncoding("bad batch magic"));
         }
         let version = read_u32_at(bytes, 4)?;
-        if version != ENCODING_VERSION {
+        if version != BATCH_ENCODING_VERSION {
             return Err(FeatureError::InvalidEncoding("unsupported batch version"));
         }
         let header = Self {
@@ -392,17 +401,17 @@ impl BatchLayout {
         let mut cursor = BATCH_HEADER_LEN;
         let node_count = section(&mut cursor, b * 4);
         let node_tokens = section(&mut cursor, b * n * 2);
-        let node_attrs = section(&mut cursor, b * n * d * 4);
+        let node_attrs = section(&mut cursor, b * n * d * 2);
         let edge_count = section(&mut cursor, b * 4);
-        let edge_src = section(&mut cursor, b * e * 4);
-        let edge_dst = section(&mut cursor, b * e * 4);
+        let edge_src = section(&mut cursor, b * e * 2);
+        let edge_dst = section(&mut cursor, b * e * 2);
         let edge_type = section(&mut cursor, b * e);
         let action_count = section(&mut cursor, b * 4);
-        let action_kind = section(&mut cursor, b * a * 4);
-        let action_prior = section(&mut cursor, b * a * 4);
+        let action_kind = section(&mut cursor, b * a * 2);
+        let action_prior = section(&mut cursor, b * a * 2);
         let subject_count = section(&mut cursor, b * a);
-        let action_subjects = section(&mut cursor, b * a * s * 4);
-        let position = section(&mut cursor, b * 4 * 4);
+        let action_subjects = section(&mut cursor, b * a * s * 2);
+        let position = section(&mut cursor, b * 4 * 2);
         let total_len = align4(cursor);
 
         Self {
@@ -443,13 +452,13 @@ const fn align4(value: usize) -> usize {
 
 fn fill_subject_padding(out: &mut [u8], layout: &BatchLayout) {
     let start = layout.action_subjects;
-    let end = start + layout.b * layout.a * layout.s * 4;
+    let end = start + layout.b * layout.a * layout.s * 2;
     out[start..end].fill(0xff);
 }
 
 fn write_batch_header(out: &mut [u8], schema: &FeatureSchema, capacity: usize, row_count: usize) {
     out[0..4].copy_from_slice(BATCH_MAGIC);
-    write_u32_at(out, 4, ENCODING_VERSION);
+    write_u32_at(out, 4, BATCH_ENCODING_VERSION);
     out[8..40].copy_from_slice(schema.hash().as_bytes());
     write_u32_at(out, 40, capacity as u32);
     write_u32_at(out, 44, row_count as u32);
@@ -468,8 +477,16 @@ fn write_u32_at(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-fn write_f32_at(out: &mut [u8], offset: usize, value: f32) {
-    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+/// Round-to-nearest-even truncation to bfloat16 wire bits.
+fn write_bf16_at(out: &mut [u8], offset: usize, value: f32) {
+    let bits = value.to_bits();
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    let bf16 = (bits.wrapping_add(rounding) >> 16) as u16;
+    out[offset..offset + 2].copy_from_slice(&bf16.to_le_bytes());
+}
+
+fn narrow_index(value: u32, what: &'static str) -> FeatureResult<u16> {
+    u16::try_from(value).map_err(|_| FeatureError::InvalidEncoding(what))
 }
 
 fn read_hash_at(bytes: &[u8], offset: usize) -> FeatureResult<FeatureSchemaHash> {
@@ -521,10 +538,32 @@ fn read_u32_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<
     Ok(out)
 }
 
-fn read_f32_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<f32>> {
+fn read_bf16_at(bytes: &[u8], offset: usize) -> FeatureResult<f32> {
+    let slice = bytes
+        .get(offset..offset + 2)
+        .ok_or(FeatureError::InvalidEncoding("bf16 truncated"))?;
+    let bits = u16::from_le_bytes(slice.try_into().expect("length checked"));
+    Ok(f32::from_bits(u32::from(bits) << 16))
+}
+
+fn read_bf16_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<f32>> {
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
-        out.push(read_f32_at(bytes, offset + index * 4)?);
+        out.push(read_bf16_at(bytes, offset + index * 2)?);
+    }
+    Ok(out)
+}
+
+fn read_u16_widened_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<u32>> {
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = offset + index * 2;
+        let slice = bytes
+            .get(start..start + 2)
+            .ok_or(FeatureError::InvalidEncoding("u16 section truncated"))?;
+        out.push(u32::from(u16::from_le_bytes(
+            slice.try_into().expect("length checked"),
+        )));
     }
     Ok(out)
 }
@@ -532,12 +571,12 @@ fn read_f32_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<
 fn read_position_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<[f32; 4]>> {
     let mut out = Vec::with_capacity(count);
     for row in 0..count {
-        let start = offset + row * 16;
+        let start = offset + row * 8;
         out.push([
-            read_f32_at(bytes, start)?,
-            read_f32_at(bytes, start + 4)?,
-            read_f32_at(bytes, start + 8)?,
-            read_f32_at(bytes, start + 12)?,
+            read_bf16_at(bytes, start)?,
+            read_bf16_at(bytes, start + 2)?,
+            read_bf16_at(bytes, start + 4)?,
+            read_bf16_at(bytes, start + 6)?,
         ]);
     }
     Ok(out)

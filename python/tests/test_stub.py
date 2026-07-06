@@ -78,15 +78,15 @@ def count_batch(node_counts: list[int], action_counts: list[int], row_count: int
         capacity * max_nodes * 2,
         0,
         capacity * 4,
-        capacity * max_edges * 4,
-        capacity * max_edges * 4,
+        capacity * max_edges * 2,
+        capacity * max_edges * 2,
         capacity * max_edges,
         capacity * 4,
-        capacity * max_actions * 4,
-        capacity * max_actions * 4,
+        capacity * max_actions * 2,
+        capacity * max_actions * 2,
         capacity * max_actions,
-        capacity * max_actions * max_subjects * 4,
-        capacity * 16,
+        capacity * max_actions * max_subjects * 2,
+        capacity * 8,
     ]:
         total_len = (total_len + 3) & ~3
         sections.append(total_len)
@@ -99,7 +99,7 @@ def count_batch(node_counts: list[int], action_counts: list[int], row_count: int
         out,
         0,
         b"GZFB",
-        1,
+        2,
         bytes(FeatureSchemaHash.from_bytes(b"r" * 32)),
         capacity,
         row_count,
@@ -109,8 +109,8 @@ def count_batch(node_counts: list[int], action_counts: list[int], row_count: int
         max_subjects,
         0,
     )
-    out[sections[11] : sections[11] + capacity * max_actions * max_subjects * 4] = b"\xff" * (
-        capacity * max_actions * max_subjects * 4
+    out[sections[11] : sections[11] + capacity * max_actions * max_subjects * 2] = b"\xff" * (
+        capacity * max_actions * max_subjects * 2
     )
     for index, value in enumerate(node_counts):
         struct.pack_into("<I", out, sections[0] + index * 4, value)

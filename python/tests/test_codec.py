@@ -8,7 +8,7 @@ import pytest
 from gz.codec import BatchView, FeatureSchemaConfig, OutputEncoder
 from gz.codec.batch import EncodingError
 from gz.codec.schema import SchemaConfigError
-from gz.proto.frames import ENCODING_VERSION
+from gz.proto.frames import BATCH_ENCODING_VERSION
 
 SCHEMA_HASH = b"f" * 32
 
@@ -20,7 +20,7 @@ def test_header_validation_rejects_bad_inputs() -> None:
         BatchView.parse(b"BAD!" + valid[4:])
     with pytest.raises(EncodingError, match="unsupported batch version"):
         bad = bytearray(valid)
-        struct.pack_into("<I", bad, 4, ENCODING_VERSION + 1)
+        struct.pack_into("<I", bad, 4, BATCH_ENCODING_VERSION + 1)
         BatchView.parse(bad)
     with pytest.raises(EncodingError, match="zero max_nodes"):
         bad = bytearray(valid)
@@ -48,7 +48,7 @@ def test_offset_arithmetic_and_zero_copy_with_attrs() -> None:
     assert view.action_kind.tolist() == [[4, 1, 0], [1, 0, 0]]
     assert view.action_prior.tolist() == [[0.25, 0.0, 0.0], [0.0, 0.0, 0.0]]
     assert view.subject_count.tolist() == [[1, 0, 0], [0, 0, 0]]
-    assert view.action_subjects[0, 0].tolist() == [1, 0xFFFFFFFF]
+    assert view.action_subjects[0, 0].tolist() == [1, 0xFFFF]
     assert view.position.tolist() == [[2.0, 3.0, 0.75, 0.125], [1.0, 0.0, 1.0, 0.5]]
 
     token_offset = _layout(2, 3, 2, 3, 2, 1)["node_tokens"]
@@ -74,7 +74,7 @@ def test_output_encoder_exact_bytes_and_reuse() -> None:
 
     expected = bytearray()
     expected.extend(b"GZFO")
-    expected.extend(struct.pack("<III", ENCODING_VERSION, 2, 3))
+    expected.extend(struct.pack("<III", BATCH_ENCODING_VERSION, 2, 3))
     expected.extend(np.array([0.5, -0.25], dtype="<f4").tobytes())
     expected.extend(np.array([1.0, 2.0, 0.0, -1.0, 0.0, 0.0], dtype="<f4").tobytes())
     assert first == bytes(expected)
@@ -140,23 +140,23 @@ def make_batch(attr_dim: int, schema_hash: bytes = SCHEMA_HASH, capacity: int = 
     b, n, e, a, s, d = capacity, 3, 2, 3, 2, attr_dim
     layout = _layout(b, n, e, a, s, d)
     out = bytearray(layout["total_len"])
-    struct.pack_into("<4sI32sIIIIIII", out, 0, b"GZFB", ENCODING_VERSION, schema_hash, b, 2, n, e, a, s, d)
+    struct.pack_into("<4sI32sIIIIIII", out, 0, b"GZFB", BATCH_ENCODING_VERSION, schema_hash, b, 2, n, e, a, s, d)
     _fill_subject_padding(out, layout, b, a, s)
 
     _u32(out, layout["node_count"], [2, 1])
     _u16(out, layout["node_tokens"], [1, 2, 0, 3, 0, 0])
     if d:
-        _f32(out, layout["node_attrs"], [0.5, -1.0, 0.0, 2.0, 0.0, 0.0])
+        _bf16(out, layout["node_attrs"], [0.5, -1.0, 0.0, 2.0, 0.0, 0.0])
     _u32(out, layout["edge_count"], [1, 0])
-    _u32(out, layout["edge_src"], [0, 0, 0, 0])
-    _u32(out, layout["edge_dst"], [1, 0, 0, 0])
+    _u16(out, layout["edge_src"], [0, 0, 0, 0])
+    _u16(out, layout["edge_dst"], [1, 0, 0, 0])
     out[layout["edge_type"]] = 1
     _u32(out, layout["action_count"], [2, 1])
-    _u32(out, layout["action_kind"], [4, 1, 0, 1, 0, 0])
-    _f32(out, layout["action_prior"], [0.25, 0.0, 0.0, 0.0, 0.0, 0.0])
+    _u16(out, layout["action_kind"], [4, 1, 0, 1, 0, 0])
+    _bf16(out, layout["action_prior"], [0.25, 0.0, 0.0, 0.0, 0.0, 0.0])
     out[layout["subject_count"]] = 1
-    _u32(out, layout["action_subjects"], [1, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF])
-    _f32(out, layout["position"], [2.0, 3.0, 0.75, 0.125, 1.0, 0.0, 1.0, 0.5])
+    _u16(out, layout["action_subjects"], [1, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF])
+    _bf16(out, layout["position"], [2.0, 3.0, 0.75, 0.125, 1.0, 0.0, 1.0, 0.5])
     return bytes(out)
 
 
@@ -166,17 +166,17 @@ def _layout(b: int, n: int, e: int, a: int, s: int, d: int) -> dict[str, int]:
     for name, size in [
         ("node_count", b * 4),
         ("node_tokens", b * n * 2),
-        ("node_attrs", b * n * d * 4),
+        ("node_attrs", b * n * d * 2),
         ("edge_count", b * 4),
-        ("edge_src", b * e * 4),
-        ("edge_dst", b * e * 4),
+        ("edge_src", b * e * 2),
+        ("edge_dst", b * e * 2),
         ("edge_type", b * e),
         ("action_count", b * 4),
-        ("action_kind", b * a * 4),
-        ("action_prior", b * a * 4),
+        ("action_kind", b * a * 2),
+        ("action_prior", b * a * 2),
         ("subject_count", b * a),
-        ("action_subjects", b * a * s * 4),
-        ("position", b * 4 * 4),
+        ("action_subjects", b * a * s * 2),
+        ("position", b * 4 * 2),
     ]:
         cursor = _align4(cursor)
         out[name] = cursor
@@ -191,7 +191,14 @@ def _align4(value: int) -> int:
 
 def _fill_subject_padding(out: bytearray, layout: dict[str, int], b: int, a: int, s: int) -> None:
     start = layout["action_subjects"]
-    out[start : start + b * a * s * 4] = b"\xff" * (b * a * s * 4)
+    out[start : start + b * a * s * 2] = b"\xff" * (b * a * s * 2)
+
+
+def _bf16(out: bytearray, offset: int, values: list[float]) -> None:
+    for index, value in enumerate(values):
+        bits = struct.unpack("<I", struct.pack("<f", value))[0]
+        rounding = 0x7FFF + ((bits >> 16) & 1)
+        struct.pack_into("<H", out, offset + index * 2, ((bits + rounding) >> 16) & 0xFFFF)
 
 
 def _u16(out: bytearray, offset: int, values: list[int]) -> None:

@@ -19,7 +19,8 @@ pub use collator::{
 pub use error::{FeatureError, FeatureResult};
 pub use row::{ActionFeature, FeatureEdge, FeatureRow, PositionFeatures};
 pub use schema::{
-    ENCODING_VERSION, FeatureSchema, FeatureSchemaConfig, FeatureSchemaHash, STOP_ACTION_KIND_TOKEN,
+    BATCH_ENCODING_VERSION, ENCODING_VERSION, FeatureSchema, FeatureSchemaConfig,
+    FeatureSchemaHash, STOP_ACTION_KIND_TOKEN,
 };
 
 use gz_engine::GraphEngine;

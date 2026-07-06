@@ -7,7 +7,7 @@ import numpy as np
 
 from gz.codec import BatchView
 from gz.model.stub import stub
-from gz.proto.frames import ENCODING_VERSION
+from gz.proto.frames import BATCH_ENCODING_VERSION
 from test_stub import scalar_stub
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -17,7 +17,7 @@ def test_attr1_fixture_matches_spec_table() -> None:
     raw = (FIXTURES / "batch_attr1.gzfb").read_bytes()
     view = BatchView.parse(raw)
 
-    assert struct.unpack_from("<I", raw, 4)[0] == ENCODING_VERSION
+    assert struct.unpack_from("<I", raw, 4)[0] == BATCH_ENCODING_VERSION
     assert view.batch_capacity == 4
     assert view.row_count == 3
     assert view.dims.max_nodes == 8
@@ -56,7 +56,7 @@ def test_attr1_fixture_matches_spec_table() -> None:
     assert view.action_prior.tolist()[2] == [-0.5, 0.0, 1.0, 0.125, -1.0, 0.0]
     assert view.subject_count.tolist()[0] == [1, 0, 0, 0, 0, 0]
     assert view.subject_count.tolist()[2] == [2, 0, 1, 2, 1, 0]
-    assert view.action_subjects[0, 0].tolist() == [2, 0xFFFFFFFF]
+    assert view.action_subjects[0, 0].tolist() == [2, 0xFFFF]
     assert view.action_subjects[2, 0].tolist() == [0, 1]
     assert view.action_subjects[2, 3].tolist() == [2, 3]
     assert view.position.tolist() == [
@@ -84,7 +84,7 @@ def test_attr0_fixture_omits_attrs() -> None:
     assert view.action_kind.tolist()[0] == [4, 1, 0]
     assert view.action_prior.tolist()[0] == [0.5, 0.0, 0.0]
     assert view.subject_count.tolist()[0] == [1, 0, 0]
-    assert view.action_subjects[0, 0].tolist() == [1, 0xFFFFFFFF]
+    assert view.action_subjects[0, 0].tolist() == [1, 0xFFFF]
     assert view.position.tolist()[0] == [0.0, 1.0, 0.25, 0.25]
 
 

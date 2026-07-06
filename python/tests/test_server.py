@@ -12,7 +12,7 @@ from gz.codec import BatchView
 from gz.evaluator import StubBackend, serve
 from gz.model.stub import STUB_MODEL_VERSION, stub
 from gz.proto import (
-    ENCODING_VERSION,
+    BATCH_ENCODING_VERSION,
     ERROR_CAPACITY,
     ERROR_ENCODING,
     ERROR_MALFORMED,
@@ -73,7 +73,7 @@ def test_server_rejects_bad_protocol(tmp_path: Path) -> None:
 def test_server_rejects_bad_encoding(tmp_path: Path) -> None:
     client, thread = raw_client(tmp_path)
     try:
-        bad_hello = make_hello(encoding_version=ENCODING_VERSION + 1)
+        bad_hello = make_hello(encoding_version=BATCH_ENCODING_VERSION + 1)
         write_frame(client, FRAME_HELLO, bad_hello.encode())
         assert_error(client, ERROR_ENCODING)
     finally:
@@ -141,7 +141,7 @@ def raw_client(tmp_path: Path) -> tuple[socket.socket, threading.Thread]:
 
 def make_hello(
     protocol_version: int = PROTOCOL_VERSION,
-    encoding_version: int = ENCODING_VERSION,
+    encoding_version: int = BATCH_ENCODING_VERSION,
     schema_hash: bytes = SCHEMA_HASH,
     batch_capacity: int = 2,
 ) -> Hello:
@@ -166,7 +166,7 @@ def assert_error(client: socket.socket, code: int) -> None:
 def expected_output_bytes(values: np.ndarray, logits: np.ndarray, row_count: int) -> bytes:
     out = bytearray()
     out.extend(b"GZFO")
-    out.extend(struct.pack("<III", ENCODING_VERSION, row_count, logits.shape[1]))
+    out.extend(struct.pack("<III", BATCH_ENCODING_VERSION, row_count, logits.shape[1]))
     out.extend(values.astype("<f4", copy=False).tobytes())
     out.extend(logits.astype("<f4", copy=False).tobytes())
     return bytes(out)

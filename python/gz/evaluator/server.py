@@ -13,7 +13,7 @@ from gz.codec.batch import EncodingError
 from gz.common.tags import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
 from gz.evaluator.backends import StubBackend
 from gz.proto import (
-    ENCODING_VERSION,
+    BATCH_ENCODING_VERSION,
     ERROR_CAPACITY,
     ERROR_ENCODING,
     ERROR_MALFORMED,
@@ -123,7 +123,7 @@ def _handshake(
     hello = Hello.decode(payload)
     if hello.protocol_version != PROTOCOL_VERSION:
         raise ProtocolError(ERROR_PROTOCOL, "protocol version mismatch")
-    if hello.encoding_version != ENCODING_VERSION:
+    if hello.encoding_version != BATCH_ENCODING_VERSION:
         raise ProtocolError(ERROR_ENCODING, "encoding version mismatch")
     if hello.batch_capacity == 0:
         raise ProtocolError(ERROR_CAPACITY, "zero batch capacity")

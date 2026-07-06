@@ -3,7 +3,7 @@ use gz_eval_service::{
     FRAME_ERROR, FRAME_EVAL, FRAME_EVAL_RESULT, FRAME_HELLO, FRAME_HELLO_ACK, FRAME_PING,
     FRAME_PONG, Hello, PROTOCOL_VERSION, ServiceError, decode_error, read_frame, write_frame,
 };
-use gz_features::{ENCODING_VERSION, FeatureSchemaHash};
+use gz_features::{BATCH_ENCODING_VERSION, FeatureSchemaHash};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
@@ -73,7 +73,7 @@ fn hello_field_order_is_pinned() {
 
     let mut expected = Vec::new();
     expected.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    expected.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
+    expected.extend_from_slice(&BATCH_ENCODING_VERSION.to_le_bytes());
     expected.extend_from_slice(&[0x11; 32]);
     expected.extend_from_slice(&7u32.to_le_bytes());
     expected.extend_from_slice(&[0x22; 16]);

@@ -166,7 +166,7 @@ pub fn read_frame_type(stream: &mut UnixStream) -> u8 {
 pub fn output_payload(rows: &[RowOutput], capacity: usize, max_actions: usize) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"GZFO");
-    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&gz_features::BATCH_ENCODING_VERSION.to_le_bytes());
     out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
     out.extend_from_slice(&(max_actions as u32).to_le_bytes());
     for index in 0..capacity {

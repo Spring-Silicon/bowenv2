@@ -9,6 +9,7 @@ from gz.proto.errors import (
     encode_error,
 )
 from gz.proto.frames import (
+    BATCH_ENCODING_VERSION,
     ENCODING_VERSION,
     FRAME_ERROR,
     FRAME_EVAL,
@@ -26,6 +27,7 @@ from gz.proto.frames import (
 from gz.proto.hello import Hello, HelloAck
 
 __all__ = [
+    "BATCH_ENCODING_VERSION",
     "ENCODING_VERSION",
     "ERROR_CAPACITY",
     "ERROR_ENCODING",

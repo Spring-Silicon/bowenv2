@@ -39,6 +39,10 @@ class TrainerLoop:
         self.config = config
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         self.step_index = 0
+        # bf16 autocast on CUDA, matching the evaluator's serving numerics.
+        # Params and optimizer state stay f32; no GradScaler is needed for
+        # bf16 (full f32 exponent range).
+        self.device_type = next(model.parameters()).device.type
 
     def train_step(self, batch: TrainingBatch, with_metrics: bool = True) -> StepMetrics | None:
         """One optimizer step. With `with_metrics=False` the step enqueues no
@@ -49,10 +53,17 @@ class TrainerLoop:
         functional = torch.nn.functional
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        value_raw, logits = self.model(batch.features)
-        policy_loss = policy_ce_loss(logits, batch.policy, batch.features.action_count, batch.row_count)
-        value_loss = value_bce_loss(value_raw, batch.value, batch.value_valid, batch.row_count)
-        loss = policy_loss + self.config.value_weight * value_loss
+        with torch.autocast(
+            device_type=self.device_type,
+            dtype=torch.bfloat16,
+            enabled=self.device_type == "cuda",
+        ):
+            value_raw, logits = self.model(batch.features)
+            policy_loss = policy_ce_loss(
+                logits, batch.policy, batch.features.action_count, batch.row_count
+            )
+            value_loss = value_bce_loss(value_raw, batch.value, batch.value_valid, batch.row_count)
+            loss = policy_loss + self.config.value_weight * value_loss
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
         lr = lr_at_step(
