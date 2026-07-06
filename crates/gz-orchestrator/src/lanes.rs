@@ -6,7 +6,9 @@ use crate::root::RootSource;
 use crate::serial::OrchestratedEpisode;
 use crate::service::internal;
 use gz_engine::{EngineError, EngineResult, ErrorCode, ErrorMessage, GraphEngine, ModelVersion};
-use gz_eval::{EvalOutput, EvalRequest, Evaluator, eval_error_to_engine_error, validate_outputs};
+use gz_eval::{
+    EvalOutput, EvalRequest, Evaluator, NnEvalCache, eval_error_to_engine_error, validate_outputs,
+};
 use gz_eval_service::{BackendOutputs, FeatureEvalBackend};
 use gz_features::{
     FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaHash,
@@ -25,6 +27,8 @@ pub struct ThreadedOrchestratorConfig {
     pub workers_per_lane: NonZeroUsize,
     pub max_batch: NonZeroUsize,
     pub flush_after: Duration,
+    /// Per-lane NN eval cache entries; 0 disables (the default everywhere).
+    pub eval_cache_capacity: usize,
 }
 
 pub struct ThreadedGumbelOrchestrator<E, V> {
@@ -188,6 +192,7 @@ where
                             search,
                             workers_per_lane: config.workers_per_lane,
                             context,
+                            eval_cache_capacity: config.eval_cache_capacity,
                             intake_tx,
                             reply_rx,
                         },
@@ -284,6 +289,7 @@ where
                             search,
                             workers_per_lane: config.workers_per_lane,
                             context,
+                            eval_cache_capacity: config.eval_cache_capacity,
                             intake_tx,
                             reply_rx,
                         },
@@ -395,6 +401,7 @@ where
                             search,
                             workers_per_lane: config.workers_per_lane,
                             context,
+                            eval_cache_capacity: config.eval_cache_capacity,
                             intake_tx,
                             reply_rx,
                         },
@@ -508,6 +515,7 @@ where
                             search,
                             workers_per_lane: config.workers_per_lane,
                             context,
+                            eval_cache_capacity: config.eval_cache_capacity,
                             intake_tx,
                             reply_rx,
                         },
@@ -568,6 +576,7 @@ struct LaneRuntime<'a, J> {
     search: &'a GumbelMcts,
     workers_per_lane: NonZeroUsize,
     context: GumbelEpisodeContext,
+    eval_cache_capacity: usize,
     intake_tx: SyncSender<J>,
     reply_rx: Receiver<EvalReply>,
 }
@@ -628,6 +637,7 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        eval_cache: Option<&mut NnEvalCache>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>>;
 
     fn send_parked(
@@ -665,6 +675,8 @@ where
     let identity = EngineIdentity::from_engine(&engine);
     let worker_id_base = (runtime.lane * runtime.workers_per_lane.get()) as u64;
     let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
+    let mut eval_cache =
+        (runtime.eval_cache_capacity > 0).then(|| NnEvalCache::new(runtime.eval_cache_capacity));
     let mut roots_exhausted = false;
     let mut next_episode_id = (runtime.lane as u64) << 32;
     mode.begin(runtime.search, identity, runtime.context);
@@ -693,18 +705,33 @@ where
             }
         }
 
-        for completed in mode.drive(&mut engine, &mut pool)? {
+        for completed in mode.drive(&mut engine, &mut pool, eval_cache.as_mut())? {
             mode.complete(&mut engine, runtime.search, completed)?;
         }
 
         mode.send_parked(runtime.lane, &mut pool, &runtime.intake_tx)?;
 
         if roots_exhausted && !pool.active() {
+            if let Some(cache) = &eval_cache {
+                let total = cache.hits() + cache.misses();
+                eprintln!(
+                    "event=eval_cache lane={} hits={} misses={} hit_rate={:.3}",
+                    runtime.lane,
+                    cache.hits(),
+                    cache.misses(),
+                    if total > 0 {
+                        cache.hits() as f64 / total as f64
+                    } else {
+                        0.0
+                    },
+                );
+            }
             return Ok(mode.finish(runtime.lane));
         }
 
         if pool.has_parked()
-            && let Some(version) = receive_replies(&mut engine, &mut pool, &runtime.reply_rx)?
+            && let Some(version) =
+                receive_replies(&mut engine, &mut pool, &runtime.reply_rx, &mut eval_cache)?
         {
             mode.observe_version(version);
         }
@@ -734,8 +761,9 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        eval_cache: Option<&mut NnEvalCache>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", None)
+        pool.drive(engine, "worker blocked", None, eval_cache)
     }
 
     fn send_parked(
@@ -792,8 +820,14 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        eval_cache: Option<&mut NnEvalCache>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", Some(&mut self.extractor))
+        pool.drive(
+            engine,
+            "worker blocked",
+            Some(&mut self.extractor),
+            eval_cache,
+        )
     }
 
     fn send_parked(
@@ -918,8 +952,9 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        eval_cache: Option<&mut NnEvalCache>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", None)
+        pool.drive(engine, "worker blocked", None, eval_cache)
     }
 
     fn send_parked(
@@ -1054,8 +1089,14 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
+        eval_cache: Option<&mut NnEvalCache>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", Some(&mut self.extractor))
+        pool.drive(
+            engine,
+            "worker blocked",
+            Some(&mut self.extractor),
+            eval_cache,
+        )
     }
 
     fn send_parked(
@@ -1381,6 +1422,7 @@ fn receive_replies<E>(
     engine: &mut E,
     pool: &mut WorkerPool<E::Graph, E::Candidate>,
     reply_rx: &Receiver<EvalReply>,
+    eval_cache: &mut Option<NnEvalCache>,
 ) -> EngineResult<Option<ModelVersion>>
 where
     E: GraphEngine,
@@ -1389,13 +1431,25 @@ where
         .recv()
         .map_err(|_| internal("eval backend unavailable"))?;
     let mut version = reply.output.model_version;
-    pool.resume(engine, reply.slot, reply.token, reply.output)?;
+    pool.resume(
+        engine,
+        reply.slot,
+        reply.token,
+        reply.output,
+        eval_cache.as_mut(),
+    )?;
 
     loop {
         match reply_rx.try_recv() {
             Ok(reply) => {
                 version = reply.output.model_version;
-                pool.resume(engine, reply.slot, reply.token, reply.output)?;
+                pool.resume(
+                    engine,
+                    reply.slot,
+                    reply.token,
+                    reply.output,
+                    eval_cache.as_mut(),
+                )?;
             }
             Err(TryRecvError::Empty) => return Ok(Some(version)),
             Err(TryRecvError::Disconnected) => return Err(internal("eval backend unavailable")),

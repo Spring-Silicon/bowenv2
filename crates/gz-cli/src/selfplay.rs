@@ -55,6 +55,9 @@ pub struct SelfplayConfig {
     pub serve_max_batch: usize,
     pub replay_backlog: Option<u64>,
     pub replay_retain: Option<u64>,
+    /// Per-lane NN eval cache entries; 0 disables. Opt-in: hits replay
+    /// cached outputs bit-identically for the serving model version.
+    pub eval_cache: usize,
 }
 
 impl Default for SelfplayConfig {
@@ -84,6 +87,7 @@ impl Default for SelfplayConfig {
             serve_max_batch: 512,
             replay_backlog: None,
             replay_retain: None,
+            eval_cache: 0,
         }
     }
 }
@@ -369,6 +373,7 @@ fn run_random(
             workers_per_lane: nonzero(config.workers_per_lane, "workers_per_lane")?,
             max_batch: nonzero(config.max_batch, "max_batch")?,
             flush_after: Duration::from_millis(1),
+            eval_cache_capacity: config.eval_cache,
         },
     );
     let run = orchestrator
@@ -530,6 +535,7 @@ fn threaded_config(config: &SelfplayConfig) -> Result<ThreadedOrchestratorConfig
         workers_per_lane: nonzero(config.workers_per_lane, "workers_per_lane")?,
         max_batch: nonzero(config.max_batch, "max_batch")?,
         flush_after: Duration::from_millis(1),
+        eval_cache_capacity: config.eval_cache,
     })
 }
 

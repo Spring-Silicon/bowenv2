@@ -35,6 +35,7 @@ fn config(workers_per_lane: usize, max_batch: usize) -> ThreadedOrchestratorConf
         workers_per_lane: NonZeroUsize::new(workers_per_lane).unwrap(),
         max_batch: NonZeroUsize::new(max_batch).unwrap(),
         flush_after: Duration::from_millis(50),
+        eval_cache_capacity: 0,
     }
 }
 
@@ -156,6 +157,7 @@ fn slow_evaluator_batches_active_workers() {
             workers_per_lane: NonZeroUsize::new(8).unwrap(),
             max_batch: NonZeroUsize::new(8).unwrap(),
             flush_after: Duration::from_millis(250),
+            eval_cache_capacity: 0,
         },
     );
     let run = orchestrator
