@@ -143,21 +143,25 @@ value_input = "pair", whittlezero's full design: the opponent
 trajectory's states embedded through the SAME trunk, paired with the
 learner state at the comparable timestep (their index rule:
 opp_state[min(t + offset, len-1)]).
-Slot semantics and symmetrization (whittle_self_play.py ValueItem
-emission): the slots are NOT randomized -- self is always the state
-whose target z is being predicted, opp is the other trajectory's
-state, and the head's contract is the asymmetric E[sgn(r_self -
-r_opp)]. What prevents slot bias is `ptp_value_perspective: both`:
-every pair also emits its MIRROR (self=opp_state, opp=self_state,
-z=-z, player ids swapped) -- deterministic both-ways augmentation
-rather than a per-sample coin flip, doubling pair data. Note this
-requires value-only samples (the mirrored rows have no policy
-target), which is why whittlezero runs SEPARATE policy and value
-replays; adopting "both" here means a value-only sample stream, a
-real architectural addition beyond the embedding plumbing. Their
-per-side player_id bits ride along as inputs for turn parity in
-alternating PTP; our fixed-root references have no turns, so they
-reduce to a self/opp indicator. For the fixed-root policy/gated-policy
+Slot semantics: self is always the state whose target z is being
+predicted, opp the other trajectory's state -- the head's contract is
+the asymmetric E[sgn(r_self - r_opp)], so slots are semantic, not
+arbitrary. Slot-bias prevention deviates from whittlezero
+deliberately: they symmetrize AT STORAGE (`ptp_value_perspective:
+both` emits every pair's mirror with z=-z as a second sample), which
+forces value-only samples and is why they run separate policy and
+value replay buffers. We symmetrize AT TRAINING instead: rows store
+the canonical (learner_state, opp_state, z) once, and the trainer
+flips a deterministic per-sample coin (seeded by run_seed and step,
+house style) each time a row is sampled -- feeding the value head
+either (self, opp) -> z or (opp, self) -> -z, while the policy loss
+always uses the learner side. Same expected training distribution,
+no value-only stream, no dual replay, no storage growth; with sample
+reuse ~3-4x every pair sees both orientations over a run anyway.
+Serving always queries the canonical orientation (self = the state
+being searched); the flip is purely a training augmentation.
+whittlezero's per-side player_id turn-parity bits have no analog in
+our turnless references and are dropped. For the fixed-root policy/gated-policy
 references the opponent trajectory is one rollout per model version,
 so its per-timestep embeddings can be computed ONCE per swap and
 memoized -- but they must be computed by the serving model
