@@ -93,7 +93,11 @@ class TrainerLoop:
             valid_count = valid.sum()
             if bool(valid_count.item()):
                 prediction = torch.where(value_raw[valid] >= 0, 1.0, -1.0)
-                label = torch.where(batch.value[valid] >= 0, 1.0, -1.0)
+                # Accuracy against the same flipped targets the loss saw:
+                # value_raw came from flipped pair inputs, so the unflipped
+                # batch.value counts correct flipped predictions as wrong.
+                # label_mean stays unflipped -- it reports the stored data.
+                label = torch.where(value[valid] >= 0, 1.0, -1.0)
                 value_accuracy = (prediction == label).float().mean()
                 label_mean = batch.value[valid].mean()
             else:
