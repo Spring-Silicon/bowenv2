@@ -863,6 +863,67 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
         }
     }
 
+    // Forwarded explicitly: the trait default falls back to reference(),
+    // which silently drops per-step opponent features (bootstrap root
+    // references lost their states this way -- scalar present, no state).
+    fn reference_with_features<X>(
+        &mut self,
+        engine: &mut WhittleEngine,
+        root: WhittleGraphId,
+        extractor: &mut X,
+        candidate_options: CandidateOptions,
+        export_position: bool,
+    ) -> EngineResult<Option<Reference>>
+    where
+        X: FeatureExtractor<WhittleEngine>,
+    {
+        match self {
+            Self::None => Ok(None),
+            Self::Root(provider) => provider.reference_with_features(
+                engine,
+                root,
+                extractor,
+                candidate_options,
+                export_position,
+            ),
+            Self::Greedy(provider) => provider.reference_with_features(
+                engine,
+                root,
+                extractor,
+                candidate_options,
+                export_position,
+            ),
+            Self::Beam(provider) => provider.reference_with_features(
+                engine,
+                root,
+                extractor,
+                candidate_options,
+                export_position,
+            ),
+            Self::Random(provider) => provider.reference_with_features(
+                engine,
+                root,
+                extractor,
+                candidate_options,
+                export_position,
+            ),
+            Self::SelfAverage(provider) => provider.reference_with_features(
+                engine,
+                root,
+                extractor,
+                candidate_options,
+                export_position,
+            ),
+            Self::Policy(provider) => provider.reference_with_features(
+                engine,
+                root,
+                extractor,
+                candidate_options,
+                export_position,
+            ),
+        }
+    }
+
     // The enum must forward observe explicitly: the trait default is a
     // no-op, which would silently starve the self-average EMA. Any future
     // stateful provider variant must be forwarded here.
