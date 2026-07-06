@@ -128,6 +128,7 @@ def _handshake(
     if hello.batch_capacity == 0:
         raise ProtocolError(ERROR_CAPACITY, "zero batch capacity")
     model_version = backend.handshake(hello)
+    _ensure_reply_send_buffer(conn, backend, hello.batch_capacity)
     write_frame_into(
         conn,
         write_buf,
@@ -141,6 +142,30 @@ def _handshake(
         engine_version=hello.engine_version,
         action_set_hash=hello.action_set_hash,
     )
+
+
+def _ensure_reply_send_buffer(conn: socket.socket, backend: StubBackend, capacity: int) -> None:
+    """The pipelined loop's deadlock-freedom invariant: a reply write must
+    never block (the client may be mid-write of its next request and not
+    reading). The kernel guarantees that when the send buffer holds one
+    full reply frame. Verified loudly at handshake instead of deadlocking
+    at the first full-size batch."""
+    manifest = getattr(backend, "manifest", None)
+    schema = getattr(manifest, "feature_schema", None)
+    max_actions = getattr(schema, "max_actions", None)
+    if max_actions is None:
+        # Schema-less backends (the stub) get best-effort sizing only.
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+        return
+    reply_frame = 45 + capacity * 4 + capacity * int(max_actions) * 4
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, reply_frame)
+    achieved = conn.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+    if achieved < reply_frame:
+        raise ProtocolError(
+            ERROR_CAPACITY,
+            f"send buffer {achieved} cannot hold a reply frame ({reply_frame}); "
+            "raise net.core.wmem_max or lower the eval batch capacity",
+        )
 
 
 def _handle_ping(conn: socket.socket, write_buf: bytearray, payload: memoryview) -> None:
