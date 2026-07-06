@@ -1,3 +1,4 @@
+use crate::wire::{bf16_bits_to_f32, f32_to_bf16_bits};
 use crate::{
     BATCH_ENCODING_VERSION, FeatureError, FeatureResult, FeatureRow, FeatureSchema,
     FeatureSchemaHash,
@@ -477,12 +478,8 @@ fn write_u32_at(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Round-to-nearest-even truncation to bfloat16 wire bits.
 fn write_bf16_at(out: &mut [u8], offset: usize, value: f32) {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    let bf16 = (bits.wrapping_add(rounding) >> 16) as u16;
-    out[offset..offset + 2].copy_from_slice(&bf16.to_le_bytes());
+    out[offset..offset + 2].copy_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
 }
 
 fn narrow_index(value: u32, what: &'static str) -> FeatureResult<u16> {
@@ -542,8 +539,9 @@ fn read_bf16_at(bytes: &[u8], offset: usize) -> FeatureResult<f32> {
     let slice = bytes
         .get(offset..offset + 2)
         .ok_or(FeatureError::InvalidEncoding("bf16 truncated"))?;
-    let bits = u16::from_le_bytes(slice.try_into().expect("length checked"));
-    Ok(f32::from_bits(u32::from(bits) << 16))
+    Ok(bf16_bits_to_f32(u16::from_le_bytes(
+        slice.try_into().expect("length checked"),
+    )))
 }
 
 fn read_bf16_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<f32>> {

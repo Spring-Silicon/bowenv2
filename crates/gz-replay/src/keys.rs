@@ -1,4 +1,6 @@
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+// v6: rows persist as StoredReplayRow (deduplicated legal-action
+// contexts, bf16 policy targets) with v2 feature-row bytes.
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 
 pub(crate) const CF_META: &str = "meta";
 pub(crate) const CF_EPISODES: &str = "episodes";

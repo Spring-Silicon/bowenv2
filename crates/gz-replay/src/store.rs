@@ -7,7 +7,8 @@ use crate::keys::{
     encode_u32, encode_u64, episode_key, row_index_key, row_key,
 };
 use crate::records::{
-    ReplayEpisodeId, ReplayEpisodeRecord, ReplayRootInfo, ReplayRow, validate_episode,
+    ReplayEpisodeId, ReplayEpisodeRecord, ReplayRootInfo, ReplayRow, StoredReplayRow,
+    validate_episode,
 };
 use crate::sample::{ReplayRng, SampleConfig};
 use gz_features::{FeatureSchema, FeatureSchemaConfig};
@@ -119,7 +120,11 @@ impl ReplayStore {
 
         for (offset, row) in rows.iter().enumerate() {
             let key = row_key(episode_seq, row.step_index);
-            batch.put_cf(&row_cf, key, postcard::to_allocvec(row)?);
+            batch.put_cf(
+                &row_cf,
+                key,
+                postcard::to_allocvec(&StoredReplayRow::from_row(row)?)?,
+            );
             batch.put_cf(
                 &row_index,
                 row_index_key(row_seq + offset as u64),
@@ -296,7 +301,7 @@ impl ReplayStore {
 
             out.push((
                 ReplayEpisodeId::new(episode_seq),
-                postcard::from_bytes(&row)?,
+                postcard::from_bytes::<StoredReplayRow>(&row)?.into_row(),
             ));
         }
 

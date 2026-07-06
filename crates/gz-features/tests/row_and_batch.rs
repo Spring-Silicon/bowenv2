@@ -1,13 +1,13 @@
 use gz_features::{
-    ActionFeature, FeatureBatchView, FeatureCollator, FeatureEdge, FeatureError, FeatureRow,
-    FeatureSchema, FeatureSchemaConfig, PositionFeatures, RowTargets, TrainingTargetsView,
-    decode_feature_row, encode_feature_row, encode_training_targets, validate_batch_action_counts,
-    validate_feature_row_header,
+    ActionFeature, ENCODING_VERSION, FeatureBatchView, FeatureCollator, FeatureEdge, FeatureError,
+    FeatureRow, FeatureSchema, FeatureSchemaConfig, PositionFeatures, RowTargets,
+    TrainingTargetsView, decode_feature_row, encode_feature_row, encode_training_targets,
+    validate_batch_action_counts, validate_feature_row_header,
 };
 use std::num::NonZeroUsize;
 
 const HAND_BUILT_BATCH_FINGERPRINT: &str =
-    "1b681a6d4b043398a86044dc74e437c88b026fcd557c3bd546142c877c4bb1bc";
+    "f18c084059db6051d0b59d24f8c0118c346ecf8eeab8eb3b0fd1e0ec241142a8";
 
 fn schema() -> FeatureSchema {
     FeatureSchema::new(FeatureSchemaConfig {
@@ -151,7 +151,7 @@ fn feature_row_codec_roundtrips_and_checks_header() {
     ));
 
     let mut bad_version = bytes.clone();
-    bad_version[4..8].copy_from_slice(&2u32.to_le_bytes());
+    bad_version[4..8].copy_from_slice(&(ENCODING_VERSION + 1).to_le_bytes());
     assert!(matches!(
         validate_feature_row_header(&bad_version, &schema.hash()),
         Err(FeatureError::InvalidEncoding(_))
@@ -173,9 +173,13 @@ fn feature_row_codec_has_stable_layout() {
     let mut bytes = Vec::new();
     encode_feature_row(&row, &schema, &mut bytes).unwrap();
 
+    // v2 layout: u16 node indexes and kind tokens, bf16 floats, u8
+    // subject counts. All float fixtures are dyadic, so their bf16 bits
+    // are the top half of the f32 bits.
+    let bf16 = |value: f32| (value.to_bits() >> 16) as u16;
     let mut expected = Vec::new();
     expected.extend_from_slice(b"GZFR");
-    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
     expected.extend_from_slice(schema.hash().as_bytes());
     expected.extend_from_slice(&3u32.to_le_bytes());
     expected.extend_from_slice(&3u32.to_le_bytes());
@@ -184,27 +188,27 @@ fn feature_row_codec_has_stable_layout() {
     }
     expected.extend_from_slice(&3u32.to_le_bytes());
     for value in [0.5f32, 1.5, 2.5] {
-        expected.extend_from_slice(&value.to_le_bytes());
+        expected.extend_from_slice(&bf16(value).to_le_bytes());
     }
     expected.extend_from_slice(&2u32.to_le_bytes());
-    for (src, dst, edge_type) in [(0u32, 1u32, 0u8), (1, 2, 1)] {
+    for (src, dst, edge_type) in [(0u16, 1u16, 0u8), (1, 2, 1)] {
         expected.extend_from_slice(&src.to_le_bytes());
         expected.extend_from_slice(&dst.to_le_bytes());
         expected.push(edge_type);
     }
     expected.extend_from_slice(&2u32.to_le_bytes());
-    expected.extend_from_slice(&4u32.to_le_bytes());
-    expected.extend_from_slice(&0.25f32.to_le_bytes());
-    expected.extend_from_slice(&2u32.to_le_bytes());
-    expected.extend_from_slice(&1u32.to_le_bytes());
-    expected.extend_from_slice(&2u32.to_le_bytes());
-    expected.extend_from_slice(&1u32.to_le_bytes());
-    expected.extend_from_slice(&0.0f32.to_le_bytes());
-    expected.extend_from_slice(&0u32.to_le_bytes());
+    expected.extend_from_slice(&4u16.to_le_bytes());
+    expected.extend_from_slice(&bf16(0.25).to_le_bytes());
+    expected.push(2);
+    expected.extend_from_slice(&1u16.to_le_bytes());
+    expected.extend_from_slice(&2u16.to_le_bytes());
+    expected.extend_from_slice(&1u16.to_le_bytes());
+    expected.extend_from_slice(&bf16(0.0).to_le_bytes());
+    expected.push(0);
     expected.extend_from_slice(&2u32.to_le_bytes());
     expected.extend_from_slice(&3u32.to_le_bytes());
-    expected.extend_from_slice(&0.75f32.to_le_bytes());
-    expected.extend_from_slice(&0.125f32.to_le_bytes());
+    expected.extend_from_slice(&bf16(0.75).to_le_bytes());
+    expected.extend_from_slice(&bf16(0.125).to_le_bytes());
 
     assert_eq!(bytes, expected);
 }
@@ -237,7 +241,7 @@ fn training_targets_codec_writes_padded_sections() {
     assert_eq!(view.reward, vec![0.25, -0.5]);
     assert_eq!(
         fingerprint(&bytes),
-        "7b1a39e0671d158ddc5a17a615a402ebcf6239dad7ad28fb361b85534076f2bc"
+        "89a55b18a695aa14b0a914db502d0ab1198c5e04eac01241e00e72f26ad1498d"
     );
 }
 

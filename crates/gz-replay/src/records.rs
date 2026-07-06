@@ -1,9 +1,11 @@
 use crate::{ReplayError, ReplayResult};
 use gz_engine::{
-    MeasureSummary, ModelVersion, PortableSearchActionRef, ReplayGraphContext, SearchConfigHash,
-    SearchStepRef,
+    CandidateHash, MeasureSummary, ModelVersion, PortableCandidateRef, PortableSearchActionRef,
+    ReplayGraphContext, SearchConfigHash, SearchStepRef,
 };
-use gz_features::{FeatureSchemaHash, validate_feature_row_header};
+use gz_features::{
+    FeatureSchemaHash, bf16_bits_to_f32, f32_to_bf16_bits, validate_feature_row_header,
+};
 
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -82,6 +84,114 @@ pub struct ReplayRow {
     pub model_version: Option<ModelVersion>,
     pub search_config_hash: SearchConfigHash,
     pub feature_row: Option<Vec<u8>>,
+}
+
+/// Storage twin of [`ReplayRow`]. Every legal action of a row references
+/// the row's state context by construction (candidates are enumerated at
+/// the state graph and STOP references it), so storage keeps one context
+/// and a bare hash per action instead of repeating a 96-byte context per
+/// legal action -- ~80% of row bytes at the 1024-action shape. Policy
+/// targets store as bf16 bits, the precision the trainer already sees on
+/// the batch wire. Reconstruction is exact apart from that bf16 rounding;
+/// the context invariant is validated at append.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct StoredReplayRow {
+    step_index: u32,
+    root: ReplayGraphContext,
+    state: ReplayGraphContext,
+    action_history: Vec<PortableSearchActionRef>,
+    legal_actions: Vec<StoredLegalAction>,
+    policy_target_bf16: Vec<u16>,
+    selected_action: PortableSearchActionRef,
+    value_target: Option<f32>,
+    reward_target: Option<f32>,
+    final_measure: MeasureSummary,
+    model_version: Option<ModelVersion>,
+    search_config_hash: SearchConfigHash,
+    feature_row: Option<Vec<u8>>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) enum StoredLegalAction {
+    Candidate(CandidateHash),
+    Stop,
+}
+
+impl StoredReplayRow {
+    pub(crate) fn from_row(row: &ReplayRow) -> ReplayResult<Self> {
+        let mut legal_actions = Vec::with_capacity(row.legal_actions.len());
+        for action in &row.legal_actions {
+            legal_actions.push(match action {
+                PortableSearchActionRef::Candidate(candidate) => {
+                    if candidate.context != row.state {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                    StoredLegalAction::Candidate(candidate.candidate_hash)
+                }
+                PortableSearchActionRef::Stop { context } => {
+                    if *context != row.state {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                    StoredLegalAction::Stop
+                }
+            });
+        }
+
+        Ok(Self {
+            step_index: row.step_index,
+            root: row.root,
+            state: row.state,
+            action_history: row.action_history.clone(),
+            legal_actions,
+            policy_target_bf16: row
+                .policy_target
+                .iter()
+                .copied()
+                .map(f32_to_bf16_bits)
+                .collect(),
+            selected_action: row.selected_action,
+            value_target: row.value_target,
+            reward_target: row.reward_target,
+            final_measure: row.final_measure.clone(),
+            model_version: row.model_version,
+            search_config_hash: row.search_config_hash,
+            feature_row: row.feature_row.clone(),
+        })
+    }
+
+    pub(crate) fn into_row(self) -> ReplayRow {
+        let state = self.state;
+        let legal_actions = self
+            .legal_actions
+            .into_iter()
+            .map(|action| match action {
+                StoredLegalAction::Candidate(hash) => {
+                    PortableSearchActionRef::candidate(PortableCandidateRef::new(state, hash))
+                }
+                StoredLegalAction::Stop => PortableSearchActionRef::stop(state),
+            })
+            .collect();
+
+        ReplayRow {
+            step_index: self.step_index,
+            root: self.root,
+            state,
+            action_history: self.action_history,
+            legal_actions,
+            policy_target: self
+                .policy_target_bf16
+                .into_iter()
+                .map(bf16_bits_to_f32)
+                .collect(),
+            selected_action: self.selected_action,
+            value_target: self.value_target,
+            reward_target: self.reward_target,
+            final_measure: self.final_measure,
+            model_version: self.model_version,
+            search_config_hash: self.search_config_hash,
+            feature_row: self.feature_row,
+        }
+    }
 }
 
 pub(crate) fn validate_episode(

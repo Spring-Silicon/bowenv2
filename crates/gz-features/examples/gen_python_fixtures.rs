@@ -1,6 +1,6 @@
 use gz_features::{
     ActionFeature, FeatureCollator, FeatureEdge, FeatureRow, FeatureSchema, FeatureSchemaConfig,
-    PositionFeatures,
+    PositionFeatures, RowTargets, encode_training_targets,
 };
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -15,6 +15,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_attr1(out_dir.join("batch_attr1.gzfb"))?;
     write_attr0(out_dir.join("batch_attr0.gzfb"))?;
     write_expander(out_dir.join("batch_expander.gzfb"))?;
+    write_targets(out_dir.join("targets.gzft"))?;
+    Ok(())
+}
+
+fn write_targets(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let targets = [
+        RowTargets {
+            policy: vec![0.75, 0.25, 0.0],
+            value: Some(1.0),
+            reward: 2.5,
+        },
+        RowTargets {
+            policy: vec![1.0, 0.0, 0.0],
+            value: Some(-1.0),
+            reward: -3.0,
+        },
+    ];
+    let mut bytes = Vec::new();
+    encode_training_targets(&targets, 2, 3, &mut bytes)?;
+    std::fs::write(path, &bytes)?;
     Ok(())
 }
 

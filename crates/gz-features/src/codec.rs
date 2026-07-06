@@ -1,3 +1,4 @@
+use crate::wire::{bf16_bits_to_f32, f32_to_bf16_bits};
 use crate::{
     ActionFeature, ENCODING_VERSION, FeatureEdge, FeatureError, FeatureResult, FeatureRow,
     FeatureSchema, FeatureSchemaConfig, FeatureSchemaHash, PositionFeatures,
@@ -52,6 +53,15 @@ pub fn encode_feature_row(
     out: &mut Vec<u8>,
 ) -> FeatureResult<()> {
     row.validate(schema)?;
+    // v2 packs node indexes and kind tokens as u16 (rows persist in replay
+    // stores, so this is the storage half of the wire-narrowing work) and
+    // floats as bf16, matching the batch encoding's precision exactly:
+    // the trainer sees identical numerics either way.
+    if schema.config().max_nodes > u32::from(u16::MAX) {
+        return Err(FeatureError::InvalidEncoding(
+            "max_nodes exceeds u16 row width",
+        ));
+    }
 
     out.clear();
     out.extend_from_slice(ROW_MAGIC);
@@ -66,30 +76,32 @@ pub fn encode_feature_row(
 
     write_u32(out, row.node_attrs.len() as u32);
     for value in &row.node_attrs {
-        write_f32(out, *value);
+        write_bf16(out, *value);
     }
 
     write_u32(out, row.edges.len() as u32);
     for edge in &row.edges {
-        write_u32(out, edge.src);
-        write_u32(out, edge.dst);
+        write_u16(out, narrow_index(edge.src, "edge src")?);
+        write_u16(out, narrow_index(edge.dst, "edge dst")?);
         out.push(edge.edge_type);
     }
 
     write_u32(out, row.actions.len() as u32);
     for action in &row.actions {
-        write_u32(out, action.kind_token);
-        write_f32(out, action.static_prior);
-        write_u32(out, action.subjects.len() as u32);
+        write_u16(out, narrow_index(action.kind_token, "action kind token")?);
+        write_bf16(out, action.static_prior);
+        let subject_count = u8::try_from(action.subjects.len())
+            .map_err(|_| FeatureError::InvalidEncoding("subject count exceeds u8"))?;
+        out.push(subject_count);
         for subject in &action.subjects {
-            write_u32(out, *subject);
+            write_u16(out, narrow_index(*subject, "action subject")?);
         }
     }
 
     write_u32(out, row.position.root_step);
     write_u32(out, row.position.leaf_depth);
-    write_f32(out, row.position.budget_fraction);
-    write_f32(out, row.position.budget_step);
+    write_bf16(out, row.position.budget_fraction);
+    write_bf16(out, row.position.budget_step);
     Ok(())
 }
 
@@ -107,7 +119,7 @@ pub fn decode_feature_row(bytes: &[u8]) -> FeatureResult<FeatureRow> {
         return Err(FeatureError::InvalidEncoding("node token length mismatch"));
     }
 
-    let node_attrs = reader.f32_vec()?;
+    let node_attrs = reader.bf16_vec()?;
     if node_attrs.iter().any(|value| !value.is_finite()) {
         return Err(FeatureError::InvalidEncoding("non-finite node attr"));
     }
@@ -116,8 +128,8 @@ pub fn decode_feature_row(bytes: &[u8]) -> FeatureResult<FeatureRow> {
     let mut edges = Vec::with_capacity(edge_count);
     for _ in 0..edge_count {
         let edge = FeatureEdge {
-            src: reader.u32()?,
-            dst: reader.u32()?,
+            src: u32::from(reader.u16()?),
+            dst: u32::from(reader.u16()?),
             edge_type: reader.u8()?,
         };
         if edge.src >= node_count || edge.dst >= node_count {
@@ -132,16 +144,19 @@ pub fn decode_feature_row(bytes: &[u8]) -> FeatureResult<FeatureRow> {
     }
     let mut actions = Vec::with_capacity(action_count);
     for _ in 0..action_count {
-        let kind_token = reader.u32()?;
-        let static_prior = reader.f32()?;
+        let kind_token = u32::from(reader.u16()?);
+        let static_prior = reader.bf16()?;
         if !static_prior.is_finite() {
             return Err(FeatureError::InvalidEncoding("non-finite action prior"));
         }
-        let subjects = reader.u32_vec()?;
-        for subject in &subjects {
-            if *subject >= node_count {
+        let subject_count = usize::from(reader.u8()?);
+        let mut subjects = Vec::with_capacity(subject_count);
+        for _ in 0..subject_count {
+            let subject = u32::from(reader.u16()?);
+            if subject >= node_count {
                 return Err(FeatureError::InvalidEncoding("action subject out of range"));
             }
+            subjects.push(subject);
         }
         actions.push(ActionFeature {
             kind_token,
@@ -153,8 +168,8 @@ pub fn decode_feature_row(bytes: &[u8]) -> FeatureResult<FeatureRow> {
     let position = PositionFeatures {
         root_step: reader.u32()?,
         leaf_depth: reader.u32()?,
-        budget_fraction: reader.f32()?,
-        budget_step: reader.f32()?,
+        budget_fraction: reader.bf16()?,
+        budget_step: reader.bf16()?,
     };
     if !position.budget_fraction.is_finite() || !position.budget_step.is_finite() {
         return Err(FeatureError::InvalidEncoding("non-finite position feature"));
@@ -426,11 +441,21 @@ impl<'a> Reader<'a> {
         ))
     }
 
-    fn f32(&mut self) -> FeatureResult<f32> {
-        let bytes = self.take(4, "f32 truncated")?;
-        Ok(f32::from_le_bytes(
+    fn bf16(&mut self) -> FeatureResult<f32> {
+        let bytes = self.take(2, "bf16 truncated")?;
+        Ok(bf16_bits_to_f32(u16::from_le_bytes(
             bytes.try_into().expect("length checked"),
-        ))
+        )))
+    }
+
+    fn bf16_vec(&mut self) -> FeatureResult<Vec<f32>> {
+        let count = self.len()?;
+        self.ensure_count(count, 2)?;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.bf16()?);
+        }
+        Ok(out)
     }
 
     fn len(&mut self) -> FeatureResult<usize> {
@@ -443,26 +468,6 @@ impl<'a> Reader<'a> {
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
             out.push(self.u16()?);
-        }
-        Ok(out)
-    }
-
-    fn u32_vec(&mut self) -> FeatureResult<Vec<u32>> {
-        let count = self.len()?;
-        self.ensure_count(count, 4)?;
-        let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            out.push(self.u32()?);
-        }
-        Ok(out)
-    }
-
-    fn f32_vec(&mut self) -> FeatureResult<Vec<f32>> {
-        let count = self.len()?;
-        self.ensure_count(count, 4)?;
-        let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            out.push(self.f32()?);
         }
         Ok(out)
     }
@@ -519,8 +524,12 @@ fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn write_f32(out: &mut Vec<u8>, value: f32) {
-    out.extend_from_slice(&value.to_le_bytes());
+fn write_bf16(out: &mut Vec<u8>, value: f32) {
+    out.extend_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
+}
+
+fn narrow_index(value: u32, what: &'static str) -> FeatureResult<u16> {
+    u16::try_from(value).map_err(|_| FeatureError::InvalidEncoding(what))
 }
 
 fn section(cursor: &mut usize, len: usize) -> usize {

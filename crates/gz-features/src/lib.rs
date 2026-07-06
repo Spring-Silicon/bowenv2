@@ -7,6 +7,7 @@ mod collator;
 mod error;
 mod row;
 mod schema;
+mod wire;
 
 pub use codec::{
     RowTargets, TrainingTargetsView, decode_feature_row, decode_feature_schema_config,
@@ -22,6 +23,7 @@ pub use schema::{
     BATCH_ENCODING_VERSION, ENCODING_VERSION, FeatureSchema, FeatureSchemaConfig,
     FeatureSchemaHash, STOP_ACTION_KIND_TOKEN,
 };
+pub use wire::{bf16_bits_to_f32, f32_to_bf16_bits};
 
 use gz_engine::GraphEngine;
 
