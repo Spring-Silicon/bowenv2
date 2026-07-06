@@ -67,7 +67,6 @@ fn replay_serve_returns_feature_batch_and_targets() {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     })
     .unwrap();
@@ -171,7 +170,6 @@ fn replay_serve_rejects_featureless_store() {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     })
     .unwrap();
@@ -373,7 +371,6 @@ fn in_process_sample_service_serves_during_production() {
             workers_per_lane: NonZeroUsize::new(2).unwrap(),
             max_batch: NonZeroUsize::new(2).unwrap(),
             flush_after: Duration::from_millis(1),
-            eval_cache_capacity: 0,
         },
     );
     let run = orchestrator
@@ -431,7 +428,6 @@ fn live_backpressure_gates_production_until_the_consumer_drains() {
             workers_per_lane: NonZeroUsize::new(1).unwrap(),
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
-            eval_cache_capacity: 0,
         },
     );
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -485,7 +481,6 @@ fn replay_serve_reacks_a_repeated_hello_on_a_live_connection() {
             workers_per_lane: NonZeroUsize::new(1).unwrap(),
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
-            eval_cache_capacity: 0,
         },
     );
     orchestrator
@@ -535,7 +530,6 @@ fn serve_survives_a_failed_connection_and_accepts_the_next() {
             workers_per_lane: NonZeroUsize::new(1).unwrap(),
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
-            eval_cache_capacity: 0,
         },
     );
     orchestrator

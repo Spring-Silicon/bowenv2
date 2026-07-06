@@ -3,7 +3,7 @@ use crate::serial::OrchestratedEpisode;
 use crate::service::{internal, service_engine_work};
 use crate::{EpisodeId, WorkerId};
 use gz_engine::{EngineResult, GraphEngine};
-use gz_eval::{EvalOutput, EvalRequest, NnEvalCache};
+use gz_eval::{EvalOutput, EvalRequest};
 use gz_features::{FeatureExtractor, FeatureRow, PositionFeatures};
 use gz_search::{
     EngineIdentity, GumbelEpisodeTask, GumbelHandleBatch, GumbelMcts, SearchPoll, SearchWork,
@@ -71,11 +71,9 @@ impl<G, C> SlotState<G, C> {
         }
     }
 
-    fn take_parked(&mut self) -> Option<(ActiveEpisode<G, C>, EvalRequest)> {
+    fn take_parked(&mut self) -> Option<ActiveEpisode<G, C>> {
         match self.take() {
-            Self::Parked {
-                episode, request, ..
-            } => Some((episode, request)),
+            Self::Parked { episode, .. } => Some(episode),
             other => {
                 *self = other;
                 None
@@ -178,7 +176,6 @@ where
         engine: &mut E,
         blocked_message: &'static str,
         mut extractor: Option<&mut dyn FeatureExtractor<E>>,
-        mut eval_cache: Option<&mut NnEvalCache>,
     ) -> EngineResult<Vec<OrchestratedEpisode<G, C>>>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
@@ -220,22 +217,6 @@ where
                             release_task_all(engine, &mut episode.task)?;
                             return Err(internal("unsupported search work"));
                         };
-                        // A cache hit resumes inline like engine-serviced
-                        // work: no feature extraction, no round trip.
-                        if let Some(output) = eval_cache
-                            .as_deref_mut()
-                            .and_then(|cache| cache.lookup(&work.request))
-                        {
-                            if let Err(error) =
-                                episode.task.resume(token, SearchWorkResult::Eval(output))
-                            {
-                                release_task_all(engine, &mut episode.task)?;
-                                return Err(error);
-                            }
-                            release_task_releasable(engine, &mut episode.task)?;
-                            slot.state = SlotState::Running(episode);
-                            continue;
-                        }
                         let action_count = match u32::try_from(work.request.actions.len()) {
                             Ok(action_count) => action_count,
                             Err(_) => {
@@ -344,7 +325,6 @@ where
         slot_index: usize,
         token: WorkToken,
         output: EvalOutput,
-        eval_cache: Option<&mut NnEvalCache>,
     ) -> EngineResult<()>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
@@ -361,13 +341,10 @@ where
             return Err(internal("unknown work token"));
         }
 
-        let (mut episode, request) = slot
+        let mut episode = slot
             .state
             .take_parked()
             .expect("token check ensures the slot is parked");
-        if let Some(cache) = eval_cache {
-            cache.insert(&request, &output);
-        }
         if let Err(error) = episode.task.resume(token, SearchWorkResult::Eval(output)) {
             release_task_all(engine, &mut episode.task)?;
             return Err(error);

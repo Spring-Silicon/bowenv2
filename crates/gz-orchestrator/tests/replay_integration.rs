@@ -86,7 +86,6 @@ fn config(workers_per_lane: usize) -> ThreadedOrchestratorConfig {
         workers_per_lane: NonZeroUsize::new(workers_per_lane).unwrap(),
         max_batch: NonZeroUsize::new(8).unwrap(),
         flush_after: Duration::from_millis(20),
-        eval_cache_capacity: 0,
     }
 }
 

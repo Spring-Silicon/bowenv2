@@ -59,7 +59,7 @@ where
                 roots_exhausted = pool.admit(&mut self.engine, roots, &mut admission)?.1;
             }
 
-            episodes.extend(pool.drive(&mut self.engine, "batched driver blocked", None, None)?);
+            episodes.extend(pool.drive(&mut self.engine, "batched driver blocked", None)?);
 
             if roots_exhausted && !pool.active() {
                 return Ok(BatchedRun {
@@ -81,7 +81,7 @@ where
             batch_sizes.push(requests.len());
 
             for (parked, output) in parked.into_iter().zip(outputs) {
-                pool.resume(&mut self.engine, parked.slot, parked.token, output, None)?;
+                pool.resume(&mut self.engine, parked.slot, parked.token, output)?;
             }
         }
     }

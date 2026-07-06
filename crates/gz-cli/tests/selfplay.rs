@@ -91,7 +91,6 @@ fn selfplay_run_writes_replay_rows() {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     })
     .unwrap();
@@ -132,7 +131,6 @@ fn selfplay_run_supports_stub_evaluator() {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     })
     .unwrap();
@@ -170,7 +168,6 @@ fn selfplay_run_supports_self_average_reference() {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     })
     .unwrap();
@@ -209,7 +206,6 @@ fn selfplay_run_supports_policy_reference() {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     })
     .unwrap();
@@ -220,56 +216,6 @@ fn selfplay_run_supports_policy_reference() {
     // unlabeled; every later episode labels against the rollout scalar.
     let labeled = summary.wins + summary.losses + summary.ties;
     assert_eq!(labeled, 3);
-}
-
-#[test]
-fn eval_cache_preserves_outcomes() {
-    // Identical fixed-seed runs with the cache off and on: hits replay
-    // exact per-row outputs, so episodes, rows, and labels must match.
-    let run_with_cache = |eval_cache: usize| {
-        let dir = TestDir::new();
-        run(SelfplayConfig {
-            replay_dir: Some(dir.path().to_path_buf()),
-            episodes: 6,
-            lanes: 1,
-            workers_per_lane: 2,
-            reference: ReferenceMode::SelfAverage,
-            root_mode: RootMode::Fixed,
-            reference_ema_decay: 0.9,
-            seed: 17,
-            max_steps: 4,
-            simulations: 4,
-            max_considered: 4,
-            gumbel_scale: 0.5,
-            tree_reuse: true,
-            max_candidates: 255,
-            max_batch: 2,
-            evaluator: EvaluatorMode::Stub,
-            python_dir: None,
-            checkpoint_dir: None,
-            eval_device: None,
-            eval_poll_interval: None,
-            serve_socket: None,
-            serve_max_batch: 512,
-            replay_backlog: None,
-            replay_retain: None,
-            eval_cache,
-            position_features: true,
-        })
-        .unwrap()
-    };
-
-    let uncached = run_with_cache(0);
-    let cached = run_with_cache(4096);
-
-    assert_eq!(cached.episodes_appended, uncached.episodes_appended);
-    assert_eq!(cached.rows_produced, uncached.rows_produced);
-    assert_eq!(
-        (cached.wins, cached.losses, cached.ties),
-        (uncached.wins, uncached.losses, uncached.ties)
-    );
-    // The cache must actually engage: fewer eval rows reach the backend.
-    assert!(cached.eval_batch_count > 0);
 }
 
 #[test]
@@ -312,7 +258,6 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     }
 }
@@ -495,7 +440,6 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         serve_max_batch: 512,
         replay_backlog: None,
         replay_retain: None,
-        eval_cache: 0,
         position_features: true,
     })
     .unwrap();

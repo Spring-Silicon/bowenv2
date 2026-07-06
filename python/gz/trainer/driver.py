@@ -70,8 +70,6 @@ class SelfplayConfig:
     seed: int = 0
     max_batch: int = 16
     python_dir: str = "python"
-    # Per-lane NN eval cache entries; 0 disables (opt-in).
-    eval_cache: int = 0
     # Export real position features to evals/rows; off = graph + opponent only.
     position_features: bool = True
 
@@ -671,8 +669,6 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             config.selfplay.root_mode,
             "--reference-ema-decay",
             str(config.selfplay.reference_ema_decay),
-            "--eval-cache",
-            str(config.selfplay.eval_cache),
             "--position-features",
             "true" if config.selfplay.position_features else "false",
             "--evaluator",
