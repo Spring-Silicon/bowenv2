@@ -165,6 +165,7 @@ fn search(engine: &WhittleEngine) -> GumbelMcts {
         c_scale: 1.0,
         temperature_moves: 0,
         tree_reuse: false,
+        export_position: true,
         candidate_options: CandidateOptions::default(),
         measure_options: measure_options(engine),
     })

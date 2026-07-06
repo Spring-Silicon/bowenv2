@@ -182,6 +182,15 @@ where
     }
 
     pub(super) fn position(&self, leaf_depth: usize) -> EvalPositionContext {
+        if !self.context.export_position {
+            return EvalPositionContext {
+                root_step: 0,
+                leaf_depth: 0,
+                budget_fraction: 0.0,
+                budget_step: 0.0,
+                opponent: self.context.opponent.map(Into::into),
+            };
+        }
         EvalPositionContext {
             root_step: self.context.root_step,
             leaf_depth: leaf_depth as u32,

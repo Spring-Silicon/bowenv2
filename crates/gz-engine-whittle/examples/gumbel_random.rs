@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         c_scale: 1.0,
         temperature_moves: 0,
         tree_reuse: false,
+        export_position: true,
         candidate_options: CandidateOptions::default(),
         measure_options: engine.measure_options(),
     });

@@ -68,6 +68,7 @@ fn replay_serve_returns_feature_batch_and_targets() {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     })
     .unwrap();
     let expected_schema_config = ReplayStore::open(dir.path())
@@ -171,6 +172,7 @@ fn replay_serve_rejects_featureless_store() {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     })
     .unwrap();
 
@@ -278,6 +280,7 @@ fn live_setup(
         c_scale: 1.0,
         temperature_moves: 0,
         tree_reuse: false,
+        export_position: true,
         candidate_options: gz_engine::CandidateOptions {
             max_candidates: Some(255),
             deterministic_order: true,

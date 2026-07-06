@@ -92,6 +92,7 @@ fn selfplay_run_writes_replay_rows() {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     })
     .unwrap();
     let store = ReplayStore::open(dir.path()).unwrap();
@@ -132,6 +133,7 @@ fn selfplay_run_supports_stub_evaluator() {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     })
     .unwrap();
 
@@ -169,6 +171,7 @@ fn selfplay_run_supports_self_average_reference() {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     })
     .unwrap();
 
@@ -207,6 +210,7 @@ fn selfplay_run_supports_policy_reference() {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     })
     .unwrap();
 
@@ -250,6 +254,7 @@ fn eval_cache_preserves_outcomes() {
             replay_backlog: None,
             replay_retain: None,
             eval_cache,
+            position_features: true,
         })
         .unwrap()
     };
@@ -308,6 +313,7 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     }
 }
 
@@ -490,6 +496,7 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         replay_backlog: None,
         replay_retain: None,
         eval_cache: 0,
+        position_features: true,
     })
     .unwrap();
     assert_eq!(summary.episodes_appended, 6);

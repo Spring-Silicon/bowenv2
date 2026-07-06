@@ -1233,20 +1233,26 @@ where
             &mut candidates,
         )?;
         created_candidates.extend(candidates.iter().copied());
-        let (budget_fraction, budget_step) = search.root_budget(index);
-        let root_step = u32::try_from(index).map_err(|_| internal("root step overflow"))?;
+        // Mirror the eval-side export gate: rows must train the model on
+        // the same position inputs it served with.
+        let position = if search.config().export_position {
+            let (budget_fraction, budget_step) = search.root_budget(index);
+            PositionFeatures {
+                root_step: u32::try_from(index).map_err(|_| internal("root step overflow"))?,
+                leaf_depth: 0,
+                budget_fraction,
+                budget_step,
+            }
+        } else {
+            PositionFeatures {
+                root_step: 0,
+                leaf_depth: 0,
+                budget_fraction: 0.0,
+                budget_step: 0.0,
+            }
+        };
         let row = extractor
-            .extract(
-                engine,
-                step.before,
-                &candidates,
-                PositionFeatures {
-                    root_step,
-                    leaf_depth: 0,
-                    budget_fraction,
-                    budget_step,
-                },
-            )
+            .extract(engine, step.before, &candidates, position)
             .map_err(|_| internal("feature extraction failed"))?;
         if row.actions.len() != step.legal_actions.len() {
             return Err(internal("feature row action count mismatch"));

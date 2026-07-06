@@ -23,6 +23,7 @@ fn search(engine: &WhittleEngine, tree_reuse: bool) -> GumbelMcts {
         temperature_moves: 0,
         tree_reuse,
         candidate_options: gz_engine::CandidateOptions::default(),
+        export_position: true,
         measure_options: engine.measure_options(),
     })
 }

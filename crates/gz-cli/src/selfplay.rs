@@ -58,6 +58,9 @@ pub struct SelfplayConfig {
     /// Per-lane NN eval cache entries; 0 disables. Opt-in: hits replay
     /// cached outputs bit-identically for the serving model version.
     pub eval_cache: usize,
+    /// Export real position features to evals and rows (default). Off
+    /// conditions the model on graph + opponent alone.
+    pub position_features: bool,
 }
 
 impl Default for SelfplayConfig {
@@ -88,6 +91,7 @@ impl Default for SelfplayConfig {
             replay_backlog: None,
             replay_retain: None,
             eval_cache: 0,
+            position_features: true,
         }
     }
 }
@@ -576,6 +580,7 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         c_scale: 1.0,
         temperature_moves: 0,
         tree_reuse: config.tree_reuse,
+        export_position: config.position_features,
         candidate_options: match config.evaluator {
             EvaluatorMode::Random => CandidateOptions::default(),
             EvaluatorMode::Stub | EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {

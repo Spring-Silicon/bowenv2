@@ -17,6 +17,13 @@ pub struct GumbelMctsConfig {
     pub c_scale: f32,
     pub temperature_moves: usize,
     pub tree_reuse: bool,
+    /// Export real position features (root_step, leaf_depth, budget) to
+    /// evals and feature rows. Off zeroes the exported values so the
+    /// model conditions on graph + opponent alone (and eval-cache keys
+    /// collide across steps/depths). The search itself always uses the
+    /// real values internally (noise seeding, budgets); deliberately not
+    /// part of the search config hash.
+    pub export_position: bool,
     pub candidate_options: CandidateOptions,
     pub measure_options: MeasureOptions,
 }
@@ -38,6 +45,9 @@ pub struct GumbelSearchContext {
     pub selection_temperature: f32,
     pub opponent: Option<GumbelOpponentContext>,
     pub noise_seed: u64,
+    /// See [`GumbelMctsConfig::export_position`]; consulted only when
+    /// exporting eval position contexts, never for search internals.
+    pub export_position: bool,
 }
 
 impl Default for GumbelSearchContext {
@@ -49,6 +59,7 @@ impl Default for GumbelSearchContext {
             selection_temperature: 0.0,
             opponent: None,
             noise_seed: 0,
+            export_position: true,
         }
     }
 }
