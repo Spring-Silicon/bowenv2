@@ -44,6 +44,7 @@ impl GumbelMcts {
             config.c_scale,
             config.temperature_moves,
             config.tree_reuse,
+            config.mask_stop,
             config.candidate_options,
             config.measure_options,
         );
@@ -61,8 +62,9 @@ impl GumbelMcts {
 
     /// The opponent-rollout search derived from this one: a single
     /// simulation over a single considered action with no noise -- a
-    /// greedy argmax-policy rollout at temperature 0. Step budget and
-    /// engine options carry over unchanged.
+    /// greedy argmax-policy rollout at temperature 0, with STOP masked
+    /// so the reference must play rewrites to its step budget. Step
+    /// budget and engine options carry over unchanged.
     #[must_use]
     pub fn policy_rollout(&self) -> Self {
         Self::new(GumbelMctsConfig {
@@ -71,6 +73,7 @@ impl GumbelMcts {
             gumbel_scale: 0.0,
             temperature_moves: 0,
             tree_reuse: false,
+            mask_stop: true,
             ..self.config
         })
     }

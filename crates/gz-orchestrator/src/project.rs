@@ -7,6 +7,7 @@ pub fn project_episode<G, C>(
     episode: &GumbelEpisode<G, C>,
     reference: Option<&Reference>,
     feature_rows: Option<&[Vec<u8>]>,
+    episode_id: u64,
 ) -> Option<(ReplayEpisodeRecord, Vec<ReplayRow>)> {
     let learner_reward = score(
         episode.final_measure.measured,
@@ -21,7 +22,7 @@ pub fn project_episode<G, C>(
 
     let final_measure = MeasureSummary::from(&episode.final_measure);
     let value_target =
-        reference.map(|reference| sign_target(learner_reward, reference.final_reward));
+        reference.map(|reference| sign_target(learner_reward, reference.final_reward, episode_id));
     let replay_reference = reference.map(|reference| ReplayReference {
         kind: reference.kind,
         reward: reference.final_reward,
@@ -81,12 +82,23 @@ fn score(measured: bool, valid: bool, scalar_reward: Option<f32>) -> Option<f32>
     }
 }
 
-fn sign_target(learner: f32, reference: f32) -> f32 {
+fn sign_target(learner: f32, reference: f32, episode_id: u64) -> f32 {
     if learner > reference {
         1.0
     } else if learner < reference {
         -1.0
     } else {
-        0.0
+        // Random tie-break (whittlezero's ptp_sign_tie_break: random). A
+        // zero target is a safe haven the search can lock onto: stopping
+        // at the root guarantees the tie, so visits, policy targets, and
+        // finally the argmax reference all converge on stop-at-root. A
+        // fair deterministic coin keeps every label hard +/-1. Salted so
+        // the coin is independent of the episode's Gumbel noise stream.
+        const TIE_SALT: u64 = 0x7469_655f_6272_6561; // "tie_brea"
+        if crate::root::episode_noise_seed(episode_id ^ TIE_SALT) & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        }
     }
 }

@@ -24,6 +24,12 @@ pub struct GumbelMctsConfig {
     /// real values internally (noise seeding, budgets); deliberately not
     /// part of the search config hash.
     pub export_position: bool,
+    /// Mask STOP out of node priors/logits wherever a rewrite exists
+    /// (STOP-only nodes keep it). Set by policy_rollout(): an argmax
+    /// reference that can stop converges to stop-at-root, freezing the
+    /// bar at root cost (whittlezero's rollouts exclude STOP the same
+    /// way). Part of the search config hash.
+    pub mask_stop: bool,
     pub candidate_options: CandidateOptions,
     pub measure_options: MeasureOptions,
 }

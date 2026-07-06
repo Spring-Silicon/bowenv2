@@ -265,8 +265,13 @@ fn validate_outcome(record: &ReplayEpisodeRecord) -> ReplayResult<()> {
                 return Err(ReplayError::InvalidRecord);
             }
 
-            let expected = sign_target(record.outcome.learner_reward, reference.reward);
-            if record.outcome.value_target != Some(expected) {
+            let valid = match sign_target(record.outcome.learner_reward, reference.reward) {
+                // Exact ties are coin-flipped to a hard +/-1 at projection
+                // (random tie-break); either sign is a valid tie label.
+                0.0 => matches!(record.outcome.value_target, Some(-1.0 | 1.0)),
+                expected => record.outcome.value_target == Some(expected),
+            };
+            if !valid {
                 return Err(ReplayError::InvalidRecord);
             }
         }
@@ -325,7 +330,9 @@ fn validate_row(
 
 fn validate_value_target(value: Option<f32>) -> ReplayResult<()> {
     match value {
-        Some(value) if value == -1.0 || value == 0.0 || value == 1.0 => Ok(()),
+        // Hard signs only: ties are coin-flipped at projection, so a
+        // stored zero target is a producer bug.
+        Some(value) if value == -1.0 || value == 1.0 => Ok(()),
         Some(_) => Err(ReplayError::InvalidRecord),
         None => Ok(()),
     }

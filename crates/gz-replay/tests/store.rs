@@ -81,17 +81,28 @@ fn admission_rejects_invalid_row_shapes() {
 }
 
 #[test]
-fn value_target_validation_accepts_only_loss_tie_or_win() {
+fn value_target_validation_accepts_hard_signs_only() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
 
+    // Exact tie (learner_reward == reference reward): coin-flipped to a
+    // hard sign at projection, so either +/-1 appends and 0.0 rejects.
     let (mut tie_record, mut tie_rows) = episode_with_rows(1);
-    tie_record.outcome.value_target = Some(0.0);
+    tie_record.outcome.value_target = Some(1.0);
     tie_record.outcome.reference.as_mut().unwrap().reward = 5.0;
-    tie_rows[0].value_target = Some(0.0);
+    tie_rows[0].value_target = Some(1.0);
     assert_eq!(
         store.append_episode(&tie_record, &tie_rows).unwrap(),
         ReplayEpisodeId::new(0)
+    );
+
+    let (mut zero_record, mut zero_rows) = episode_with_rows(1);
+    zero_record.outcome.value_target = Some(0.0);
+    zero_record.outcome.reference.as_mut().unwrap().reward = 5.0;
+    zero_rows[0].value_target = Some(0.0);
+    assert_eq!(
+        store.append_episode(&zero_record, &zero_rows).unwrap_err(),
+        ReplayError::InvalidRecord
     );
 
     let (mut loss_record, mut loss_rows) = episode_with_rows(1);

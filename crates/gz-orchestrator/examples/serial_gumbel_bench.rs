@@ -28,6 +28,7 @@ fn main() -> gz_engine::EngineResult<()> {
         temperature_moves: 0,
         tree_reuse: false,
         export_position: true,
+        mask_stop: false,
         candidate_options: CandidateOptions::default(),
         measure_options: engine.measure_options(),
     });

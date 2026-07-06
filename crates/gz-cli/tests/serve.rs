@@ -279,6 +279,7 @@ fn live_setup(
         temperature_moves: 0,
         tree_reuse: false,
         export_position: true,
+        mask_stop: false,
         candidate_options: gz_engine::CandidateOptions {
             max_candidates: Some(255),
             deterministic_order: true,

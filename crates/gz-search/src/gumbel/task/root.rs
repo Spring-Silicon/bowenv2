@@ -513,7 +513,7 @@ where
     ) -> usize {
         let priors = softmax(&output.policy_logits);
         let action_count = output.policy_logits.len();
-        let node = Node {
+        let mut node = Node {
             graph: expansion.graph,
             context: expansion.context,
             candidates: expansion.candidates,
@@ -533,6 +533,11 @@ where
             value_sum: vec![0.0; action_count],
             q: vec![0.0; action_count],
         };
+        if self.config.mask_stop && !node.candidates.is_empty() {
+            let stop = node.candidates.len();
+            node.logits[stop] = f32::NEG_INFINITY;
+            node.priors[stop] = 0.0;
+        }
 
         self.tree.eval_count += 1;
         self.tree.nodes.push(node);

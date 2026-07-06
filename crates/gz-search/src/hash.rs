@@ -54,13 +54,15 @@ pub fn gumbel_search_config_hash(
     c_scale: f32,
     temperature_moves: usize,
     tree_reuse: bool,
+    mask_stop: bool,
     candidate_options: CandidateOptions,
     measure_options: MeasureOptions,
 ) -> SearchConfigHash {
     let mut hasher = blake3::Hasher::new();
     // v3: reused roots credit carried visits against the simulation
     // budget (semantics change without a config-shape change).
-    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v3");
+    // v4: mask_stop joins the config shape.
+    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v4");
     update_u64(&mut hasher, max_steps as u64);
     update_u64(&mut hasher, simulations as u64);
     update_u64(&mut hasher, max_considered_actions as u64);
@@ -70,6 +72,7 @@ pub fn gumbel_search_config_hash(
     update_u32(&mut hasher, c_scale.to_bits());
     update_u64(&mut hasher, temperature_moves as u64);
     update_bool(&mut hasher, tree_reuse);
+    update_bool(&mut hasher, mask_stop);
     update_candidate_options(&mut hasher, candidate_options);
     update_measure_options(&mut hasher, measure_options);
     SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())

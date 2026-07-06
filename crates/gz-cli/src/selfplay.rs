@@ -575,6 +575,7 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         temperature_moves: 0,
         tree_reuse: config.tree_reuse,
         export_position: config.position_features,
+        mask_stop: false,
         candidate_options: match config.evaluator {
             EvaluatorMode::Random => CandidateOptions::default(),
             EvaluatorMode::Stub | EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {

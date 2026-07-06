@@ -975,8 +975,12 @@ where
             .ok_or_else(|| internal("missing replay reference"))?;
         self.summary.episodes_completed += 1;
 
-        if let Some((record, rows)) = project_episode(&completed.episode, reference.as_ref(), None)
-        {
+        if let Some((record, rows)) = project_episode(
+            &completed.episode,
+            reference.as_ref(),
+            None,
+            completed.episode_id.value(),
+        ) {
             let reward = record.outcome.learner_reward;
             let append = append_replay_job(&self.replay_tx, record, rows);
             release_episode_handles(engine, &completed.episode, &[])?;
@@ -1153,6 +1157,7 @@ where
             &completed.episode,
             reference.as_ref(),
             Some(&feature_rows.rows),
+            completed.episode_id.value(),
         ) {
             let reward = record.outcome.learner_reward;
             let append = append_replay_job(&self.replay.replay_tx, record, rows);

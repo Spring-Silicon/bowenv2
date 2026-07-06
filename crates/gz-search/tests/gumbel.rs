@@ -75,6 +75,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         temperature_moves: 0,
         tree_reuse: false,
         export_position: true,
+        mask_stop: false,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: measure_options(),
     }
@@ -173,6 +174,39 @@ fn stop_is_selected_through_eval_policy_and_never_applied() {
     assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
     assert!(matches!(episode.steps[0].action, SearchAction::Stop));
     assert!(engine.apply_calls.is_empty());
+}
+
+#[test]
+fn policy_rollout_masks_stop_wherever_a_rewrite_exists() {
+    let mut engine = TestEngine::new()
+        .candidates(0, [1])
+        .candidates(20, [])
+        .apply(0, 1, 20)
+        .reward(20, 20.0);
+    let mut evaluator = RecordedEvaluator::default()
+        .row(0, [-10.0, 10.0], 0.0)
+        .row(20, [0.0], 0.0);
+    let search = GumbelMcts::new(config(3)).policy_rollout();
+
+    let episode = search
+        .run(
+            &mut engine,
+            &mut evaluator,
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    // STOP dominates the eval policy at graph 0, but the rollout masks it
+    // wherever a rewrite exists -- the argmax reference must play. Graph 20
+    // is STOP-only, so STOP stays selectable there.
+    assert!(matches!(
+        episode.steps[0].action,
+        SearchAction::Candidate(1)
+    ));
+    assert_eq!(engine.apply_calls, vec![(0, 1)]);
+    assert_eq!(episode.final_graph, 20);
+    assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
 }
 
 #[test]
