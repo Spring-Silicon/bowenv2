@@ -26,6 +26,8 @@ pub struct NnEvalCache {
     version: Option<ModelVersion>,
     hits: u64,
     misses: u64,
+    version_start_hits: u64,
+    version_start_misses: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -71,6 +73,8 @@ impl NnEvalCache {
             version: None,
             hits: 0,
             misses: 0,
+            version_start_hits: 0,
+            version_start_misses: 0,
         }
     }
 
@@ -92,10 +96,11 @@ impl NnEvalCache {
     pub fn insert(&mut self, request: &EvalRequest, output: &EvalOutput) {
         match self.version {
             Some(version) if version == output.model_version => {}
-            Some(_) => {
+            Some(version) => {
                 // A reply from a different version: newer replies flush the
                 // cache; stragglers from before the swap are dropped. Both
                 // cases key off "not the version we cached for".
+                self.log_version_stats(version);
                 self.current.clear();
                 self.previous.clear();
                 self.version = Some(output.model_version);
@@ -103,6 +108,29 @@ impl NnEvalCache {
             None => self.version = Some(output.model_version),
         }
         self.insert_rotating(EvalCacheKey::new(request), output.clone());
+    }
+
+    /// Per-version window stats at each swap flush, for live runs whose
+    /// lanes never exit gracefully. Enabled by GZ_EVAL_CACHE_STATS.
+    fn log_version_stats(&mut self, version: ModelVersion) {
+        let hits = self.hits - self.version_start_hits;
+        let misses = self.misses - self.version_start_misses;
+        self.version_start_hits = self.hits;
+        self.version_start_misses = self.misses;
+        if std::env::var_os("GZ_EVAL_CACHE_STATS").is_none() {
+            return;
+        }
+        let total = hits + misses;
+        eprintln!(
+            "event=eval_cache_window version={:02x}{:02x} hits={hits} misses={misses} hit_rate={:.3}",
+            version.as_bytes()[0],
+            version.as_bytes()[1],
+            if total > 0 {
+                hits as f64 / total as f64
+            } else {
+                0.0
+            },
+        );
     }
 
     fn insert_rotating(&mut self, key: EvalCacheKey, output: EvalOutput) {
