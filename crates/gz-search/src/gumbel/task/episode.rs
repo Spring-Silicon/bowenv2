@@ -198,6 +198,13 @@ where
         }
     }
 
+    /// Completed-move count: the root step in play. Unlike the eval
+    /// request's exported root_step, this is never zeroed by
+    /// export_position.
+    pub fn step_index(&self) -> usize {
+        self.step_index
+    }
+
     pub fn take_releasable(&mut self) -> GumbelHandleBatch<G, C> {
         std::mem::take(&mut self.releasable)
     }

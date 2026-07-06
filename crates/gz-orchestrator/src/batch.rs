@@ -64,7 +64,12 @@ where
                 )?;
             }
 
-            episodes.extend(pool.drive(&mut self.engine, "batched driver blocked", None)?);
+            episodes.extend(pool.drive(
+                &mut self.engine,
+                "batched driver blocked",
+                None,
+                |_, _, _| {},
+            )?);
 
             if roots_exhausted && !pool.active() {
                 return Ok(BatchedRun {

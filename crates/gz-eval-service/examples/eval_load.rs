@@ -161,6 +161,7 @@ fn synthetic_row(batch: u64, row: u64) -> FeatureRow {
             opponent_reward: 0.0,
             opponent_present: false,
         },
+        opponent: None,
     }
 }
 

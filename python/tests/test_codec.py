@@ -52,6 +52,14 @@ def test_offset_arithmetic_and_zero_copy_with_attrs() -> None:
     assert view.position.tolist() == [[2.0, 3.0, 0.75, 0.125], [1.0, 0.0, 1.0, 0.5]]
     assert view.opponent_reward.tolist() == [0.5, -0.25]
     assert view.opponent_present.tolist() == [1, 1]
+    assert view.opponent_state_present.tolist() == [1, 1]
+    assert view.opponent_node_count.tolist() == [1, 2]
+    assert view.opponent_node_tokens.tolist() == [[5, 0, 0], [2, 1, 0]]
+    assert view.opponent_edge_count.tolist() == [0, 1]
+    assert view.opponent_edge_src.tolist() == [[0, 0], [1, 0]]
+    assert view.opponent_edge_dst.tolist() == [[0, 0], [0, 0]]
+    assert view.opponent_edge_type.tolist() == [[0, 0], [1, 0]]
+    assert view.opponent_position.tolist() == [[0.0, 0.0, 0.5, 0.0], [1.0, 0.0, 0.25, 0.0]]
 
     token_offset = _layout(2, 3, 2, 3, 2, 1)["node_tokens"]
     struct.pack_into("<H", buf, token_offset, 6)
@@ -164,6 +172,17 @@ def make_batch(attr_dim: int, schema_hash: bytes = SCHEMA_HASH, capacity: int = 
     _bf16(out, layout["opponent_reward"], [0.5, -0.25])
     out[layout["opponent_present"]] = 1
     out[layout["opponent_present"] + 1] = 1
+    out[layout["opponent_state_present"]] = 1
+    out[layout["opponent_state_present"] + 1] = 1
+    _u32(out, layout["opponent_node_count"], [1, 2])
+    _u16(out, layout["opponent_node_tokens"], [5, 0, 0, 2, 1, 0])
+    if d:
+        _bf16(out, layout["opponent_node_attrs"], [3.0, 0.0, 0.0, -0.5, 1.0, 0.0])
+    _u32(out, layout["opponent_edge_count"], [0, 1])
+    _u16(out, layout["opponent_edge_src"], [0, 0, 1, 0])
+    _u16(out, layout["opponent_edge_dst"], [0, 0, 0, 0])
+    out[layout["opponent_edge_type"] + 2] = 1
+    _bf16(out, layout["opponent_position"], [0.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.25, 0.0])
     return bytes(out)
 
 
@@ -186,6 +205,15 @@ def _layout(b: int, n: int, e: int, a: int, s: int, d: int) -> dict[str, int]:
         ("position", b * 4 * 2),
         ("opponent_reward", b * 2),
         ("opponent_present", b),
+        ("opponent_state_present", b),
+        ("opponent_node_count", b * 4),
+        ("opponent_node_tokens", b * n * 2),
+        ("opponent_node_attrs", b * n * d * 2),
+        ("opponent_edge_count", b * 4),
+        ("opponent_edge_src", b * e * 2),
+        ("opponent_edge_dst", b * e * 2),
+        ("opponent_edge_type", b * e),
+        ("opponent_position", b * 4 * 2),
     ]:
         cursor = _align4(cursor)
         out[name] = cursor

@@ -185,6 +185,7 @@ fn reference(
         final_graph: Some(episode.root_context),
         steps: vec![ReferenceStep {
             context: episode.root_context,
+            features: None,
         }],
         search_config_hash: None,
         model_version: None,

@@ -177,6 +177,7 @@ pub fn feature_row_bytes(step_index: u32, action_count: usize) -> Vec<u8> {
             opponent_reward: 0.0,
             opponent_present: false,
         },
+        opponent: None,
     };
     for index in 0..action_count.saturating_sub(1) {
         row.actions.push(ActionFeature {

@@ -176,14 +176,16 @@ where
         false
     }
 
-    pub(crate) fn drive<E>(
+    pub(crate) fn drive<E, F>(
         &mut self,
         engine: &mut E,
         blocked_message: &'static str,
         mut extractor: Option<&mut dyn FeatureExtractor<E>>,
+        mut decorate_row: F,
     ) -> EngineResult<Vec<OrchestratedEpisode<G, C>>>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
+        F: FnMut(EpisodeId, u32, &mut FeatureRow),
     {
         let mut completed = Vec::new();
 
@@ -239,7 +241,22 @@ where
                                     &work.candidates,
                                     position,
                                 ) {
-                                    Ok(row) => Some(row),
+                                    Ok(mut row) => {
+                                        // The task's real step, not the request's
+                                        // root_step: export_position zeroes the
+                                        // latter, and opponent alignment must
+                                        // match the row projection's real index.
+                                        let root_step =
+                                            match u32::try_from(episode.task.step_index()) {
+                                                Ok(root_step) => root_step,
+                                                Err(_) => {
+                                                    release_task_all(engine, &mut episode.task)?;
+                                                    return Err(internal("root step overflow"));
+                                                }
+                                            };
+                                        decorate_row(episode.episode_id, root_step, &mut row);
+                                        Some(row)
+                                    }
                                     Err(_) => {
                                         release_task_all(engine, &mut episode.task)?;
                                         return Err(internal("feature extraction failed"));

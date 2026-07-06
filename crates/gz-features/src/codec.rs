@@ -1,7 +1,7 @@
 use crate::wire::{bf16_bits_to_f32, f32_to_bf16_bits};
 use crate::{
     ActionFeature, ENCODING_VERSION, FeatureEdge, FeatureError, FeatureResult, FeatureRow,
-    FeatureSchema, FeatureSchemaConfig, FeatureSchemaHash, PositionFeatures,
+    FeatureSchema, FeatureSchemaConfig, FeatureSchemaHash, OpponentStateFeatures, PositionFeatures,
 };
 
 const ROW_MAGIC: &[u8; 4] = b"GZFR";
@@ -69,22 +69,13 @@ pub fn encode_feature_row(
     out.extend_from_slice(schema.hash().as_bytes());
     write_u32(out, row.node_count);
 
-    write_u32(out, row.node_tokens.len() as u32);
-    for token in &row.node_tokens {
-        write_u16(out, *token);
-    }
-
-    write_u32(out, row.node_attrs.len() as u32);
-    for value in &row.node_attrs {
-        write_bf16(out, *value);
-    }
-
-    write_u32(out, row.edges.len() as u32);
-    for edge in &row.edges {
-        write_u16(out, narrow_index(edge.src, "edge src")?);
-        write_u16(out, narrow_index(edge.dst, "edge dst")?);
-        out.push(edge.edge_type);
-    }
+    write_state_body(
+        row.node_count,
+        &row.node_tokens,
+        &row.node_attrs,
+        &row.edges,
+        out,
+    )?;
 
     write_u32(out, row.actions.len() as u32);
     for action in &row.actions {
@@ -98,12 +89,22 @@ pub fn encode_feature_row(
         }
     }
 
-    write_u32(out, row.position.root_step);
-    write_u32(out, row.position.leaf_depth);
-    write_bf16(out, row.position.budget_fraction);
-    write_bf16(out, row.position.budget_step);
-    write_bf16(out, row.position.opponent_reward);
-    out.push(u8::from(row.position.opponent_present));
+    write_position(out, row.position);
+    match &row.opponent {
+        Some(opponent) => {
+            out.push(1);
+            write_u32(out, opponent.node_count);
+            write_state_body(
+                opponent.node_count,
+                &opponent.node_tokens,
+                &opponent.node_attrs,
+                &opponent.edges,
+                out,
+            )?;
+            write_position(out, opponent.position);
+        }
+        None => out.push(0),
+    }
     Ok(())
 }
 
@@ -112,33 +113,7 @@ pub fn decode_feature_row(bytes: &[u8]) -> FeatureResult<FeatureRow> {
     let mut reader = Reader::new(&bytes[ROW_HEADER_LEN..]);
 
     let node_count = reader.u32()?;
-    if node_count == 0 {
-        return Err(FeatureError::InvalidEncoding("zero node count"));
-    }
-
-    let node_tokens = reader.u16_vec()?;
-    if node_tokens.len() != node_count as usize {
-        return Err(FeatureError::InvalidEncoding("node token length mismatch"));
-    }
-
-    let node_attrs = reader.bf16_vec()?;
-    if node_attrs.iter().any(|value| !value.is_finite()) {
-        return Err(FeatureError::InvalidEncoding("non-finite node attr"));
-    }
-
-    let edge_count = reader.len()?;
-    let mut edges = Vec::with_capacity(edge_count);
-    for _ in 0..edge_count {
-        let edge = FeatureEdge {
-            src: u32::from(reader.u16()?),
-            dst: u32::from(reader.u16()?),
-            edge_type: reader.u8()?,
-        };
-        if edge.src >= node_count || edge.dst >= node_count {
-            return Err(FeatureError::InvalidEncoding("edge endpoint out of range"));
-        }
-        edges.push(edge);
-    }
+    let (node_tokens, node_attrs, edges) = read_state_body(&mut reader, node_count)?;
 
     let action_count = reader.len()?;
     if action_count == 0 {
@@ -167,6 +142,123 @@ pub fn decode_feature_row(bytes: &[u8]) -> FeatureResult<FeatureRow> {
         });
     }
 
+    let position = read_position(&mut reader)?;
+    let opponent = if reader.u8()? != 0 {
+        let node_count = reader.u32()?;
+        let (node_tokens, node_attrs, edges) = read_state_body(&mut reader, node_count)?;
+        let position = read_position(&mut reader)?;
+        Some(OpponentStateFeatures {
+            node_count,
+            node_tokens,
+            node_attrs,
+            edges,
+            position,
+        })
+    } else {
+        None
+    };
+    if !reader.is_empty() {
+        return Err(FeatureError::InvalidEncoding("trailing row bytes"));
+    }
+
+    Ok(FeatureRow {
+        node_count,
+        node_tokens,
+        node_attrs,
+        edges,
+        actions,
+        position,
+        opponent,
+    })
+}
+
+pub fn validate_feature_row_header(
+    bytes: &[u8],
+    expected: &FeatureSchemaHash,
+) -> FeatureResult<()> {
+    let schema_hash = parse_row_header(bytes)?;
+    if &schema_hash != expected {
+        return Err(FeatureError::InvalidEncoding(
+            "feature schema hash mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn write_state_body(
+    node_count: u32,
+    node_tokens: &[u16],
+    node_attrs: &[f32],
+    edges: &[FeatureEdge],
+    out: &mut Vec<u8>,
+) -> FeatureResult<()> {
+    if node_tokens.len() != node_count as usize {
+        return Err(FeatureError::InvalidEncoding("node token length mismatch"));
+    }
+    write_u32(out, node_tokens.len() as u32);
+    for token in node_tokens {
+        write_u16(out, *token);
+    }
+
+    write_u32(out, node_attrs.len() as u32);
+    for value in node_attrs {
+        write_bf16(out, *value);
+    }
+
+    write_u32(out, edges.len() as u32);
+    for edge in edges {
+        write_u16(out, narrow_index(edge.src, "edge src")?);
+        write_u16(out, narrow_index(edge.dst, "edge dst")?);
+        out.push(edge.edge_type);
+    }
+    Ok(())
+}
+
+fn read_state_body(
+    reader: &mut Reader<'_>,
+    node_count: u32,
+) -> FeatureResult<(Vec<u16>, Vec<f32>, Vec<FeatureEdge>)> {
+    if node_count == 0 {
+        return Err(FeatureError::InvalidEncoding("zero node count"));
+    }
+
+    let node_tokens = reader.u16_vec()?;
+    if node_tokens.len() != node_count as usize {
+        return Err(FeatureError::InvalidEncoding("node token length mismatch"));
+    }
+
+    let node_attrs = reader.bf16_vec()?;
+    if node_attrs.iter().any(|value| !value.is_finite()) {
+        return Err(FeatureError::InvalidEncoding("non-finite node attr"));
+    }
+
+    let edge_count = reader.len()?;
+    let mut edges = Vec::with_capacity(edge_count);
+    for _ in 0..edge_count {
+        let edge = FeatureEdge {
+            src: u32::from(reader.u16()?),
+            dst: u32::from(reader.u16()?),
+            edge_type: reader.u8()?,
+        };
+        if edge.src >= node_count || edge.dst >= node_count {
+            return Err(FeatureError::InvalidEncoding("edge endpoint out of range"));
+        }
+        edges.push(edge);
+    }
+
+    Ok((node_tokens, node_attrs, edges))
+}
+
+fn write_position(out: &mut Vec<u8>, position: PositionFeatures) {
+    write_u32(out, position.root_step);
+    write_u32(out, position.leaf_depth);
+    write_bf16(out, position.budget_fraction);
+    write_bf16(out, position.budget_step);
+    write_bf16(out, position.opponent_reward);
+    out.push(u8::from(position.opponent_present));
+}
+
+fn read_position(reader: &mut Reader<'_>) -> FeatureResult<PositionFeatures> {
     let position = PositionFeatures {
         root_step: reader.u32()?,
         leaf_depth: reader.u32()?,
@@ -186,31 +278,7 @@ pub fn decode_feature_row(bytes: &[u8]) -> FeatureResult<FeatureRow> {
             "absent opponent must have zero reward",
         ));
     }
-    if !reader.is_empty() {
-        return Err(FeatureError::InvalidEncoding("trailing row bytes"));
-    }
-
-    Ok(FeatureRow {
-        node_count,
-        node_tokens,
-        node_attrs,
-        edges,
-        actions,
-        position,
-    })
-}
-
-pub fn validate_feature_row_header(
-    bytes: &[u8],
-    expected: &FeatureSchemaHash,
-) -> FeatureResult<()> {
-    let schema_hash = parse_row_header(bytes)?;
-    if &schema_hash != expected {
-        return Err(FeatureError::InvalidEncoding(
-            "feature schema hash mismatch",
-        ));
-    }
-    Ok(())
+    Ok(position)
 }
 
 pub fn encode_feature_schema_config(

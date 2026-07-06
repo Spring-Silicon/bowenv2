@@ -1,13 +1,13 @@
 use gz_features::{
     ActionFeature, ENCODING_VERSION, FeatureBatchView, FeatureCollator, FeatureEdge, FeatureError,
-    FeatureRow, FeatureSchema, FeatureSchemaConfig, PositionFeatures, RowTargets,
-    TrainingTargetsView, decode_feature_row, encode_feature_row, encode_training_targets,
-    validate_batch_action_counts, validate_feature_row_header,
+    FeatureRow, FeatureSchema, FeatureSchemaConfig, OpponentStateFeatures, PositionFeatures,
+    RowTargets, TrainingTargetsView, decode_feature_row, encode_feature_row,
+    encode_training_targets, validate_batch_action_counts, validate_feature_row_header,
 };
 use std::num::NonZeroUsize;
 
 const HAND_BUILT_BATCH_FINGERPRINT: &str =
-    "9ccea8576a120381ba540bb8f5b250fb758997c0807007d9912ddef870617de0";
+    "7769b626bde107842fbbf00d721a5c541d5284c53f879c829d4bb77dfd9fc34b";
 
 fn schema() -> FeatureSchema {
     FeatureSchema::new(FeatureSchemaConfig {
@@ -64,6 +64,24 @@ fn row() -> FeatureRow {
             opponent_reward: 0.5,
             opponent_present: true,
         },
+        opponent: Some(OpponentStateFeatures {
+            node_count: 2,
+            node_tokens: vec![2, 5],
+            node_attrs: vec![4.0, 8.0],
+            edges: vec![FeatureEdge {
+                src: 1,
+                dst: 0,
+                edge_type: 1,
+            }],
+            position: PositionFeatures {
+                root_step: 1,
+                leaf_depth: 0,
+                budget_fraction: 0.5,
+                budget_step: 0.25,
+                opponent_reward: 0.5,
+                opponent_present: true,
+            },
+        }),
     }
 }
 
@@ -120,6 +138,14 @@ fn collate_parse_roundtrips_sections_and_padding() {
     assert_eq!(view.position[0], [2.0, 3.0, 0.75, 0.125]);
     assert_eq!(view.opponent_reward, vec![0.5, 0.0]);
     assert_eq!(view.opponent_present, vec![1, 0]);
+    assert_eq!(view.opponent_state_present, vec![1, 0]);
+    assert_eq!(view.opponent_node_count, vec![2, 0]);
+    assert_eq!(view.opponent_node_tokens[0..4], [2, 5, 0, 0]);
+    assert_eq!(view.opponent_edge_count, vec![1, 0]);
+    assert_eq!(view.opponent_edge_src[0..4], [1, 0, 0, 0]);
+    assert_eq!(view.opponent_edge_dst[0..4], [0, 0, 0, 0]);
+    assert_eq!(view.opponent_edge_type[0..4], [1, 0, 0, 0]);
+    assert_eq!(view.opponent_position[0], [1.0, 0.0, 0.5, 0.25]);
 }
 
 #[test]
@@ -216,6 +242,26 @@ fn feature_row_codec_has_stable_layout() {
     expected.extend_from_slice(&bf16(0.125).to_le_bytes());
     expected.extend_from_slice(&bf16(0.5).to_le_bytes());
     expected.push(1);
+    expected.push(1);
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    for token in [2u16, 5] {
+        expected.extend_from_slice(&token.to_le_bytes());
+    }
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    for value in [4.0f32, 8.0] {
+        expected.extend_from_slice(&bf16(value).to_le_bytes());
+    }
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&1u16.to_le_bytes());
+    expected.extend_from_slice(&0u16.to_le_bytes());
+    expected.push(1);
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    expected.extend_from_slice(&bf16(0.5).to_le_bytes());
+    expected.extend_from_slice(&bf16(0.25).to_le_bytes());
+    expected.extend_from_slice(&bf16(0.5).to_le_bytes());
+    expected.push(1);
 
     assert_eq!(bytes, expected);
 }
@@ -248,7 +294,7 @@ fn training_targets_codec_writes_padded_sections() {
     assert_eq!(view.reward, vec![0.25, -0.5]);
     assert_eq!(
         fingerprint(&bytes),
-        "618b58f8d534fe00f1b36c449d800dba7e83b6adf45c243f4eafc02ac030e77c"
+        "bbe4a7663fd71400abf5b8ab6608068be9014cf8ff1af18e4844024d3d39aec1"
     );
 }
 

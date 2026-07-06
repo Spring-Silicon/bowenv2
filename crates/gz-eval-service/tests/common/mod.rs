@@ -71,6 +71,7 @@ pub fn row(node_count: u32, action_count: usize) -> FeatureRow {
             opponent_reward: 0.0,
             opponent_present: false,
         },
+        opponent: None,
     }
 }
 

@@ -205,6 +205,7 @@ def run(config_path: str | Path) -> None:
                 total_steps=config.trainer.total_steps,
                 value_weight=config.trainer.value_weight,
                 grad_clip=config.trainer.grad_clip,
+                run_seed=config.trainer.seed,
             ),
         )
         loop.step_index = resume_start

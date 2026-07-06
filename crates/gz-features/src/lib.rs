@@ -18,7 +18,7 @@ pub use collator::{
     FeatureBatchView, FeatureCollator, RowOutput, decode_outputs, validate_batch_action_counts,
 };
 pub use error::{FeatureError, FeatureResult};
-pub use row::{ActionFeature, FeatureEdge, FeatureRow, PositionFeatures};
+pub use row::{ActionFeature, FeatureEdge, FeatureRow, OpponentStateFeatures, PositionFeatures};
 pub use schema::{
     BATCH_ENCODING_VERSION, ENCODING_VERSION, FeatureSchema, FeatureSchemaConfig,
     FeatureSchemaHash, STOP_ACTION_KIND_TOKEN,

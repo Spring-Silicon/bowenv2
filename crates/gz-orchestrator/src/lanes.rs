@@ -5,12 +5,14 @@ use crate::reference::{Reference, ReferenceProvider, RolloutOutcome};
 use crate::root::RootSource;
 use crate::serial::OrchestratedEpisode;
 use crate::service::internal;
-use gz_engine::{EngineError, EngineResult, ErrorCode, ErrorMessage, GraphEngine, ModelVersion};
+use gz_engine::{
+    CandidateOptions, EngineError, EngineResult, ErrorCode, ErrorMessage, GraphEngine, ModelVersion,
+};
 use gz_eval::{EvalOutput, EvalRequest, Evaluator, eval_error_to_engine_error, validate_outputs};
 use gz_eval_service::{BackendOutputs, FeatureEvalBackend};
 use gz_features::{
     FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaHash,
-    PositionFeatures, encode_feature_row,
+    OpponentStateFeatures, PositionFeatures, encode_feature_row,
 };
 use gz_replay::{ReplayEpisodeRecord, ReplayError, ReplayRow, ReplayStore};
 use gz_search::{
@@ -743,7 +745,7 @@ where
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", None)
+        pool.drive(engine, "worker blocked", None, |_, _, _| {})
     }
 
     fn send_parked(
@@ -801,7 +803,12 @@ where
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", Some(&mut self.extractor))
+        pool.drive(
+            engine,
+            "worker blocked",
+            Some(&mut self.extractor),
+            |_, _, _| {},
+        )
     }
 
     fn send_parked(
@@ -928,7 +935,7 @@ where
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", None)
+        pool.drive(engine, "worker blocked", None, |_, _, _| {})
     }
 
     fn send_parked(
@@ -994,6 +1001,8 @@ where
 struct FeaturizedReplayMode<'a, X, P> {
     extractor: X,
     replay: ReplayMode<'a, P>,
+    candidate_options: CandidateOptions,
+    export_position: bool,
 }
 
 impl<'a, X, P> FeaturizedReplayMode<'a, X, P> {
@@ -1007,6 +1016,8 @@ impl<'a, X, P> FeaturizedReplayMode<'a, X, P> {
         Self {
             extractor,
             replay: ReplayMode::new(provider, replay_tx, store, backpressure),
+            candidate_options: CandidateOptions::default(),
+            export_position: true,
         }
     }
 }
@@ -1027,6 +1038,8 @@ where
         context: GumbelEpisodeContext,
     ) {
         self.replay.begin(search, identity, context);
+        self.candidate_options = search.config().candidate_options;
+        self.export_position = search.config().export_position;
     }
 
     fn before_root_admission<R>(
@@ -1058,8 +1071,17 @@ where
         root: E::Graph,
         context: GumbelEpisodeContext,
     ) -> EngineResult<GumbelEpisodeContext> {
-        self.replay
-            .episode_context(engine, episode_id, root, context)
+        let reference = self.replay.provider.reference_with_features(
+            engine,
+            root,
+            &mut self.extractor,
+            self.candidate_options,
+            self.export_position,
+        )?;
+        let mut context = context;
+        context.opponent = reference.as_ref().map(opponent_context);
+        self.replay.references.insert(episode_id, reference);
+        Ok(context)
     }
 
     fn drive(
@@ -1067,7 +1089,15 @@ where
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
     ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
-        pool.drive(engine, "worker blocked", Some(&mut self.extractor))
+        let references = &self.replay.references;
+        pool.drive(
+            engine,
+            "worker blocked",
+            Some(&mut self.extractor),
+            |episode_id, root_step, row| {
+                attach_reference_opponent(references, episode_id, root_step, row);
+            },
+        )
     }
 
     fn send_parked(
@@ -1094,7 +1124,12 @@ where
             .rollout
             .take()
             .ok_or_else(|| internal("missing opponent rollout"))?;
-        if rollout.intercept(engine, &mut self.replay.provider, &completed)? {
+        if rollout.intercept_with_features(
+            engine,
+            &mut self.replay.provider,
+            &completed,
+            &mut self.extractor,
+        )? {
             self.replay.rollout = Some(rollout);
             return Ok(());
         }
@@ -1186,6 +1221,38 @@ where
     Ok(())
 }
 
+fn attach_reference_opponent(
+    references: &HashMap<EpisodeId, Option<Reference>>,
+    episode_id: EpisodeId,
+    root_step: u32,
+    row: &mut FeatureRow,
+) {
+    let Some(Some(reference)) = references.get(&episode_id) else {
+        return;
+    };
+    attach_opponent_step(reference, root_step as usize, row);
+}
+
+fn attach_opponent_step(reference: &Reference, step_index: usize, row: &mut FeatureRow) {
+    let Some(step) = aligned_reference_step(reference, step_index) else {
+        return;
+    };
+    row.opponent = step.features.clone();
+}
+
+fn aligned_reference_step(
+    reference: &Reference,
+    step_index: usize,
+) -> Option<&crate::reference::ReferenceStep> {
+    if reference.steps.is_empty() {
+        return None;
+    }
+    reference
+        .steps
+        .get(step_index)
+        .or_else(|| reference.steps.last())
+}
+
 fn feature_rows_for_episode<E, X>(
     engine: &mut E,
     extractor: &mut X,
@@ -1213,9 +1280,12 @@ where
         // Mirror the eval-side export gate: rows must train the model on
         // the same position inputs it served with.
         let position = replay_position_features(search, extractor.schema(), index, reference)?;
-        let row = extractor
+        let mut row = extractor
             .extract(engine, step.before, &candidates, position)
             .map_err(|_| internal("feature extraction failed"))?;
+        if let Some(reference) = reference {
+            attach_opponent_step(reference, index, &mut row);
+        }
         if row.actions.len() != step.legal_actions.len() {
             return Err(internal("feature row action count mismatch"));
         }
@@ -1286,6 +1356,153 @@ where
     candidates.extend_from_slice(&episode.created_candidates);
     candidates.extend_from_slice(extra_candidates);
     engine.release(&episode.created_graphs, &candidates)
+}
+
+fn reference_steps_for_gumbel_episode<G, C>(
+    episode: &GumbelEpisode<G, C>,
+) -> Vec<crate::reference::ReferenceStep> {
+    let mut steps = Vec::with_capacity(episode.steps.len() + 1);
+    match episode.steps.first() {
+        Some(step) => steps.push(crate::reference::ReferenceStep {
+            context: step.step_ref.before,
+            features: None,
+        }),
+        None => steps.push(crate::reference::ReferenceStep {
+            context: episode.final_context,
+            features: None,
+        }),
+    }
+    steps.extend(
+        episode
+            .steps
+            .iter()
+            .map(|step| crate::reference::ReferenceStep {
+                context: step.step_ref.after,
+                features: None,
+            }),
+    );
+    steps
+}
+
+fn reference_steps_for_gumbel_episode_with_features<E, X>(
+    engine: &mut E,
+    extractor: &mut X,
+    search: &GumbelMcts,
+    episode: &GumbelEpisode<E::Graph, E::Candidate>,
+    final_reward: f32,
+) -> EngineResult<(Vec<crate::reference::ReferenceStep>, Vec<E::Candidate>)>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let mut candidates = Vec::new();
+    let steps = (|| {
+        let mut steps = Vec::with_capacity(episode.steps.len() + 1);
+
+        match episode.steps.first() {
+            Some(step) => steps.push(reference_step_with_features(
+                engine,
+                extractor,
+                search,
+                GumbelReferenceStepInput {
+                    graph: step.before,
+                    context: step.step_ref.before,
+                    index: 0,
+                    final_reward,
+                },
+                &mut candidates,
+            )?),
+            None => steps.push(reference_step_with_features(
+                engine,
+                extractor,
+                search,
+                GumbelReferenceStepInput {
+                    graph: episode.final_graph,
+                    context: episode.final_context,
+                    index: 0,
+                    final_reward,
+                },
+                &mut candidates,
+            )?),
+        }
+
+        for (index, step) in episode.steps.iter().enumerate() {
+            steps.push(reference_step_with_features(
+                engine,
+                extractor,
+                search,
+                GumbelReferenceStepInput {
+                    graph: step.after,
+                    context: step.step_ref.after,
+                    index: index + 1,
+                    final_reward,
+                },
+                &mut candidates,
+            )?);
+        }
+
+        Ok(steps)
+    })();
+
+    match steps {
+        Ok(steps) => Ok((steps, candidates)),
+        Err(error) => {
+            engine.release(&[], &candidates)?;
+            Err(error)
+        }
+    }
+}
+
+struct GumbelReferenceStepInput<G> {
+    graph: G,
+    context: gz_engine::ReplayGraphContext,
+    index: usize,
+    final_reward: f32,
+}
+
+fn reference_step_with_features<E, X>(
+    engine: &mut E,
+    extractor: &mut X,
+    search: &GumbelMcts,
+    input: GumbelReferenceStepInput<E::Graph>,
+    created_candidates: &mut Vec<E::Candidate>,
+) -> EngineResult<crate::reference::ReferenceStep>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let mut candidates = Vec::new();
+    engine.candidates(
+        input.graph,
+        search.config().candidate_options,
+        &mut candidates,
+    )?;
+    created_candidates.extend(candidates.iter().copied());
+    let position = replay_position_features(search, extractor.schema(), input.index, None)?;
+    let scale = extractor.schema().config().opponent_reward_scale;
+    let row = extractor
+        .extract(
+            engine,
+            input.graph,
+            &candidates,
+            PositionFeatures {
+                opponent_reward: input.final_reward / scale,
+                opponent_present: true,
+                ..position
+            },
+        )
+        .map_err(|_| internal("reference feature extraction failed"))?;
+
+    Ok(crate::reference::ReferenceStep {
+        context: input.context,
+        features: Some(OpponentStateFeatures {
+            node_count: row.node_count,
+            node_tokens: row.node_tokens,
+            node_attrs: row.node_attrs,
+            edges: row.edges,
+            position: row.position,
+        }),
+    })
 }
 
 /// Drives opponent rollout episodes for rollout-based reference providers
@@ -1390,6 +1607,52 @@ impl OpponentRollout {
         provider.finish_rollout(reward.map(|final_reward| RolloutOutcome {
             final_reward,
             final_graph: completed.episode.final_context,
+            steps: reference_steps_for_gumbel_episode(&completed.episode),
+            search_config_hash: completed.episode.search_config_hash,
+        }));
+        Ok(true)
+    }
+
+    fn intercept_with_features<E, P, X>(
+        &mut self,
+        engine: &mut E,
+        provider: &mut P,
+        completed: &OrchestratedEpisode<E::Graph, E::Candidate>,
+        extractor: &mut X,
+    ) -> EngineResult<bool>
+    where
+        E: GraphEngine,
+        P: ReferenceProvider<E>,
+        X: FeatureExtractor<E>,
+    {
+        if self.in_flight != Some(completed.episode_id) {
+            return Ok(false);
+        }
+        self.in_flight = None;
+
+        let measure = &completed.episode.final_measure;
+        let reward = if measure.measured && measure.valid {
+            measure.scalar_reward.filter(|reward| reward.is_finite())
+        } else {
+            None
+        };
+
+        let (steps, feature_candidates) = match reward {
+            Some(final_reward) => reference_steps_for_gumbel_episode_with_features(
+                engine,
+                extractor,
+                &self.search,
+                &completed.episode,
+                final_reward,
+            )?,
+            None => (Vec::new(), Vec::new()),
+        };
+        release_episode_handles(engine, &completed.episode, &feature_candidates)?;
+
+        provider.finish_rollout(reward.map(|final_reward| RolloutOutcome {
+            final_reward,
+            final_graph: completed.episode.final_context,
+            steps,
             search_config_hash: completed.episode.search_config_hash,
         }));
         Ok(true)

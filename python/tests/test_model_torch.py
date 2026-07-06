@@ -149,6 +149,34 @@ def test_scalar_value_head_uses_opponent_features() -> None:
     assert not torch.equal(changed_values, values)
 
 
+def test_pair_value_head_uses_opponent_state() -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    changed_bytes = bytearray(make_batch(attr_dim=1))
+    layout = _layout(2, 3, 2, 3, 2, 1)
+    changed_bytes[layout["opponent_state_present"]] = 0
+    changed_bytes[layout["opponent_state_present"] + 1] = 0
+    changed = BatchView.parse(changed_bytes)
+    schema = schema_for_view(view, node_vocab_size=7, edge_type_count=2, action_kind_vocab_size=8)
+    arch = ArchConfig(
+        dim=16,
+        layers=1,
+        heads=4,
+        ffn_dim=32,
+        dropout=0.0,
+        aggregation="attention",
+        value_input="pair",
+    )
+    model = build_model(schema, arch).eval()
+
+    values, logits = run_model(model, schema, view)
+    changed_values, changed_logits = run_model(model, schema, changed)
+
+    assert values.shape == (2,)
+    assert logits.shape == (2, 3)
+    torch.testing.assert_close(changed_logits, logits, rtol=0, atol=0)
+    assert not torch.equal(changed_values, values)
+
+
 def run_model(model: object, schema: FeatureSchemaConfig, view: BatchView):
     stager = BatchStager(schema, view.batch_capacity, "cpu")
     return model(stager.copy(view))

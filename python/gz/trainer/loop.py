@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from gz.trainer.data import TrainingBatch
+from gz.trainer.sampler import step_seed
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,7 @@ class LoopConfig:
     value_weight: float = 1.0
     grad_clip: float = 1.0
     weight_decay: float = 0.01
+    run_seed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,11 +60,15 @@ class TrainerLoop:
             dtype=torch.bfloat16,
             enabled=self.device_type == "cuda",
         ):
-            value_raw, logits = self.model(batch.features)
+            value_flip = None
+            if getattr(getattr(self.model, "arch", None), "value_input", None) == "pair":
+                value_flip = pair_value_flip(torch, batch, self.config.run_seed, self.step_index)
+            value_raw, logits = self.model(batch.features, value_flip=value_flip)
             policy_loss = policy_ce_loss(
                 logits, batch.policy, batch.features.action_count, batch.row_count
             )
-            value_loss = value_bce_loss(value_raw, batch.value, batch.value_valid, batch.row_count)
+            value = flipped_value_targets(torch, batch.value, value_flip)
+            value_loss = value_bce_loss(value_raw, value, batch.value_valid, batch.row_count)
             loss = policy_loss + self.config.value_weight * value_loss
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
@@ -144,6 +150,23 @@ def value_bce_loss(value_raw: object, value: object, value_valid: object, row_co
         2.0 * value_raw, target, reduction="none"
     )
     return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
+
+
+def pair_value_flip(torch: object, batch: TrainingBatch, run_seed: int, step: int) -> object:
+    if getattr(batch.features, "opponent_state_present", None) is None:
+        return None
+    device = batch.value.device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(step_seed(run_seed, step))
+    row_mask = _row_mask(torch, batch.row_count, batch.value.shape[0], device)
+    present = batch.features.opponent_state_present > 0
+    return (torch.rand(batch.value.shape, generator=generator, device=device) < 0.5) & row_mask & present
+
+
+def flipped_value_targets(torch: object, value: object, value_flip: object) -> object:
+    if value_flip is None:
+        return value
+    return torch.where(value_flip, -value, value)
 
 
 def lr_at_step(

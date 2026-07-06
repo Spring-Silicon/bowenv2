@@ -134,6 +134,48 @@ impl FeatureCollator {
                 row.position.opponent_reward,
             );
             out[layout.opponent_present + row_index] = u8::from(row.position.opponent_present);
+            if let Some(opponent) = &row.opponent {
+                out[layout.opponent_state_present + row_index] = 1;
+                write_u32_at(
+                    out,
+                    layout.opponent_node_count + row_index * 4,
+                    opponent.node_count,
+                );
+                for (node_index, token) in opponent.node_tokens.iter().copied().enumerate() {
+                    let offset =
+                        layout.opponent_node_tokens + (row_index * layout.n + node_index) * 2;
+                    write_u16_at(out, offset, token);
+                }
+                for (attr_index, value) in opponent.node_attrs.iter().copied().enumerate() {
+                    let offset = layout.opponent_node_attrs
+                        + (row_index * layout.n * layout.d + attr_index) * 2;
+                    write_bf16_at(out, offset, value);
+                }
+                write_u32_at(
+                    out,
+                    layout.opponent_edge_count + row_index * 4,
+                    opponent.edges.len() as u32,
+                );
+                for (edge_index, edge) in opponent.edges.iter().copied().enumerate() {
+                    write_u16_at(
+                        out,
+                        layout.opponent_edge_src + (row_index * layout.e + edge_index) * 2,
+                        narrow_index(edge.src, "opponent edge src")?,
+                    );
+                    write_u16_at(
+                        out,
+                        layout.opponent_edge_dst + (row_index * layout.e + edge_index) * 2,
+                        narrow_index(edge.dst, "opponent edge dst")?,
+                    );
+                    out[layout.opponent_edge_type + row_index * layout.e + edge_index] =
+                        edge.edge_type;
+                }
+                let position = layout.opponent_position + row_index * 8;
+                write_bf16_at(out, position, opponent.position.root_step as f32);
+                write_bf16_at(out, position + 2, opponent.position.leaf_depth as f32);
+                write_bf16_at(out, position + 4, opponent.position.budget_fraction);
+                write_bf16_at(out, position + 6, opponent.position.budget_step);
+            }
         }
 
         Ok(())
@@ -276,6 +318,15 @@ pub struct FeatureBatchView {
     pub position: Vec<[f32; 4]>,
     pub opponent_reward: Vec<f32>,
     pub opponent_present: Vec<u8>,
+    pub opponent_state_present: Vec<u8>,
+    pub opponent_node_count: Vec<u32>,
+    pub opponent_node_tokens: Vec<u16>,
+    pub opponent_node_attrs: Vec<f32>,
+    pub opponent_edge_count: Vec<u32>,
+    pub opponent_edge_src: Vec<u32>,
+    pub opponent_edge_dst: Vec<u32>,
+    pub opponent_edge_type: Vec<u8>,
+    pub opponent_position: Vec<[f32; 4]>,
 }
 
 impl FeatureBatchView {
@@ -324,6 +375,35 @@ impl FeatureBatchView {
             opponent_reward: read_bf16_vec(bytes, layout.opponent_reward, layout.b)?,
             opponent_present: bytes[layout.opponent_present..layout.opponent_present + layout.b]
                 .to_vec(),
+            opponent_state_present: bytes
+                [layout.opponent_state_present..layout.opponent_state_present + layout.b]
+                .to_vec(),
+            opponent_node_count: read_u32_vec(bytes, layout.opponent_node_count, layout.b)?,
+            opponent_node_tokens: read_u16_vec(
+                bytes,
+                layout.opponent_node_tokens,
+                layout.b * layout.n,
+            )?,
+            opponent_node_attrs: read_bf16_vec(
+                bytes,
+                layout.opponent_node_attrs,
+                layout.b * layout.n * layout.d,
+            )?,
+            opponent_edge_count: read_u32_vec(bytes, layout.opponent_edge_count, layout.b)?,
+            opponent_edge_src: read_u16_widened_vec(
+                bytes,
+                layout.opponent_edge_src,
+                layout.b * layout.e,
+            )?,
+            opponent_edge_dst: read_u16_widened_vec(
+                bytes,
+                layout.opponent_edge_dst,
+                layout.b * layout.e,
+            )?,
+            opponent_edge_type: bytes
+                [layout.opponent_edge_type..layout.opponent_edge_type + layout.b * layout.e]
+                .to_vec(),
+            opponent_position: read_position_vec(bytes, layout.opponent_position, layout.b)?,
         })
     }
 }
@@ -395,6 +475,15 @@ struct BatchLayout {
     position: usize,
     opponent_reward: usize,
     opponent_present: usize,
+    opponent_state_present: usize,
+    opponent_node_count: usize,
+    opponent_node_tokens: usize,
+    opponent_node_attrs: usize,
+    opponent_edge_count: usize,
+    opponent_edge_src: usize,
+    opponent_edge_dst: usize,
+    opponent_edge_type: usize,
+    opponent_position: usize,
     total_len: usize,
 }
 
@@ -428,6 +517,15 @@ impl BatchLayout {
         let position = section(&mut cursor, b * 4 * 2);
         let opponent_reward = section(&mut cursor, b * 2);
         let opponent_present = section(&mut cursor, b);
+        let opponent_state_present = section(&mut cursor, b);
+        let opponent_node_count = section(&mut cursor, b * 4);
+        let opponent_node_tokens = section(&mut cursor, b * n * 2);
+        let opponent_node_attrs = section(&mut cursor, b * n * d * 2);
+        let opponent_edge_count = section(&mut cursor, b * 4);
+        let opponent_edge_src = section(&mut cursor, b * e * 2);
+        let opponent_edge_dst = section(&mut cursor, b * e * 2);
+        let opponent_edge_type = section(&mut cursor, b * e);
+        let opponent_position = section(&mut cursor, b * 4 * 2);
         let total_len = align4(cursor);
 
         Self {
@@ -452,6 +550,15 @@ impl BatchLayout {
             position,
             opponent_reward,
             opponent_present,
+            opponent_state_present,
+            opponent_node_count,
+            opponent_node_tokens,
+            opponent_node_attrs,
+            opponent_edge_count,
+            opponent_edge_src,
+            opponent_edge_dst,
+            opponent_edge_type,
+            opponent_position,
             total_len,
         }
     }

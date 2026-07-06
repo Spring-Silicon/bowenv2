@@ -86,6 +86,7 @@ fn write_attr1(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 opponent_reward: 0.0,
                 opponent_present: false,
             },
+            opponent: None,
         },
         FeatureRow {
             node_count: 1,
@@ -101,6 +102,7 @@ fn write_attr1(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 opponent_reward: 0.0,
                 opponent_present: false,
             },
+            opponent: None,
         },
         FeatureRow {
             node_count: 5,
@@ -164,6 +166,7 @@ fn write_attr1(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 opponent_reward: 0.0,
                 opponent_present: false,
             },
+            opponent: None,
         },
     ];
     write_batch(schema, 4, &rows, path)
@@ -209,6 +212,7 @@ fn write_attr0(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             opponent_reward: 0.0,
             opponent_present: false,
         },
+        opponent: None,
     }];
     write_batch(schema, 2, &rows, path)
 }
@@ -270,6 +274,7 @@ fn write_expander(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             opponent_reward: 0.0,
             opponent_present: false,
         },
+        opponent: None,
     }];
     write_batch(schema, 2, &rows, path)
 }

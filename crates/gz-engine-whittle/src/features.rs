@@ -152,6 +152,7 @@ impl FeatureExtractor<WhittleEngine> for WhittleFeatureExtractor {
             edges,
             actions,
             position,
+            opponent: None,
         };
         row.validate(&self.schema)?;
         Ok(row)

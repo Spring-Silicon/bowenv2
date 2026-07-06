@@ -41,7 +41,7 @@ class ArchConfig:
             raise ValueError("unsupported aggregation")
         if self.global_tokens <= 0:
             raise ValueError("global_tokens must be positive")
-        if self.value_input not in {"single", "scalar"}:
+        if self.value_input not in {"single", "scalar", "pair"}:
             raise ValueError("unsupported value_input")
 
     def to_dict(self) -> dict[str, object]:
@@ -114,6 +114,26 @@ class GraphBatchTensors(NamedTuple):
     position: object
     opponent_reward: object
     opponent_present: object
+    opponent_state_present: object
+    opponent_node_count: object
+    opponent_node_tokens: object
+    opponent_node_attrs: object
+    opponent_edge_count: object
+    opponent_edge_src: object
+    opponent_edge_dst: object
+    opponent_edge_type: object
+    opponent_position: object
+
+
+class GraphStateTensors(NamedTuple):
+    node_count: object
+    node_tokens: object
+    node_attrs: object
+    edge_count: object
+    edge_src: object
+    edge_dst: object
+    edge_type: object
+    position: object
 
 
 def build_model(schema: FeatureSchemaConfig, arch: ArchConfig):
@@ -152,6 +172,15 @@ class BatchStager:
         self.position = _StagedTensor((b, 4), torch.float32, self.device, self.pin)
         self.opponent_reward = _StagedTensor((b,), torch.float32, self.device, self.pin)
         self.opponent_present = _StagedTensor((b,), torch.float32, self.device, self.pin)
+        self.opponent_state_present = _StagedTensor((b,), torch.float32, self.device, self.pin)
+        self.opponent_node_count = _StagedTensor((b,), torch.int64, self.device, self.pin)
+        self.opponent_node_tokens = _StagedTensor((b, n), torch.int64, self.device, self.pin)
+        self.opponent_node_attrs = _StagedTensor((b, n, d), torch.float32, self.device, self.pin)
+        self.opponent_edge_count = _StagedTensor((b,), torch.int64, self.device, self.pin)
+        self.opponent_edge_src = _StagedTensor((b, e), torch.int64, self.device, self.pin)
+        self.opponent_edge_dst = _StagedTensor((b, e), torch.int64, self.device, self.pin)
+        self.opponent_edge_type = _StagedTensor((b, e), torch.int64, self.device, self.pin)
+        self.opponent_position = _StagedTensor((b, 4), torch.float32, self.device, self.pin)
 
     @classmethod
     def from_view(cls, view: BatchView, device: str | object, pinned_staging: bool = True) -> BatchStager:
@@ -191,6 +220,18 @@ class BatchStager:
         self.position.copy(view.position)
         self.opponent_reward.copy(view.opponent_reward)
         self.opponent_present.copy(view.opponent_present)
+        self.opponent_state_present.copy(view.opponent_state_present)
+        self.opponent_node_count.copy(view.opponent_node_count)
+        self.opponent_node_tokens.copy(view.opponent_node_tokens)
+        if view.opponent_node_attrs is None:
+            self.opponent_node_attrs.zero_()
+        else:
+            self.opponent_node_attrs.copy(view.opponent_node_attrs)
+        self.opponent_edge_count.copy(view.opponent_edge_count)
+        self.opponent_edge_src.copy(view.opponent_edge_src)
+        self.opponent_edge_dst.copy(view.opponent_edge_dst)
+        self.opponent_edge_type.copy(view.opponent_edge_type)
+        self.opponent_position.copy(view.opponent_position)
         return self.tensors()
 
     def dummy(self) -> GraphBatchTensors:
@@ -211,6 +252,15 @@ class BatchStager:
         self.position.zero_()
         self.opponent_reward.zero_()
         self.opponent_present.zero_()
+        self.opponent_state_present.zero_()
+        self.opponent_node_count.zero_()
+        self.opponent_node_tokens.zero_()
+        self.opponent_node_attrs.zero_()
+        self.opponent_edge_count.zero_()
+        self.opponent_edge_src.zero_()
+        self.opponent_edge_dst.zero_()
+        self.opponent_edge_type.zero_()
+        self.opponent_position.zero_()
         for tensor in self._all():
             tensor.sync()
         return self.tensors()
@@ -232,6 +282,15 @@ class BatchStager:
             position=self.position.device_tensor,
             opponent_reward=self.opponent_reward.device_tensor,
             opponent_present=self.opponent_present.device_tensor,
+            opponent_state_present=self.opponent_state_present.device_tensor,
+            opponent_node_count=self.opponent_node_count.device_tensor,
+            opponent_node_tokens=self.opponent_node_tokens.device_tensor,
+            opponent_node_attrs=self.opponent_node_attrs.device_tensor,
+            opponent_edge_count=self.opponent_edge_count.device_tensor,
+            opponent_edge_src=self.opponent_edge_src.device_tensor,
+            opponent_edge_dst=self.opponent_edge_dst.device_tensor,
+            opponent_edge_type=self.opponent_edge_type.device_tensor,
+            opponent_position=self.opponent_position.device_tensor,
         )
 
     def _check_view(self, view: BatchView) -> None:
@@ -266,6 +325,15 @@ class BatchStager:
             self.position,
             self.opponent_reward,
             self.opponent_present,
+            self.opponent_state_present,
+            self.opponent_node_count,
+            self.opponent_node_tokens,
+            self.opponent_node_attrs,
+            self.opponent_edge_count,
+            self.opponent_edge_src,
+            self.opponent_edge_dst,
+            self.opponent_edge_type,
+            self.opponent_position,
         )
 
 
@@ -310,36 +378,56 @@ def _model_class():
             self.layers = nn.ModuleList([GraphLayer(schema, arch) for _ in range(arch.layers)])
             self.kind_embedding = nn.Embedding(schema.action_kind_vocab_size, arch.dim, padding_idx=0)
             self.policy = _mlp(nn, arch.dim * 3 + 1, arch.ffn_dim, 1, arch.activation, arch.dropout)
-            value_dim = arch.dim + (2 if arch.value_input == "scalar" else 0)
+            value_dim = arch.dim
+            if arch.value_input == "scalar":
+                value_dim += 2
+            elif arch.value_input == "pair":
+                value_dim *= 2
             self.value = _mlp(nn, value_dim, arch.ffn_dim, 1, arch.activation, arch.dropout)
 
-        def forward(self, batch: GraphBatchTensors):
-            b, n = batch.node_tokens.shape
-            device = batch.node_tokens.device
-            node_index = torch.arange(n, device=device)
-            node_mask = node_index.unsqueeze(0) < batch.node_count.unsqueeze(1)
-            h = self.node_embedding(batch.node_tokens.clamp(0, self.schema.node_vocab_size - 1))
-            if self.attr_proj is not None:
-                h = h + self.attr_proj(batch.node_attrs)
-            h = h * node_mask.unsqueeze(-1)
-
-            position = self.position_proj(batch.position).unsqueeze(1)
-            g = self.global_tokens.unsqueeze(0).expand(b, -1, -1) + position
-            for layer in self.layers:
-                h, g = layer(h, g, batch, node_mask)
-
-            g_readout = g.mean(dim=1)
+        def forward(self, batch: GraphBatchTensors, value_flip: object = None):
+            graph = _self_graph(batch)
+            h, g_readout, node_mask = self._encode_graph(graph)
             subject_pool = _subject_pool(torch, h, node_mask, batch.action_subjects, batch.subject_count)
             kind = self.kind_embedding(batch.action_kind.clamp(0, self.schema.action_kind_vocab_size - 1))
             prior = batch.action_prior.unsqueeze(-1)
             readout = g_readout.unsqueeze(1).expand(-1, batch.action_kind.shape[1], -1)
             logits = self.policy(torch.cat((kind, prior, subject_pool, readout), dim=-1)).squeeze(-1)
+
             value_input = g_readout
             if self.arch.value_input == "scalar":
                 opponent = torch.stack((batch.opponent_reward, batch.opponent_present), dim=-1).to(g_readout.dtype)
                 value_input = torch.cat((g_readout, opponent), dim=-1)
+            elif self.arch.value_input == "pair":
+                _, opponent_readout, _ = self._encode_graph(_opponent_graph(batch))
+                present = (batch.opponent_state_present > 0).unsqueeze(-1)
+                opponent_readout = torch.where(present, opponent_readout, torch.zeros_like(opponent_readout))
+                if value_flip is not None:
+                    flip = value_flip.to(torch.bool).unsqueeze(-1) & present
+                    left = torch.where(flip, opponent_readout, g_readout)
+                    right = torch.where(flip, g_readout, opponent_readout)
+                    value_input = torch.cat((left, right), dim=-1)
+                else:
+                    value_input = torch.cat((g_readout, opponent_readout), dim=-1)
             value_raw = self.value(value_input).squeeze(-1)
             return value_raw, logits
+
+        def _encode_graph(self, graph: GraphStateTensors):
+            b, n = graph.node_tokens.shape
+            device = graph.node_tokens.device
+            node_index = torch.arange(n, device=device)
+            node_mask = node_index.unsqueeze(0) < graph.node_count.unsqueeze(1)
+            h = self.node_embedding(graph.node_tokens.clamp(0, self.schema.node_vocab_size - 1))
+            if self.attr_proj is not None:
+                h = h + self.attr_proj(graph.node_attrs)
+            h = h * node_mask.unsqueeze(-1)
+
+            position = self.position_proj(graph.position).unsqueeze(1)
+            g = self.global_tokens.unsqueeze(0).expand(b, -1, -1) + position
+            for layer in self.layers:
+                h, g = layer(h, g, graph, node_mask)
+
+            return h, g.mean(dim=1), node_mask
 
     class GraphLayer(nn.Module):
         def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
@@ -357,9 +445,9 @@ def _model_class():
             self.ffn_h = _mlp(nn, arch.dim, arch.ffn_dim, arch.dim, arch.activation, arch.dropout)
             self.ffn_g = _mlp(nn, arch.dim, arch.ffn_dim, arch.dim, arch.activation, arch.dropout)
 
-        def forward(self, h, g, batch: GraphBatchTensors, node_mask):
+        def forward(self, h, g, graph: GraphStateTensors, node_mask):
             h_mask = node_mask.unsqueeze(-1)
-            h = h + self.edge(self.norm_edge(h), batch, node_mask) * h_mask
+            h = h + self.edge(self.norm_edge(h), graph, node_mask) * h_mask
             h = h + self.exchange(self.norm_exchange_h(h), self.norm_exchange_g(g), None) * h_mask
             g = g + self.read(self.norm_read_g(g), self.norm_read_h(h), node_mask)
             h = h + self.ffn_h(self.norm_ffn_h(h)) * h_mask
@@ -379,9 +467,9 @@ def _model_class():
             self.o_proj = nn.Linear(arch.dim, arch.dim, bias=False)
             self.edge_embedding = nn.Embedding(max(1, 2 * schema.edge_type_count), arch.dim)
 
-        def forward(self, h, batch: GraphBatchTensors, node_mask):
+        def forward(self, h, graph: GraphStateTensors, node_mask):
             b, n, d = h.shape
-            src, dst, typ, mask = _mirrored_edges(torch, batch, node_mask, self.edge_type_count)
+            src, dst, typ, mask = _mirrored_edges(torch, graph, node_mask, self.edge_type_count)
             q = self.q_proj(h).reshape(b, n, self.heads, self.head_dim)
             k = self.k_proj(h).reshape(b, n, self.heads, self.head_dim)
             v = self.v_proj(h).reshape(b, n, self.heads, self.head_dim)
@@ -414,9 +502,9 @@ def _model_class():
             self.out = _mlp(nn, arch.dim, arch.ffn_dim, arch.dim, arch.activation, arch.dropout)
             self.activation = _activation(functional, arch.activation)
 
-        def forward(self, h, batch: GraphBatchTensors, node_mask):
+        def forward(self, h, graph: GraphStateTensors, node_mask):
             b, n, d = h.shape
-            src, dst, typ, mask = _mirrored_edges(torch, batch, node_mask, self.edge_type_count)
+            src, dst, typ, mask = _mirrored_edges(torch, graph, node_mask, self.edge_type_count)
             src_h = _gather_nodes(torch, self.k_proj(h), src)
             msg = self.activation(src_h + self.edge_embedding(typ)) * mask.unsqueeze(-1).to(h.dtype)
             out = torch.zeros((b, n, d), dtype=h.dtype, device=h.device)
@@ -449,17 +537,43 @@ def _model_class():
     return GraphModel
 
 
-def _mirrored_edges(torch: object, batch: GraphBatchTensors, node_mask: object, edge_type_count: int):
-    e = batch.edge_src.shape[1]
-    edge_index = torch.arange(e, device=batch.edge_src.device)
-    base_mask = edge_index.unsqueeze(0) < batch.edge_count.unsqueeze(1)
-    src_valid = batch.edge_src < batch.node_count.unsqueeze(1)
-    dst_valid = batch.edge_dst < batch.node_count.unsqueeze(1)
-    type_valid = batch.edge_type < edge_type_count
+def _self_graph(batch: GraphBatchTensors) -> GraphStateTensors:
+    return GraphStateTensors(
+        node_count=batch.node_count,
+        node_tokens=batch.node_tokens,
+        node_attrs=batch.node_attrs,
+        edge_count=batch.edge_count,
+        edge_src=batch.edge_src,
+        edge_dst=batch.edge_dst,
+        edge_type=batch.edge_type,
+        position=batch.position,
+    )
+
+
+def _opponent_graph(batch: GraphBatchTensors) -> GraphStateTensors:
+    return GraphStateTensors(
+        node_count=batch.opponent_node_count,
+        node_tokens=batch.opponent_node_tokens,
+        node_attrs=batch.opponent_node_attrs,
+        edge_count=batch.opponent_edge_count,
+        edge_src=batch.opponent_edge_src,
+        edge_dst=batch.opponent_edge_dst,
+        edge_type=batch.opponent_edge_type,
+        position=batch.opponent_position,
+    )
+
+
+def _mirrored_edges(torch: object, graph: GraphStateTensors, node_mask: object, edge_type_count: int):
+    e = graph.edge_src.shape[1]
+    edge_index = torch.arange(e, device=graph.edge_src.device)
+    base_mask = edge_index.unsqueeze(0) < graph.edge_count.unsqueeze(1)
+    src_valid = graph.edge_src < graph.node_count.unsqueeze(1)
+    dst_valid = graph.edge_dst < graph.node_count.unsqueeze(1)
+    type_valid = graph.edge_type < edge_type_count
     base_mask = base_mask & src_valid & dst_valid & type_valid
-    src = torch.cat((batch.edge_src, batch.edge_dst), dim=1).clamp(0, node_mask.shape[1] - 1)
-    dst = torch.cat((batch.edge_dst, batch.edge_src), dim=1).clamp(0, node_mask.shape[1] - 1)
-    typ = torch.cat((batch.edge_type, batch.edge_type + edge_type_count), dim=1).clamp(0, max(0, 2 * edge_type_count - 1))
+    src = torch.cat((graph.edge_src, graph.edge_dst), dim=1).clamp(0, node_mask.shape[1] - 1)
+    dst = torch.cat((graph.edge_dst, graph.edge_src), dim=1).clamp(0, node_mask.shape[1] - 1)
+    typ = torch.cat((graph.edge_type, graph.edge_type + edge_type_count), dim=1).clamp(0, max(0, 2 * edge_type_count - 1))
     mask = torch.cat((base_mask, base_mask), dim=1)
     return src, dst, typ, mask
 

@@ -129,6 +129,15 @@ def _layout(capacity: int) -> dict[str, int]:
         ("position", capacity * 8),
         ("opponent_reward", capacity * 2),
         ("opponent_present", capacity),
+        ("opponent_state_present", capacity),
+        ("opponent_node_count", capacity * 4),
+        ("opponent_node_tokens", capacity * NODES * 2),
+        ("opponent_node_attrs", capacity * NODES * ATTR_DIM * 2),
+        ("opponent_edge_count", capacity * 4),
+        ("opponent_edge_src", capacity * EDGES * 2),
+        ("opponent_edge_dst", capacity * EDGES * 2),
+        ("opponent_edge_type", capacity * EDGES),
+        ("opponent_position", capacity * 8),
     ]:
         cursor = _align4(cursor)
         out[name] = cursor

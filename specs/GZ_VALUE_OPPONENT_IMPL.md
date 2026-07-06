@@ -171,6 +171,12 @@ which resurrects the stale-embedding question whittlezero solved by
 shipping best_model in checkpoints. Substantial plumbing; only worth
 it if Stage 1 shows conditioning matters but the scalar is too
 coarse.
+
+Implementation note: GraphZero keeps the feature wire independent of
+model hidden dimension by carrying optional raw opponent graph-state
+features in the row/batch encoding instead of model embeddings. The
+Python model embeds self and opponent through the same trunk and applies
+the pair value head inside the model.
 ```
 
 ## Out Of Scope

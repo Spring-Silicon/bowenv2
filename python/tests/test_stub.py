@@ -90,6 +90,15 @@ def count_batch(node_counts: list[int], action_counts: list[int], row_count: int
         capacity * 8,
         capacity * 2,
         capacity,
+        capacity,
+        capacity * 4,
+        capacity * max_nodes * 2,
+        0,
+        capacity * 4,
+        capacity * max_edges * 2,
+        capacity * max_edges * 2,
+        capacity * max_edges,
+        capacity * 8,
     ]:
         total_len = (total_len + 3) & ~3
         sections.append(total_len)

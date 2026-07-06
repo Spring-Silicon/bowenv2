@@ -40,6 +40,15 @@ class _Layout:
     position: int
     opponent_reward: int
     opponent_present: int
+    opponent_state_present: int
+    opponent_node_count: int
+    opponent_node_tokens: int
+    opponent_node_attrs: int
+    opponent_edge_count: int
+    opponent_edge_src: int
+    opponent_edge_dst: int
+    opponent_edge_type: int
+    opponent_position: int
     total_len: int
 
 
@@ -61,6 +70,15 @@ class BatchView:
     position: np.ndarray
     opponent_reward: np.ndarray
     opponent_present: np.ndarray
+    opponent_state_present: np.ndarray
+    opponent_node_count: np.ndarray
+    opponent_node_tokens: np.ndarray
+    opponent_node_attrs: np.ndarray | None
+    opponent_edge_count: np.ndarray
+    opponent_edge_src: np.ndarray
+    opponent_edge_dst: np.ndarray
+    opponent_edge_type: np.ndarray
+    opponent_position: np.ndarray
 
     @property
     def feature_schema_hash(self) -> FeatureSchemaHash:
@@ -113,6 +131,13 @@ class BatchView:
         node_attrs = None
         if layout.d != 0:
             node_attrs = _bf16_array(view, layout.node_attrs, (layout.b, layout.n, layout.d))
+        opponent_node_attrs = None
+        if layout.d != 0:
+            opponent_node_attrs = _bf16_array(
+                view,
+                layout.opponent_node_attrs,
+                (layout.b, layout.n, layout.d),
+            )
 
         return cls(
             dims=dims,
@@ -136,6 +161,15 @@ class BatchView:
             position=_bf16_array(view, layout.position, (layout.b, 4)),
             opponent_reward=_bf16_array(view, layout.opponent_reward, (layout.b,)),
             opponent_present=_array(view, layout.opponent_present, "u1", (layout.b,)),
+            opponent_state_present=_array(view, layout.opponent_state_present, "u1", (layout.b,)),
+            opponent_node_count=_array(view, layout.opponent_node_count, "<u4", (layout.b,)),
+            opponent_node_tokens=_array(view, layout.opponent_node_tokens, "<u2", (layout.b, layout.n)),
+            opponent_node_attrs=opponent_node_attrs,
+            opponent_edge_count=_array(view, layout.opponent_edge_count, "<u4", (layout.b,)),
+            opponent_edge_src=_array(view, layout.opponent_edge_src, "<u2", (layout.b, layout.e)),
+            opponent_edge_dst=_array(view, layout.opponent_edge_dst, "<u2", (layout.b, layout.e)),
+            opponent_edge_type=_array(view, layout.opponent_edge_type, "u1", (layout.b, layout.e)),
+            opponent_position=_bf16_array(view, layout.opponent_position, (layout.b, 4)),
         )
 
 
@@ -173,6 +207,15 @@ def _layout(b: int, n: int, e: int, a: int, s: int, d: int) -> _Layout:
     position, cursor = _section(cursor, b * 4 * 2)
     opponent_reward, cursor = _section(cursor, b * 2)
     opponent_present, cursor = _section(cursor, b)
+    opponent_state_present, cursor = _section(cursor, b)
+    opponent_node_count, cursor = _section(cursor, b * 4)
+    opponent_node_tokens, cursor = _section(cursor, b * n * 2)
+    opponent_node_attrs, cursor = _section(cursor, b * n * d * 2)
+    opponent_edge_count, cursor = _section(cursor, b * 4)
+    opponent_edge_src, cursor = _section(cursor, b * e * 2)
+    opponent_edge_dst, cursor = _section(cursor, b * e * 2)
+    opponent_edge_type, cursor = _section(cursor, b * e)
+    opponent_position, cursor = _section(cursor, b * 4 * 2)
     return _Layout(
         b=b,
         n=n,
@@ -195,6 +238,15 @@ def _layout(b: int, n: int, e: int, a: int, s: int, d: int) -> _Layout:
         position=position,
         opponent_reward=opponent_reward,
         opponent_present=opponent_present,
+        opponent_state_present=opponent_state_present,
+        opponent_node_count=opponent_node_count,
+        opponent_node_tokens=opponent_node_tokens,
+        opponent_node_attrs=opponent_node_attrs,
+        opponent_edge_count=opponent_edge_count,
+        opponent_edge_src=opponent_edge_src,
+        opponent_edge_dst=opponent_edge_dst,
+        opponent_edge_type=opponent_edge_type,
+        opponent_position=opponent_position,
         total_len=_align4(cursor),
     )
 

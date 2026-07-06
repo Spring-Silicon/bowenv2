@@ -1,12 +1,29 @@
 use gz_engine::{
-    EngineResult, GraphEngine, MeasureOptions, ModelVersion, PortableGraphId, ReplayGraphContext,
-    SearchConfigHash,
+    CandidateOptions, EngineError, EngineResult, ErrorCode, ErrorMessage, GraphEngine,
+    MeasureOptions, ModelVersion, PortableGraphId, ReplayGraphContext, SearchConfigHash,
 };
+use gz_features::{FeatureExtractor, FeatureRow, OpponentStateFeatures, PositionFeatures};
 use gz_replay::ReplayReferenceKind;
 use gz_search::{BeamSearch, GreedySearch, RandomSearch, SearchStep};
 
 pub trait ReferenceProvider<E: GraphEngine> {
     fn reference(&mut self, engine: &mut E, root: E::Graph) -> EngineResult<Option<Reference>>;
+
+    fn reference_with_features<X>(
+        &mut self,
+        engine: &mut E,
+        root: E::Graph,
+        extractor: &mut X,
+        candidate_options: CandidateOptions,
+        export_position: bool,
+    ) -> EngineResult<Option<Reference>>
+    where
+        Self: Sized,
+        X: FeatureExtractor<E>,
+    {
+        let _ = (extractor, candidate_options, export_position);
+        self.reference(engine, root)
+    }
 
     /// Called by the replay drivers for every replay-eligible completed
     /// episode with the learner's final measured reward. Default: no-op.
@@ -38,10 +55,11 @@ pub trait ReferenceProvider<E: GraphEngine> {
 }
 
 /// The measured result of an opponent rollout episode.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RolloutOutcome {
     pub final_reward: f32,
     pub final_graph: ReplayGraphContext,
+    pub steps: Vec<ReferenceStep>,
     pub search_config_hash: SearchConfigHash,
 }
 
@@ -55,9 +73,10 @@ pub struct Reference {
     pub model_version: Option<ModelVersion>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceStep {
     pub context: ReplayGraphContext,
+    pub features: Option<OpponentStateFeatures>,
 }
 
 pub struct RootBaselineProvider {
@@ -89,7 +108,53 @@ where
             final_graph: Some(final_graph),
             steps: vec![ReferenceStep {
                 context: final_graph,
+                features: None,
             }],
+            search_config_hash: None,
+            model_version: None,
+        }))
+    }
+
+    fn reference_with_features<X>(
+        &mut self,
+        engine: &mut E,
+        root: E::Graph,
+        extractor: &mut X,
+        candidate_options: CandidateOptions,
+        export_position: bool,
+    ) -> EngineResult<Option<Reference>>
+    where
+        X: FeatureExtractor<E>,
+    {
+        let measure = engine.measure(root, self.measure_options)?;
+        let Some(final_reward) = score(measure.measured, measure.valid, measure.scalar_reward)
+        else {
+            return Ok(None);
+        };
+        let final_graph = context(engine, measure.graph_hash);
+        let mut created_candidates = Vec::new();
+        let step = feature_reference_step(
+            engine,
+            extractor,
+            root,
+            final_graph,
+            candidate_options,
+            ReferenceFeatureContext {
+                index: 0,
+                final_reward,
+                export_position,
+            },
+            &mut created_candidates,
+        );
+        let release = engine.release(&[], &created_candidates);
+        let step = step?;
+        release?;
+
+        Ok(Some(Reference {
+            kind: ReplayReferenceKind::RootBaseline,
+            final_reward,
+            final_graph: Some(final_graph),
+            steps: vec![step],
             search_config_hash: None,
             model_version: None,
         }))
@@ -127,6 +192,40 @@ where
         engine.release(&episode.created_graphs, &episode.created_candidates)?;
         Ok(reference)
     }
+
+    fn reference_with_features<X>(
+        &mut self,
+        engine: &mut E,
+        root: E::Graph,
+        extractor: &mut X,
+        _candidate_options: CandidateOptions,
+        export_position: bool,
+    ) -> EngineResult<Option<Reference>>
+    where
+        X: FeatureExtractor<E>,
+    {
+        let episode = self.search.run(engine, root)?;
+        let reference = project_search_episode_with_features(
+            engine,
+            extractor,
+            SearchReferenceProjection {
+                kind: ReplayReferenceKind::Greedy,
+                final_graph: episode.final_graph,
+                final_context: episode.final_context,
+                steps: &episode.steps,
+                final_reward: score(
+                    episode.final_measure.measured,
+                    episode.final_measure.valid,
+                    episode.final_measure.scalar_reward,
+                ),
+                search_config_hash: Some(episode.search_config_hash),
+                candidate_options: self.search.config().candidate_options,
+                export_position,
+            },
+        );
+        engine.release(&episode.created_graphs, &episode.created_candidates)?;
+        reference
+    }
 }
 
 pub struct BeamReferenceProvider {
@@ -159,6 +258,40 @@ where
         );
         engine.release(&episode.created_graphs, &episode.created_candidates)?;
         Ok(reference)
+    }
+
+    fn reference_with_features<X>(
+        &mut self,
+        engine: &mut E,
+        root: E::Graph,
+        extractor: &mut X,
+        _candidate_options: CandidateOptions,
+        export_position: bool,
+    ) -> EngineResult<Option<Reference>>
+    where
+        X: FeatureExtractor<E>,
+    {
+        let episode = self.search.run(engine, root)?;
+        let reference = project_search_episode_with_features(
+            engine,
+            extractor,
+            SearchReferenceProjection {
+                kind: ReplayReferenceKind::Beam,
+                final_graph: episode.final_graph,
+                final_context: episode.final_context,
+                steps: &episode.steps,
+                final_reward: score(
+                    episode.final_measure.measured,
+                    episode.final_measure.valid,
+                    episode.final_measure.scalar_reward,
+                ),
+                search_config_hash: Some(episode.search_config_hash),
+                candidate_options: self.search.config().candidate_options,
+                export_position,
+            },
+        );
+        engine.release(&episode.created_graphs, &episode.created_candidates)?;
+        reference
     }
 }
 
@@ -193,6 +326,40 @@ where
         engine.release(&episode.created_graphs, &episode.created_candidates)?;
         Ok(reference)
     }
+
+    fn reference_with_features<X>(
+        &mut self,
+        engine: &mut E,
+        root: E::Graph,
+        extractor: &mut X,
+        _candidate_options: CandidateOptions,
+        export_position: bool,
+    ) -> EngineResult<Option<Reference>>
+    where
+        X: FeatureExtractor<E>,
+    {
+        let episode = self.search.run(engine, root)?;
+        let reference = project_search_episode_with_features(
+            engine,
+            extractor,
+            SearchReferenceProjection {
+                kind: ReplayReferenceKind::Random,
+                final_graph: episode.final_graph,
+                final_context: episode.final_context,
+                steps: &episode.steps,
+                final_reward: score(
+                    episode.final_measure.measured,
+                    episode.final_measure.valid,
+                    episode.final_measure.scalar_reward,
+                ),
+                search_config_hash: Some(episode.search_config_hash),
+                candidate_options: self.search.config().candidate_options,
+                export_position,
+            },
+        );
+        engine.release(&episode.created_graphs, &episode.created_candidates)?;
+        reference
+    }
 }
 
 fn project_search_episode<G, C>(
@@ -208,14 +375,17 @@ fn project_search_episode<G, C>(
     match steps.first() {
         Some(step) => reference_steps.push(ReferenceStep {
             context: step.step_ref.before,
+            features: None,
         }),
         None => reference_steps.push(ReferenceStep {
             context: final_graph,
+            features: None,
         }),
     }
 
     reference_steps.extend(steps.iter().map(|step| ReferenceStep {
         context: step.step_ref.after,
+        features: None,
     }));
 
     Some(Reference {
@@ -226,6 +396,159 @@ fn project_search_episode<G, C>(
         search_config_hash,
         model_version: None,
     })
+}
+
+struct SearchReferenceProjection<'a, E: GraphEngine> {
+    kind: ReplayReferenceKind,
+    final_graph: E::Graph,
+    final_context: ReplayGraphContext,
+    steps: &'a [SearchStep<E::Graph, E::Candidate>],
+    final_reward: Option<f32>,
+    search_config_hash: Option<SearchConfigHash>,
+    candidate_options: CandidateOptions,
+    export_position: bool,
+}
+
+fn project_search_episode_with_features<E, X>(
+    engine: &mut E,
+    extractor: &mut X,
+    projection: SearchReferenceProjection<'_, E>,
+) -> EngineResult<Option<Reference>>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let Some(final_reward) = projection.final_reward else {
+        return Ok(None);
+    };
+    let mut feature_candidates = Vec::new();
+    let mut reference_steps = Vec::with_capacity(projection.steps.len() + 1);
+
+    match projection.steps.first() {
+        Some(step) => reference_steps.push(feature_reference_step(
+            engine,
+            extractor,
+            step.before,
+            step.step_ref.before,
+            projection.candidate_options,
+            ReferenceFeatureContext {
+                index: 0,
+                final_reward,
+                export_position: projection.export_position,
+            },
+            &mut feature_candidates,
+        )),
+        None => reference_steps.push(feature_reference_step(
+            engine,
+            extractor,
+            projection.final_graph,
+            projection.final_context,
+            projection.candidate_options,
+            ReferenceFeatureContext {
+                index: 0,
+                final_reward,
+                export_position: projection.export_position,
+            },
+            &mut feature_candidates,
+        )),
+    }
+
+    for (index, step) in projection.steps.iter().enumerate() {
+        reference_steps.push(feature_reference_step(
+            engine,
+            extractor,
+            step.after,
+            step.step_ref.after,
+            projection.candidate_options,
+            ReferenceFeatureContext {
+                index: index + 1,
+                final_reward,
+                export_position: projection.export_position,
+            },
+            &mut feature_candidates,
+        ));
+    }
+
+    let release = engine.release(&[], &feature_candidates);
+    let mut steps = Vec::with_capacity(reference_steps.len());
+    for step in reference_steps {
+        steps.push(step?);
+    }
+    release?;
+
+    Ok(Some(Reference {
+        kind: projection.kind,
+        final_reward,
+        final_graph: Some(projection.final_context),
+        steps,
+        search_config_hash: projection.search_config_hash,
+        model_version: None,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct ReferenceFeatureContext {
+    index: usize,
+    final_reward: f32,
+    export_position: bool,
+}
+
+fn feature_reference_step<E, X>(
+    engine: &mut E,
+    extractor: &mut X,
+    graph: E::Graph,
+    context: ReplayGraphContext,
+    candidate_options: CandidateOptions,
+    feature_context: ReferenceFeatureContext,
+    created_candidates: &mut Vec<E::Candidate>,
+) -> EngineResult<ReferenceStep>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let mut candidates = Vec::new();
+    engine.candidates(graph, candidate_options, &mut candidates)?;
+    created_candidates.extend(candidates.iter().copied());
+    let scale = extractor.schema().config().opponent_reward_scale;
+    let (root_step, budget_fraction, budget_step) = if feature_context.export_position {
+        (
+            u32::try_from(feature_context.index).map_err(|_| internal("root step overflow"))?,
+            0.0,
+            0.0,
+        )
+    } else {
+        (0, 0.0, 0.0)
+    };
+    let row = extractor
+        .extract(
+            engine,
+            graph,
+            &candidates,
+            PositionFeatures {
+                root_step,
+                leaf_depth: 0,
+                budget_fraction,
+                budget_step,
+                opponent_reward: feature_context.final_reward / scale,
+                opponent_present: true,
+            },
+        )
+        .map_err(|_| internal("reference feature extraction failed"))?;
+
+    Ok(ReferenceStep {
+        context,
+        features: Some(opponent_state(row)),
+    })
+}
+
+fn opponent_state(row: FeatureRow) -> OpponentStateFeatures {
+    OpponentStateFeatures {
+        node_count: row.node_count,
+        node_tokens: row.node_tokens,
+        node_attrs: row.node_attrs,
+        edges: row.edges,
+        position: row.position,
+    }
 }
 
 /// Adaptive reference: a reward EMA of the learner's own recent episodes
@@ -293,6 +616,7 @@ struct PolicyReference {
     reward: f32,
     version: ModelVersion,
     final_graph: ReplayGraphContext,
+    steps: Vec<ReferenceStep>,
     search_config_hash: SearchConfigHash,
 }
 
@@ -325,7 +649,7 @@ where
             kind: ReplayReferenceKind::Gumbel,
             final_reward: current.reward,
             final_graph: Some(current.final_graph),
-            steps: Vec::new(),
+            steps: current.steps.clone(),
             search_config_hash: Some(current.search_config_hash),
             model_version: Some(current.version),
         }))
@@ -357,6 +681,7 @@ where
                 reward: outcome.final_reward,
                 version,
                 final_graph: outcome.final_graph,
+                steps: outcome.steps,
                 search_config_hash: outcome.search_config_hash,
             });
         }
@@ -379,4 +704,11 @@ fn context<E: GraphEngine>(engine: &E, graph_hash: gz_engine::GraphHash) -> Repl
         PortableGraphId::new(graph_hash, engine.engine_id(), engine.engine_version()),
         engine.action_set_hash(),
     )
+}
+
+fn internal(message: &'static str) -> EngineError {
+    EngineError::Internal {
+        code: ErrorCode::new(9_001),
+        message: ErrorMessage::new(message).expect("static error message fits"),
+    }
 }

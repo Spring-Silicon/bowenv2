@@ -221,6 +221,7 @@ fn rollout_outcome(reward: f32) -> RolloutOutcome {
             ),
             ActionSetHash::from_bytes([4; 32]),
         ),
+        steps: Vec::new(),
         search_config_hash: SearchConfigHash::from_bytes([9; 32]),
     }
 }
