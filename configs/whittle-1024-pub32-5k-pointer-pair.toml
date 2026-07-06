@@ -52,7 +52,7 @@ python_dir = "python"
 
 [wandb]
 project = "graphzero"
-run_name = "whittle-1024-pub32-5k-pointer-pair-1"
+run_name = "whittle-1024-pub32-5k-pointer-pair-2"
 
 [paths]
 run_dir = "runs/whittle-1024-pub32-5k-pointer-pair"
