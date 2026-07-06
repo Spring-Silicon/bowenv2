@@ -114,6 +114,28 @@ pub struct GumbelEpisode<G, C> {
     pub search_config_hash: SearchConfigHash,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GumbelHandleBatch<G, C> {
+    pub graphs: Vec<G>,
+    pub candidates: Vec<C>,
+}
+
+impl<G, C> Default for GumbelHandleBatch<G, C> {
+    fn default() -> Self {
+        Self {
+            graphs: Vec::new(),
+            candidates: Vec::new(),
+        }
+    }
+}
+
+impl<G, C> GumbelHandleBatch<G, C> {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.graphs.is_empty() && self.candidates.is_empty()
+    }
+}
+
 impl<G, C> PartialEq for GumbelEpisode<G, C> {
     fn eq(&self, other: &Self) -> bool {
         self.root_context == other.root_context

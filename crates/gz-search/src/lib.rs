@@ -18,9 +18,9 @@ pub use beam::{
 pub use episode::{SearchAction, SearchCandidateSummary, SearchEpisode, SearchStep};
 pub use greedy::{GreedyEpisode, GreedySearch, GreedySearchConfig, GreedyStopReason};
 pub use gumbel::{
-    GumbelEpisode, GumbelEpisodeContext, GumbelEpisodeTask, GumbelMcts, GumbelMctsConfig,
-    GumbelOpponentContext, GumbelRootResult, GumbelRootStats, GumbelRootTask, GumbelSearchContext,
-    GumbelStep, GumbelStopReason, considered_visit_sequence,
+    GumbelEpisode, GumbelEpisodeContext, GumbelEpisodeTask, GumbelHandleBatch, GumbelMcts,
+    GumbelMctsConfig, GumbelOpponentContext, GumbelRootResult, GumbelRootStats, GumbelRootTask,
+    GumbelSearchContext, GumbelStep, GumbelStopReason, considered_visit_sequence,
 };
 pub use hash::{
     beam_search_config_hash, greedy_search_config_hash, gumbel_search_config_hash,

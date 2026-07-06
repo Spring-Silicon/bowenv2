@@ -704,7 +704,7 @@ where
         }
 
         if pool.has_parked()
-            && let Some(version) = receive_replies(&mut pool, &runtime.reply_rx)?
+            && let Some(version) = receive_replies(&mut engine, &mut pool, &runtime.reply_rx)?
         {
             mode.observe_version(version);
         }
@@ -1129,8 +1129,8 @@ fn send_featurized_parked<G, C>(
     intake_tx: &SyncSender<FeaturizedEvalJob>,
 ) -> EngineResult<()>
 where
-    G: Copy + Eq,
-    C: Copy,
+    G: Copy + Eq + std::hash::Hash,
+    C: Copy + Eq + std::hash::Hash,
 {
     for parked in pool.take_unsent_parked() {
         let row = parked.row.ok_or_else(|| internal("missing feature row"))?;
@@ -1153,8 +1153,8 @@ fn send_plain_parked<G, C>(
     intake_tx: &SyncSender<EvalJob>,
 ) -> EngineResult<()>
 where
-    G: Copy + Eq,
-    C: Copy,
+    G: Copy + Eq + std::hash::Hash,
+    C: Copy + Eq + std::hash::Hash,
 {
     for parked in pool.take_unsent_parked() {
         intake_tx
@@ -1377,25 +1377,25 @@ fn append_replay_job(
 
 /// Resumes every pending reply; returns the newest model version seen so
 /// callers can drive version-triggered opponent rollouts.
-fn receive_replies<G, C>(
-    pool: &mut WorkerPool<G, C>,
+fn receive_replies<E>(
+    engine: &mut E,
+    pool: &mut WorkerPool<E::Graph, E::Candidate>,
     reply_rx: &Receiver<EvalReply>,
 ) -> EngineResult<Option<ModelVersion>>
 where
-    G: Copy + Eq,
-    C: Copy,
+    E: GraphEngine,
 {
     let reply = reply_rx
         .recv()
         .map_err(|_| internal("eval backend unavailable"))?;
     let mut version = reply.output.model_version;
-    pool.resume(reply.slot, reply.token, reply.output)?;
+    pool.resume(engine, reply.slot, reply.token, reply.output)?;
 
     loop {
         match reply_rx.try_recv() {
             Ok(reply) => {
                 version = reply.output.model_version;
-                pool.resume(reply.slot, reply.token, reply.output)?;
+                pool.resume(engine, reply.slot, reply.token, reply.output)?;
             }
             Err(TryRecvError::Empty) => return Ok(Some(version)),
             Err(TryRecvError::Disconnected) => return Err(internal("eval backend unavailable")),

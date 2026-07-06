@@ -1,5 +1,5 @@
 use super::schedule::{completed_q, softmax};
-use super::{GumbelMcts, GumbelMctsConfig, GumbelSearchContext};
+use super::{GumbelHandleBatch, GumbelMcts, GumbelMctsConfig, GumbelSearchContext};
 use crate::support::internal;
 use crate::{SearchAction, SearchCandidateSummary};
 use gz_engine::{
@@ -37,7 +37,7 @@ where
         &self,
         root_index: usize,
         context: GumbelSearchContext,
-    ) -> EngineResult<(Self, ReplayGraphContext)> {
+    ) -> EngineResult<(Self, ReplayGraphContext, GumbelHandleBatch<G, C>)> {
         let mut remap = vec![None; self.nodes.len()];
         let mut old_indices = Vec::new();
         let mut stack = vec![root_index];
@@ -56,8 +56,11 @@ where
         }
 
         let mut nodes = Vec::with_capacity(old_indices.len());
+        let mut handles = GumbelHandleBatch::default();
         for &old_index in &old_indices {
             let mut node = self.nodes[old_index].clone();
+            handles.graphs.push(node.graph);
+            handles.candidates.extend(node.candidates.iter().copied());
             for child in &mut node.children {
                 if let Some(old_child) = *child {
                     *child = remap[old_child];
@@ -83,6 +86,7 @@ where
                 carried_root_visits,
             },
             root_context,
+            handles,
         ))
     }
 

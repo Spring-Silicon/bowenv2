@@ -187,8 +187,8 @@ fn serial_orchestrator_releases_completed_episode_handles() {
         .unwrap();
 
     assert_eq!(episode.episode.created_graphs, vec![1]);
-    assert_eq!(episode.episode.created_candidates, vec![1]);
-    assert_eq!(log.entries(), vec![(vec![1], vec![1])]);
+    assert_eq!(episode.episode.created_candidates, Vec::<u8>::new());
+    assert_eq!(log.entries(), vec![(vec![], vec![1]), (vec![1], vec![])]);
 }
 
 #[test]
@@ -216,7 +216,15 @@ fn threaded_orchestrator_releases_each_completed_episode() {
         .unwrap();
 
     assert_eq!(run.lanes[0].episodes.len(), 2);
-    assert_eq!(log.entries(), vec![(vec![1], vec![1]), (vec![1], vec![1])]);
+    assert_eq!(
+        log.entries(),
+        vec![
+            (vec![], vec![1]),
+            (vec![1], vec![]),
+            (vec![], vec![1]),
+            (vec![1], vec![])
+        ]
+    );
 }
 
 fn search() -> GumbelMcts {

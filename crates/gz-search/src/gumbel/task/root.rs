@@ -4,7 +4,8 @@ use super::super::schedule::{
 };
 use super::super::tree::{Edge, Node, Tree};
 use super::super::{
-    GumbelMcts, GumbelMctsConfig, GumbelRootResult, GumbelRootStats, GumbelSearchContext,
+    GumbelHandleBatch, GumbelMcts, GumbelMctsConfig, GumbelRootResult, GumbelRootStats,
+    GumbelSearchContext,
 };
 use super::state::{
     DescentPoll, DescentState, NodeExpansion, PendingRootWork, RootTaskState, RunState,
@@ -66,11 +67,11 @@ where
         root: G,
         expected_context: ReplayGraphContext,
         context: GumbelSearchContext,
-    ) -> EngineResult<Option<Self>> {
+    ) -> EngineResult<Option<ReusedRootTask<G, C>>> {
         let Some(child_index) = self.tree.nodes[0].children[action] else {
             return Ok(None);
         };
-        let (tree, root_context) = self.tree.compact_subtree(child_index, context)?;
+        let (tree, root_context, handles) = self.tree.compact_subtree(child_index, context)?;
         if root_context != expected_context {
             return Err(internal("reused root context mismatch"));
         }
@@ -88,7 +89,7 @@ where
         };
         let run = task.start_run_state();
         task.state = RootTaskState::Running(run);
-        Ok(Some(task))
+        Ok(Some(ReusedRootTask { task, handles }))
     }
 
     pub fn poll(&mut self) -> EngineResult<SearchPoll<G, C, GumbelRootResult<G, C>>> {
@@ -593,4 +594,9 @@ where
             },
         }))
     }
+}
+
+pub(super) struct ReusedRootTask<G, C> {
+    pub(super) task: GumbelRootTask<G, C>,
+    pub(super) handles: GumbelHandleBatch<G, C>,
 }

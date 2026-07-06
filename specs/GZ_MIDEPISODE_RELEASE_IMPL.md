@@ -1,6 +1,6 @@
 # Mid-Episode Subtree Release Implementation Spec
 
-Status: design for review
+Status: implemented (2026-07-06); review notes in the landing commit
 
 Purpose: bound the selfplay working set by the CARRIED search tree
 instead of the episode's full creation history. Today every graph and

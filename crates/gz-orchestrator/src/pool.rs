@@ -6,9 +6,10 @@ use gz_engine::{EngineResult, GraphEngine};
 use gz_eval::{EvalOutput, EvalRequest};
 use gz_features::{FeatureExtractor, FeatureRow, PositionFeatures};
 use gz_search::{
-    EngineIdentity, GumbelEpisodeTask, GumbelMcts, SearchPoll, SearchWork, SearchWorkResult,
-    WorkToken,
+    EngineIdentity, GumbelEpisodeTask, GumbelHandleBatch, GumbelMcts, SearchPoll, SearchWork,
+    SearchWorkResult, WorkToken,
 };
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 
 pub(crate) struct WorkerPool<G, C> {
@@ -90,8 +91,8 @@ impl<G, C> SlotState<G, C> {
 
 impl<G, C> WorkerPool<G, C>
 where
-    G: Copy + Eq,
-    C: Copy,
+    G: Copy + Eq + Hash,
+    C: Copy + Eq + Hash,
 {
     pub(crate) fn new(workers: NonZeroUsize, worker_id_base: u64) -> Self {
         let slots = (0..workers.get())
@@ -183,28 +184,61 @@ where
 
         for slot in &mut self.slots {
             while let Some(mut episode) = slot.state.take_running() {
-                match episode.task.poll()? {
+                let poll = match episode.task.poll() {
+                    Ok(poll) => poll,
+                    Err(error) => {
+                        release_task_all(engine, &mut episode.task)?;
+                        return Err(error);
+                    }
+                };
+                release_task_releasable(engine, &mut episode.task)?;
+
+                match poll {
                     SearchPoll::Work(work) => {
                         let token = work.token();
-                        if let Some(result) = service_engine_work(engine, &work)? {
-                            episode.task.resume(token, result)?;
+                        let result = match service_engine_work(engine, &work) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                release_task_all(engine, &mut episode.task)?;
+                                return Err(error);
+                            }
+                        };
+                        if let Some(result) = result {
+                            if let Err(error) = episode.task.resume(token, result) {
+                                release_task_all(engine, &mut episode.task)?;
+                                return Err(error);
+                            }
+                            release_task_releasable(engine, &mut episode.task)?;
                             slot.state = SlotState::Running(episode);
                             continue;
                         }
 
                         let SearchWork::Eval(work) = work else {
+                            release_task_all(engine, &mut episode.task)?;
                             return Err(internal("unsupported search work"));
                         };
-                        let action_count = u32::try_from(work.request.actions.len())
-                            .map_err(|_| internal("action count overflow"))?;
+                        let action_count = match u32::try_from(work.request.actions.len()) {
+                            Ok(action_count) => action_count,
+                            Err(_) => {
+                                release_task_all(engine, &mut episode.task)?;
+                                return Err(internal("action count overflow"));
+                            }
+                        };
                         let row = match extractor.as_deref_mut() {
                             Some(extractor) => {
                                 let position = position_features(work.request.position);
-                                Some(
-                                    extractor
-                                        .extract(engine, work.graph, &work.candidates, position)
-                                        .map_err(|_| internal("feature extraction failed"))?,
-                                )
+                                match extractor.extract(
+                                    engine,
+                                    work.graph,
+                                    &work.candidates,
+                                    position,
+                                ) {
+                                    Ok(row) => Some(row),
+                                    Err(_) => {
+                                        release_task_all(engine, &mut episode.task)?;
+                                        return Err(internal("feature extraction failed"));
+                                    }
+                                }
                             }
                             None => None,
                         };
@@ -218,7 +252,7 @@ where
                         };
                     }
                     SearchPoll::Blocked => {
-                        slot.state = SlotState::Running(episode);
+                        release_task_all(engine, &mut episode.task)?;
                         return Err(internal(blocked_message));
                     }
                     SearchPoll::Done(result) => {
@@ -285,12 +319,16 @@ where
             .collect()
     }
 
-    pub(crate) fn resume(
+    pub(crate) fn resume<E>(
         &mut self,
+        engine: &mut E,
         slot_index: usize,
         token: WorkToken,
         output: EvalOutput,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<()>
+    where
+        E: GraphEngine<Graph = G, Candidate = C>,
+    {
         let slot = self
             .slots
             .get_mut(slot_index)
@@ -307,7 +345,11 @@ where
             .state
             .take_parked()
             .expect("token check ensures the slot is parked");
-        episode.task.resume(token, SearchWorkResult::Eval(output))?;
+        if let Err(error) = episode.task.resume(token, SearchWorkResult::Eval(output)) {
+            release_task_all(engine, &mut episode.task)?;
+            return Err(error);
+        }
+        release_task_releasable(engine, &mut episode.task)?;
         slot.state = SlotState::Running(episode);
         Ok(())
     }
@@ -327,6 +369,39 @@ where
     pub(crate) fn active(&self) -> bool {
         self.has_running() || self.has_parked()
     }
+}
+
+fn release_task_releasable<E>(
+    engine: &mut E,
+    task: &mut GumbelEpisodeTask<E::Graph, E::Candidate>,
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    release_handles(engine, task.take_releasable())
+}
+
+fn release_task_all<E>(
+    engine: &mut E,
+    task: &mut GumbelEpisodeTask<E::Graph, E::Candidate>,
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    release_handles(engine, task.take_all_handles())
+}
+
+fn release_handles<E>(
+    engine: &mut E,
+    handles: GumbelHandleBatch<E::Graph, E::Candidate>,
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    if handles.is_empty() {
+        return Ok(());
+    }
+    engine.release(&handles.graphs, &handles.candidates)
 }
 
 const fn position_features(position: gz_eval::EvalPositionContext) -> PositionFeatures {

@@ -81,7 +81,7 @@ where
             batch_sizes.push(requests.len());
 
             for (parked, output) in parked.into_iter().zip(outputs) {
-                pool.resume(parked.slot, parked.token, output)?;
+                pool.resume(&mut self.engine, parked.slot, parked.token, output)?;
             }
         }
     }

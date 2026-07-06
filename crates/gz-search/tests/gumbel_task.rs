@@ -345,3 +345,88 @@ fn episode_task_emits_final_measure() {
 
     assert_eq!(measure.graph, 0);
 }
+
+#[test]
+fn episode_task_exposes_releasable_handles_before_measure() {
+    let mut engine = TestEngine::new()
+        .candidates(0, [1, 2])
+        .candidates(20, [])
+        .apply(0, 2, 20)
+        .reward(20, 20.0);
+    let search = GumbelMcts::new(config(1));
+    let mut task = GumbelEpisodeTask::new(
+        &search,
+        EngineIdentity::from_engine(&engine),
+        0,
+        GumbelEpisodeContext::default(),
+    );
+
+    let expand = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Expand(work)) => work,
+        other => panic!("expected root expand, got {other:?}"),
+    };
+    task.resume(
+        expand.token,
+        SearchWorkResult::Expand(expand_result(&mut engine, expand.graph, expand.options)),
+    )
+    .unwrap();
+
+    let eval = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Eval(work)) => work,
+        other => panic!("expected root eval, got {other:?}"),
+    };
+    task.resume(
+        eval.token,
+        SearchWorkResult::Eval(output_with_logits(vec![0.0, 10.0, -10.0], 0.0)),
+    )
+    .unwrap();
+
+    let apply = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Apply(work)) => work,
+        other => panic!("expected apply, got {other:?}"),
+    };
+    assert_eq!(apply.candidate, 2);
+    let applied = GraphEngine::apply(&mut engine, apply.graph, apply.candidate).unwrap();
+    task.resume(apply.token, SearchWorkResult::Apply(applied))
+        .unwrap();
+
+    let child_expand = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Expand(work)) => work,
+        other => panic!("expected child expand, got {other:?}"),
+    };
+    task.resume(
+        child_expand.token,
+        SearchWorkResult::Expand(expand_result(
+            &mut engine,
+            child_expand.graph,
+            child_expand.options,
+        )),
+    )
+    .unwrap();
+
+    let child_eval = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Eval(work)) => work,
+        other => panic!("expected child eval, got {other:?}"),
+    };
+    task.resume(child_eval.token, SearchWorkResult::Eval(output(1, 0.0)))
+        .unwrap();
+
+    let measure = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Measure(work)) => work,
+        other => panic!("expected measure, got {other:?}"),
+    };
+    let releasable = task.take_releasable();
+    assert_eq!(releasable.graphs, Vec::<u8>::new());
+    assert_eq!(releasable.candidates, vec![1, 2]);
+
+    let measured = GraphEngine::measure(&mut engine, measure.graph, measure.options).unwrap();
+    task.resume(measure.token, SearchWorkResult::Measure(measured))
+        .unwrap();
+
+    let episode = match task.poll().unwrap() {
+        SearchPoll::Done(episode) => episode,
+        other => panic!("expected done, got {other:?}"),
+    };
+    assert_eq!(episode.created_graphs, vec![20]);
+    assert_eq!(episode.created_candidates, Vec::<u8>::new());
+}

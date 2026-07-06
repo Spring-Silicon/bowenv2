@@ -3,7 +3,8 @@ use crate::{EpisodeId, WorkerId};
 use gz_engine::{EngineResult, GraphEngine};
 use gz_eval::EngineEvaluator;
 use gz_search::{
-    EngineIdentity, GumbelEpisode, GumbelEpisodeContext, GumbelEpisodeTask, GumbelMcts, SearchPoll,
+    EngineIdentity, GumbelEpisode, GumbelEpisodeContext, GumbelEpisodeTask, GumbelHandleBatch,
+    GumbelMcts, SearchPoll,
 };
 
 pub struct SerialGumbelOrchestrator<E, V> {
@@ -59,13 +60,34 @@ where
         let mut task = GumbelEpisodeTask::new(&self.search, identity, root, context);
 
         loop {
-            match task.poll()? {
-                SearchPoll::Work(work) => {
-                    let token = work.token();
-                    let result = service_work(&mut self.engine, &mut self.evaluator, work)?;
-                    task.resume(token, result)?;
+            let poll = match task.poll() {
+                Ok(poll) => poll,
+                Err(error) => {
+                    self.release_handles(task.take_all_handles())?;
+                    return Err(error);
                 }
-                SearchPoll::Blocked => return Err(internal("serial driver blocked")),
+            };
+            match poll {
+                SearchPoll::Work(work) => {
+                    self.release_handles(task.take_releasable())?;
+                    let token = work.token();
+                    let result = match service_work(&mut self.engine, &mut self.evaluator, work) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.release_handles(task.take_all_handles())?;
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = task.resume(token, result) {
+                        self.release_handles(task.take_all_handles())?;
+                        return Err(error);
+                    }
+                    self.release_handles(task.take_releasable())?;
+                }
+                SearchPoll::Blocked => {
+                    self.release_handles(task.take_all_handles())?;
+                    return Err(internal("serial driver blocked"));
+                }
                 SearchPoll::Done(episode) => {
                     let episode_id = EpisodeId::new(self.next_episode_id);
                     self.next_episode_id += 1;
@@ -79,5 +101,15 @@ where
                 }
             }
         }
+    }
+
+    fn release_handles(
+        &mut self,
+        handles: GumbelHandleBatch<E::Graph, E::Candidate>,
+    ) -> EngineResult<()> {
+        if handles.is_empty() {
+            return Ok(());
+        }
+        self.engine.release(&handles.graphs, &handles.candidates)
     }
 }

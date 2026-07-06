@@ -1,15 +1,17 @@
 use super::super::schedule::budget_fraction;
 use super::super::{
-    GumbelEpisode, GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelRootResult,
-    GumbelRootStats, GumbelSearchContext, GumbelStep, GumbelStopReason,
+    GumbelEpisode, GumbelEpisodeContext, GumbelHandleBatch, GumbelMcts, GumbelMctsConfig,
+    GumbelRootResult, GumbelRootStats, GumbelSearchContext, GumbelStep, GumbelStopReason,
 };
-use super::root::GumbelRootTask;
+use super::root::{GumbelRootTask, ReusedRootTask};
 use crate::SearchAction;
 use crate::support::{internal, step_ref};
 use crate::work::{
     EngineIdentity, MeasureWork, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
 };
 use gz_engine::{EngineResult, ReplayGraphContext, SearchConfigHash};
+use std::collections::HashMap;
+use std::hash::Hash;
 
 pub struct GumbelEpisodeTask<G, C> {
     config: GumbelMctsConfig,
@@ -22,8 +24,10 @@ pub struct GumbelEpisodeTask<G, C> {
     root_context: Option<ReplayGraphContext>,
     steps: Vec<GumbelStep<G, C>>,
     root_stats: Vec<GumbelRootStats>,
-    created_graphs: Vec<G>,
-    created_candidates: Vec<C>,
+    path_graphs: Vec<G>,
+    move_graphs: Vec<G>,
+    move_candidates: Vec<C>,
+    releasable: GumbelHandleBatch<G, C>,
     step_index: usize,
     budget_step: f32,
     next_token: u64,
@@ -33,8 +37,8 @@ pub struct GumbelEpisodeTask<G, C> {
 
 impl<G, C> GumbelEpisodeTask<G, C>
 where
-    G: Copy + Eq,
-    C: Copy,
+    G: Copy + Eq + Hash,
+    C: Copy + Eq + Hash,
 {
     pub fn new(
         search: &GumbelMcts,
@@ -59,8 +63,10 @@ where
             root_context: None,
             steps: Vec::new(),
             root_stats: Vec::new(),
-            created_graphs: Vec::new(),
-            created_candidates: Vec::new(),
+            path_graphs: Vec::new(),
+            move_graphs: Vec::new(),
+            move_candidates: Vec::new(),
+            releasable: GumbelHandleBatch::default(),
             step_index: 0,
             budget_step,
             next_token: 0,
@@ -177,8 +183,8 @@ where
                     final_context,
                     steps: std::mem::take(&mut self.steps),
                     root_stats: std::mem::take(&mut self.root_stats),
-                    created_graphs: std::mem::take(&mut self.created_graphs),
-                    created_candidates: std::mem::take(&mut self.created_candidates),
+                    created_graphs: self.take_final_graphs(),
+                    created_candidates: self.take_final_candidates(),
                     final_measure: measure,
                     stop_reason,
                     search_config_hash: self.search_config_hash,
@@ -192,6 +198,18 @@ where
         }
     }
 
+    pub fn take_releasable(&mut self) -> GumbelHandleBatch<G, C> {
+        std::mem::take(&mut self.releasable)
+    }
+
+    pub fn take_all_handles(&mut self) -> GumbelHandleBatch<G, C> {
+        let mut handles = self.take_releasable();
+        handles.graphs.append(&mut self.path_graphs);
+        handles.graphs.append(&mut self.move_graphs);
+        handles.candidates.append(&mut self.move_candidates);
+        handles
+    }
+
     fn next_token(&mut self) -> WorkToken {
         let token = WorkToken::new(self.next_token);
         self.next_token += 1;
@@ -201,7 +219,7 @@ where
     fn track_created_handles(&mut self, result: &SearchWorkResult<G, C>) {
         match result {
             SearchWorkResult::Expand(expanded) => {
-                self.created_candidates.extend(
+                self.move_candidates.extend(
                     expanded
                         .candidates
                         .iter()
@@ -209,7 +227,7 @@ where
                 );
             }
             SearchWorkResult::Apply(applied) => {
-                self.created_graphs.push(applied.after);
+                self.move_graphs.push(applied.after);
             }
             SearchWorkResult::Measure(_) | SearchWorkResult::Eval(_) => {}
         }
@@ -247,7 +265,7 @@ where
         &self,
         root_task: &GumbelRootTask<G, C>,
         result: &GumbelRootResult<G, C>,
-    ) -> EngineResult<Option<GumbelRootTask<G, C>>> {
+    ) -> EngineResult<Option<ReusedRootTask<G, C>>> {
         let next_step = self.step_index + 1;
         if !self.config.tree_reuse
             || matches!(result.selected_action, SearchAction::Stop)
@@ -268,7 +286,7 @@ where
     fn finish_root_result(
         &mut self,
         result: GumbelRootResult<G, C>,
-        reused_root: Option<GumbelRootTask<G, C>>,
+        reused_root: Option<ReusedRootTask<G, C>>,
     ) -> EngineResult<()> {
         let before_context = self.current_context.unwrap_or(result.root_context);
         let step_ref = step_ref(
@@ -277,6 +295,7 @@ where
             result.selected_after_context,
         )?;
         let selected_stop = matches!(result.selected_action, SearchAction::Stop);
+        let selected_graph = (!selected_stop).then_some(result.selected_after);
         let step = GumbelStep {
             before: self.current,
             after: result.selected_after,
@@ -305,6 +324,12 @@ where
         self.root_stats.push(result.stats);
         self.step_index += 1;
 
+        let (reused_root, carried) = match reused_root {
+            Some(reused) => (Some(reused.task), reused.handles),
+            None => (None, GumbelHandleBatch::default()),
+        };
+        self.partition_move_handles(&carried, selected_graph);
+
         if selected_stop {
             self.state = EpisodeTaskState::Measure {
                 stop_reason: GumbelStopReason::SelectedStop,
@@ -321,6 +346,79 @@ where
 
         Ok(())
     }
+
+    fn partition_move_handles(
+        &mut self,
+        carried: &GumbelHandleBatch<G, C>,
+        selected_graph: Option<G>,
+    ) {
+        let mut selected_graphs = HashMap::new();
+        if let Some(graph) = selected_graph {
+            selected_graphs.insert(graph, 1);
+        }
+
+        let mut carried_graphs = handle_counts(&carried.graphs);
+        let mut next_graphs = Vec::new();
+        for graph in self.move_graphs.drain(..) {
+            if decrement_count(&mut selected_graphs, graph) {
+                self.path_graphs.push(graph);
+            } else if decrement_count(&mut carried_graphs, graph) {
+                next_graphs.push(graph);
+            } else {
+                self.releasable.graphs.push(graph);
+            }
+        }
+        self.move_graphs = next_graphs;
+
+        let mut carried_candidates = handle_counts(&carried.candidates);
+        let mut next_candidates = Vec::new();
+        for candidate in self.move_candidates.drain(..) {
+            if decrement_count(&mut carried_candidates, candidate) {
+                next_candidates.push(candidate);
+            } else {
+                self.releasable.candidates.push(candidate);
+            }
+        }
+        self.move_candidates = next_candidates;
+    }
+
+    fn take_final_graphs(&mut self) -> Vec<G> {
+        let mut graphs = std::mem::take(&mut self.releasable.graphs);
+        graphs.append(&mut self.path_graphs);
+        graphs.append(&mut self.move_graphs);
+        graphs
+    }
+
+    fn take_final_candidates(&mut self) -> Vec<C> {
+        let mut candidates = std::mem::take(&mut self.releasable.candidates);
+        candidates.append(&mut self.move_candidates);
+        candidates
+    }
+}
+
+fn handle_counts<T>(handles: &[T]) -> HashMap<T, usize>
+where
+    T: Copy + Eq + Hash,
+{
+    let mut counts = HashMap::with_capacity(handles.len());
+    for handle in handles {
+        *counts.entry(*handle).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn decrement_count<T>(counts: &mut HashMap<T, usize>, handle: T) -> bool
+where
+    T: Copy + Eq + Hash,
+{
+    let Some(count) = counts.get_mut(&handle) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        counts.remove(&handle);
+    }
+    true
 }
 
 #[allow(clippy::large_enum_variant)]

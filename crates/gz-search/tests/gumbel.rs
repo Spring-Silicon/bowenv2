@@ -150,7 +150,7 @@ fn episode_records_created_engine_handles() {
         .unwrap();
 
     assert_eq!(episode.created_graphs, vec![20]);
-    assert_eq!(episode.created_candidates, vec![1, 2]);
+    assert_eq!(episode.created_candidates, Vec::<u8>::new());
 }
 
 #[test]

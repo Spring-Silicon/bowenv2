@@ -6,8 +6,9 @@ mod types;
 pub use schedule::considered_visit_sequence;
 pub use task::{GumbelEpisodeTask, GumbelRootTask};
 pub use types::{
-    GumbelEpisode, GumbelEpisodeContext, GumbelMctsConfig, GumbelOpponentContext, GumbelRootResult,
-    GumbelRootStats, GumbelSearchContext, GumbelStep, GumbelStopReason,
+    GumbelEpisode, GumbelEpisodeContext, GumbelHandleBatch, GumbelMctsConfig,
+    GumbelOpponentContext, GumbelRootResult, GumbelRootStats, GumbelSearchContext, GumbelStep,
+    GumbelStopReason,
 };
 
 use crate::gumbel::schedule::budget_fraction;
@@ -118,13 +119,34 @@ impl GumbelMcts {
         let mut task = GumbelEpisodeTask::new(self, identity, root, context);
 
         loop {
-            match task.poll()? {
-                SearchPoll::Work(work) => {
-                    let token = work.token();
-                    let result = service_search_work(engine, evaluator, work)?;
-                    task.resume(token, result)?;
+            let poll = match task.poll() {
+                Ok(poll) => poll,
+                Err(error) => {
+                    release_task_all(engine, &mut task)?;
+                    return Err(error);
                 }
-                SearchPoll::Blocked => return Err(internal("serial driver blocked")),
+            };
+            match poll {
+                SearchPoll::Work(work) => {
+                    release_task_releasable(engine, &mut task)?;
+                    let token = work.token();
+                    let result = match service_search_work(engine, evaluator, work) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            release_task_all(engine, &mut task)?;
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = task.resume(token, result) {
+                        release_task_all(engine, &mut task)?;
+                        return Err(error);
+                    }
+                    release_task_releasable(engine, &mut task)?;
+                }
+                SearchPoll::Blocked => {
+                    release_task_all(engine, &mut task)?;
+                    return Err(internal("serial driver blocked"));
+                }
                 SearchPoll::Done(result) => return Ok(result),
             }
         }
@@ -156,6 +178,39 @@ impl GumbelMcts {
             }
         }
     }
+}
+
+fn release_task_releasable<E>(
+    engine: &mut E,
+    task: &mut GumbelEpisodeTask<E::Graph, E::Candidate>,
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    release_handles(engine, task.take_releasable())
+}
+
+fn release_task_all<E>(
+    engine: &mut E,
+    task: &mut GumbelEpisodeTask<E::Graph, E::Candidate>,
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    release_handles(engine, task.take_all_handles())
+}
+
+fn release_handles<E>(
+    engine: &mut E,
+    handles: GumbelHandleBatch<E::Graph, E::Candidate>,
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    if handles.is_empty() {
+        return Ok(());
+    }
+    engine.release(&handles.graphs, &handles.candidates)
 }
 
 fn service_search_work<E, V>(
