@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from gz.trainer.loop import policy_ce_loss, value_bce_loss
+from gz.trainer.loop import policy_ce_loss, value_bce_loss, value_mse_loss
 
 torch = pytest.importorskip("torch")
 
@@ -44,6 +44,28 @@ def test_value_bce_loss_zero_valid_has_finite_gradient() -> None:
 
     assert float(loss) == 0.0
     assert value_raw.grad is not None
+    assert value_raw.grad.tolist() == [0.0, 0.0]
+
+
+def test_value_mse_loss_matches_literal_and_masks_invalid() -> None:
+    value_raw = torch.tensor([0.5, -0.25, 0.9], dtype=torch.float32)
+    value = torch.tensor([1.0, -1.0, 1.0], dtype=torch.float32)
+    valid = torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32)
+
+    loss = value_mse_loss(value_raw, value, valid, row_count=3)
+
+    assert float(loss) == pytest.approx((0.5**2 + 0.75**2) / 2.0)
+
+
+def test_value_mse_loss_zero_valid_has_finite_gradient() -> None:
+    value_raw = torch.tensor([1.0, -1.0], dtype=torch.float32, requires_grad=True)
+    value = torch.tensor([1.0, -1.0], dtype=torch.float32)
+    valid = torch.tensor([0.0, 0.0], dtype=torch.float32)
+
+    loss = value_mse_loss(value_raw, value, valid, row_count=2)
+    loss.backward()
+
+    assert float(loss) == 0.0
     assert value_raw.grad.tolist() == [0.0, 0.0]
 
 

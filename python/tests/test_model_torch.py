@@ -214,6 +214,20 @@ def test_pointer_policy_head_bounded_and_masks_padded_actions() -> None:
     assert ArchConfig.from_dict(legacy).policy_head == "mlp"
 
 
+def test_tanh_value_activation_bounds_values() -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    schema = schema_for_view(view, node_vocab_size=7, edge_type_count=2, action_kind_vocab_size=8)
+    arch = ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0, value_activation="tanh")
+    model = build_model(schema, arch).eval()
+
+    values, _ = run_model(model, schema, view)
+
+    assert values.abs().max() < 1.0
+    assert ArchConfig.from_dict(arch.to_dict()) == arch
+    legacy = {k: v for k, v in arch.to_dict().items() if k != "value_activation"}
+    assert ArchConfig.from_dict(legacy).value_activation == "logit"
+
+
 def test_sage_trunk_arch_round_trip_and_legacy_defaults() -> None:
     arch = make_arch("sage")
     assert ArchConfig.from_dict(arch.to_dict()) == arch

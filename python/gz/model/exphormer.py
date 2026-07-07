@@ -28,6 +28,7 @@ class ArchConfig:
     policy_head: str = "mlp"
     trunk: str = "exphormer"
     sage_layers: int = 3
+    value_activation: str = "logit"
 
     def __post_init__(self) -> None:
         if self.name != "gz-graph-v1":
@@ -52,6 +53,8 @@ class ArchConfig:
             raise ValueError("unsupported trunk")
         if self.sage_layers <= 0:
             raise ValueError("sage_layers must be positive")
+        if self.value_activation not in {"logit", "tanh"}:
+            raise ValueError("unsupported value_activation")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -68,6 +71,7 @@ class ArchConfig:
             "policy_head": self.policy_head,
             "trunk": self.trunk,
             "sage_layers": self.sage_layers,
+            "value_activation": self.value_activation,
         }
 
     def encode(self) -> bytes:
@@ -95,8 +99,9 @@ class ArchConfig:
             "policy_head",
             "trunk",
             "sage_layers",
+            "value_activation",
         }
-        optional = {"value_input", "policy_head", "trunk", "sage_layers"}
+        optional = {"value_input", "policy_head", "trunk", "sage_layers", "value_activation"}
         keys = set(value)
         if not (fields - optional <= keys <= fields):
             raise ValueError("arch config fields mismatch")
@@ -114,6 +119,7 @@ class ArchConfig:
             policy_head=_str(value, "policy_head", "mlp"),
             trunk=_str(value, "trunk", "exphormer"),
             sage_layers=_int(value, "sage_layers", 3),
+            value_activation=_str(value, "value_activation", "logit"),
         )
 
 
@@ -443,6 +449,10 @@ def _model_class():
                 else:
                     value_input = torch.cat((g_readout, opponent_readout), dim=-1)
             value_raw = self.value(value_input).squeeze(-1)
+            if self.arch.value_activation == "tanh":
+                # whittlezero's bounded value head: the serving-side search
+                # and the MSE training target share the [-1, 1] scale.
+                value_raw = torch.tanh(value_raw)
             return value_raw, logits
 
         def _encode_graph(self, graph: GraphStateTensors):

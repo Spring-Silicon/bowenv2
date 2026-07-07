@@ -68,7 +68,10 @@ class TrainerLoop:
                 logits, batch.policy, batch.features.action_count, batch.row_count
             )
             value = flipped_value_targets(torch, batch.value, value_flip)
-            value_loss = value_bce_loss(value_raw, value, batch.value_valid, batch.row_count)
+            if getattr(getattr(self.model, "arch", None), "value_activation", "logit") == "tanh":
+                value_loss = value_mse_loss(value_raw, value, batch.value_valid, batch.row_count)
+            else:
+                value_loss = value_bce_loss(value_raw, value, batch.value_valid, batch.row_count)
             loss = policy_loss + self.config.value_weight * value_loss
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
@@ -153,6 +156,19 @@ def value_bce_loss(value_raw: object, value: object, value_valid: object, row_co
     per_row = functional.binary_cross_entropy_with_logits(
         2.0 * value_raw, target, reduction="none"
     )
+    return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
+
+
+def value_mse_loss(value_raw: object, value: object, value_valid: object, row_count: int) -> object:
+    # whittlezero's value loss: MSE against the +/-1 target on the
+    # tanh-bounded head. Masking mirrors value_bce_loss -- fully
+    # tensorized, invalid rows zeroed and weighted out.
+    torch = _torch()
+    row_mask = _row_mask(torch, row_count, value_raw.shape[0], value_raw.device)
+    valid = row_mask & (value_valid > 0)
+    weight = valid.to(value_raw.dtype)
+    target = torch.where(valid, value, torch.zeros_like(value))
+    per_row = (value_raw - target) ** 2
     return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
 
 
