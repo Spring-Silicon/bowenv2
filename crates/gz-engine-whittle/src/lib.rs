@@ -8,8 +8,8 @@ mod graph;
 mod rules;
 
 pub use engine::{
-    ArenaOccupancy, GeneratedWhittleGraph, WhittleContractFixture, WhittleEngine,
-    WhittleEngineConfig, WhittleGeneratorConfigError, WhittleGraphGenerator,
+    ArenaOccupancy, GeneratedWhittleGraph, HashVolumeCounters, WhittleContractFixture,
+    WhittleEngine, WhittleEngineConfig, WhittleGeneratorConfigError, WhittleGraphGenerator,
     WhittleGraphGeneratorConfig, WhittleMeasureMode, WhittleRng, WhittleRoot,
 };
 pub use features::{WhittleFeatureExtractor, WhittleFeatureExtractorConfig};

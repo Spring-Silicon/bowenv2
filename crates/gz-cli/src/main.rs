@@ -37,6 +37,15 @@ fn main() {
                 summary.counters.produced_rows,
                 summary.counters.consumed_rows,
             );
+            if std::env::var_os("GZ_HASH_VOLUME_STATS").is_some() {
+                println!(
+                    "hash_volume_contexts search={} replay_rows={} reference_steps={} total={}",
+                    summary.search_contexts,
+                    summary.replay_rows,
+                    summary.reference_steps,
+                    summary.search_contexts + summary.replay_rows + summary.reference_steps,
+                );
+            }
         }),
         "replay-serve" => parse_replay_serve(args.collect()).and_then(run_replay_serve),
         _ => Err(format!("unknown command: {command}\n{}", usage())),

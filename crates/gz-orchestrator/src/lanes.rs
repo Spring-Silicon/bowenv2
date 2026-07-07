@@ -78,6 +78,9 @@ pub struct ReplayLaneSummary {
     pub episodes_completed: u64,
     pub episodes_appended: u64,
     pub episodes_dropped: u64,
+    pub search_contexts: u64,
+    pub replay_rows: u64,
+    pub reference_steps: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +89,9 @@ pub struct ThreadedReplayRun {
     pub batch_sizes: Vec<usize>,
     pub episodes_appended: u64,
     pub episodes_dropped: u64,
+    pub search_contexts: u64,
+    pub replay_rows: u64,
+    pub reference_steps: u64,
 }
 
 struct EvalJob {
@@ -322,10 +328,16 @@ where
         let episodes_appended = sink_result?;
         let mut lanes = Vec::with_capacity(lane_results.len());
         let mut episodes_dropped = 0;
+        let mut search_contexts = 0;
+        let mut replay_rows = 0;
+        let mut reference_steps = 0;
 
         for result in lane_results {
             let result = result?;
             episodes_dropped += result.episodes_dropped;
+            search_contexts += result.search_contexts;
+            replay_rows += result.replay_rows;
+            reference_steps += result.reference_steps;
             lanes.push(result);
         }
 
@@ -334,6 +346,9 @@ where
             batch_sizes,
             episodes_appended,
             episodes_dropped,
+            search_contexts,
+            replay_rows,
+            reference_steps,
         })
     }
 
@@ -552,10 +567,16 @@ where
         let episodes_appended = sink_result?;
         let mut lanes = Vec::with_capacity(lane_results.len());
         let mut episodes_dropped = 0;
+        let mut search_contexts = 0;
+        let mut replay_rows = 0;
+        let mut reference_steps = 0;
 
         for result in lane_results {
             let result = result?;
             episodes_dropped += result.episodes_dropped;
+            search_contexts += result.search_contexts;
+            replay_rows += result.replay_rows;
+            reference_steps += result.reference_steps;
             lanes.push(result);
         }
 
@@ -564,6 +585,9 @@ where
             batch_sizes,
             episodes_appended,
             episodes_dropped,
+            search_contexts,
+            replay_rows,
+            reference_steps,
         })
     }
 }
@@ -867,6 +891,9 @@ impl<'a, P> ReplayMode<'a, P> {
                 episodes_completed: 0,
                 episodes_appended: 0,
                 episodes_dropped: 0,
+                search_contexts: 0,
+                replay_rows: 0,
+                reference_steps: 0,
             },
             rollout: None,
         }
@@ -974,6 +1001,10 @@ where
             .remove(&completed.episode_id)
             .ok_or_else(|| internal("missing replay reference"))?;
         self.summary.episodes_completed += 1;
+        self.summary.search_contexts += episode_search_contexts(&completed.episode);
+        self.summary.reference_steps += reference
+            .as_ref()
+            .map_or(0, |reference| reference.steps.len() as u64);
 
         if let Some((record, rows)) = project_episode(
             &completed.episode,
@@ -982,6 +1013,7 @@ where
             completed.episode_id.value(),
         ) {
             let reward = record.outcome.learner_reward;
+            self.summary.replay_rows += rows.len() as u64;
             let append = append_replay_job(&self.replay_tx, record, rows);
             release_episode_handles(engine, &completed.episode, &[])?;
             append?;
@@ -1152,6 +1184,10 @@ where
             reference.as_ref(),
         )?;
         self.replay.summary.episodes_completed += 1;
+        self.replay.summary.search_contexts += episode_search_contexts(&completed.episode);
+        self.replay.summary.reference_steps += reference
+            .as_ref()
+            .map_or(0, |reference| reference.steps.len() as u64);
 
         if let Some((record, rows)) = project_episode(
             &completed.episode,
@@ -1160,6 +1196,7 @@ where
             completed.episode_id.value(),
         ) {
             let reward = record.outcome.learner_reward;
+            self.replay.summary.replay_rows += rows.len() as u64;
             let append = append_replay_job(&self.replay.replay_tx, record, rows);
             release_episode_handles(engine, &completed.episode, &feature_rows.candidates)?;
             append?;
@@ -1202,6 +1239,14 @@ where
             .map_err(|_| internal("eval backend unavailable"))?;
     }
     Ok(())
+}
+
+fn episode_search_contexts<G, C>(episode: &GumbelEpisode<G, C>) -> u64 {
+    episode
+        .root_stats
+        .iter()
+        .map(|stats| stats.portable_contexts as u64)
+        .sum()
 }
 
 fn send_plain_parked<G, C>(

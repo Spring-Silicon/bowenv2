@@ -301,6 +301,9 @@ pub struct SelfplaySummary {
     pub ties: u64,
     pub eval_batch_count: usize,
     pub mean_eval_batch_size: f64,
+    pub search_contexts: u64,
+    pub replay_rows: u64,
+    pub reference_steps: u64,
     pub counters: ReplayCounters,
 }
 
@@ -527,6 +530,9 @@ fn summarize(
         ties,
         eval_batch_count: run.batch_sizes.len(),
         mean_eval_batch_size,
+        search_contexts: run.search_contexts,
+        replay_rows: run.replay_rows,
+        reference_steps: run.reference_steps,
         counters,
     })
 }

@@ -13,6 +13,7 @@ pub(super) struct Tree<G, C> {
     pub(super) context: GumbelSearchContext,
     pub(super) nodes: Vec<Node<G, C>>,
     pub(super) eval_count: usize,
+    pub(super) portable_contexts: usize,
     pub(super) carried_nodes: usize,
     pub(super) carried_root_visits: u32,
 }
@@ -28,6 +29,7 @@ where
             context,
             nodes: Vec::new(),
             eval_count: 0,
+            portable_contexts: 0,
             carried_nodes: 0,
             carried_root_visits: 0,
         }
@@ -82,6 +84,7 @@ where
                 context,
                 nodes,
                 eval_count: 0,
+                portable_contexts: 0,
                 carried_nodes,
                 carried_root_visits,
             },

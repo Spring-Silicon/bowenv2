@@ -114,6 +114,7 @@ pub struct GumbelRootStats {
     pub simulations: usize,
     pub expanded_nodes: usize,
     pub eval_count: usize,
+    pub portable_contexts: usize,
     pub carried_nodes: usize,
     pub carried_root_visits: u32,
 }

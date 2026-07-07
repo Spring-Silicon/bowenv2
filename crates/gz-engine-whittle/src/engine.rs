@@ -186,6 +186,13 @@ pub struct ArenaOccupancy {
     pub candidate_refs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HashVolumeCounters {
+    pub graph_inserts: u64,
+    pub dedup_hits: u64,
+    pub portable_hashes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WhittleGeneratorConfigError {
     ZeroArity,
@@ -231,25 +238,33 @@ pub struct WhittleEngine {
 
 impl Drop for WhittleEngine {
     fn drop(&mut self) {
-        if std::env::var_os("GZ_ARENA_STATS").is_none() {
-            return;
+        if std::env::var_os("GZ_ARENA_STATS").is_some() {
+            let occupancy = self.arena_occupancy();
+            let cache_cand_ids: usize = self.caches.candidates.values().map(|c| c.ids.len()).sum();
+            let cache_trans_bodies: usize =
+                self.caches.transitions.values().map(HashMap::len).sum();
+            eprintln!(
+                "arena_stats graphs_live={} graphs_slots={} graph_refs={} cands_live={} cands_slots={} cand_refs={} cache_cand_keys={} cache_cand_ids={} cache_trans_keys={} cache_trans_bodies={}",
+                occupancy.graphs_live,
+                self.graphs.items.len(),
+                occupancy.graph_refs,
+                occupancy.candidates_live,
+                self.candidates.items.len(),
+                occupancy.candidate_refs,
+                self.caches.candidates.len(),
+                cache_cand_ids,
+                self.caches.transitions.len(),
+                cache_trans_bodies,
+            );
         }
-        let occupancy = self.arena_occupancy();
-        let cache_cand_ids: usize = self.caches.candidates.values().map(|c| c.ids.len()).sum();
-        let cache_trans_bodies: usize = self.caches.transitions.values().map(HashMap::len).sum();
-        eprintln!(
-            "arena_stats graphs_live={} graphs_slots={} graph_refs={} cands_live={} cands_slots={} cand_refs={} cache_cand_keys={} cache_cand_ids={} cache_trans_keys={} cache_trans_bodies={}",
-            occupancy.graphs_live,
-            self.graphs.items.len(),
-            occupancy.graph_refs,
-            occupancy.candidates_live,
-            self.candidates.items.len(),
-            occupancy.candidate_refs,
-            self.caches.candidates.len(),
-            cache_cand_ids,
-            self.caches.transitions.len(),
-            cache_trans_bodies,
-        );
+
+        if std::env::var_os("GZ_HASH_VOLUME_STATS").is_some() {
+            let counters = self.hash_volume_counters();
+            eprintln!(
+                "hash_volume graph_inserts={} dedup_hits={} portable_hashes={}",
+                counters.graph_inserts, counters.dedup_hits, counters.portable_hashes,
+            );
+        }
     }
 }
 
@@ -310,6 +325,11 @@ impl WhittleEngine {
             candidates_live: self.candidates.live_count(),
             candidate_refs: self.candidates.ref_count(),
         }
+    }
+
+    #[must_use]
+    pub const fn hash_volume_counters(&self) -> HashVolumeCounters {
+        self.graphs.hash_volume_counters()
     }
 
     pub(crate) fn graph(&self, graph: WhittleGraphId) -> EngineResult<&WhittleGraph> {
@@ -593,6 +613,7 @@ struct GraphArena {
     hash_refs: HashMap<GraphHash, u32>,
     engine_id: EngineId,
     engine_version: EngineVersion,
+    counters: HashVolumeCounters,
 }
 
 impl GraphArena {
@@ -604,15 +625,19 @@ impl GraphArena {
             hash_refs: HashMap::new(),
             engine_id,
             engine_version,
+            counters: HashVolumeCounters::default(),
         }
     }
 
     fn insert(&mut self, body: GraphBody) -> Result<WhittleGraphId, GraphError> {
+        self.counters.graph_inserts += 1;
         let compact = compact_graph(&body)?;
         let canonical = serialize_wav1(&compact);
         let hash = graph_hash(self.engine_id, self.engine_version, &canonical);
+        self.counters.portable_hashes += 1;
 
         if let Some(id) = self.by_hash.get(&hash).copied() {
+            self.counters.dedup_hits += 1;
             let refs = self
                 .hash_refs
                 .get_mut(&hash)
@@ -646,6 +671,10 @@ impl GraphArena {
         self.by_hash.insert(hash, id);
         *self.hash_refs.entry(hash).or_insert(0) += 1;
         Ok(id)
+    }
+
+    const fn hash_volume_counters(&self) -> HashVolumeCounters {
+        self.counters
     }
 
     fn get(&self, id: WhittleGraphId) -> Option<&WhittleGraph> {
