@@ -26,6 +26,8 @@ class ArchConfig:
     global_tokens: int = 1
     value_input: str = "single"
     policy_head: str = "mlp"
+    trunk: str = "exphormer"
+    sage_layers: int = 3
 
     def __post_init__(self) -> None:
         if self.name != "gz-graph-v1":
@@ -46,6 +48,10 @@ class ArchConfig:
             raise ValueError("unsupported value_input")
         if self.policy_head not in {"mlp", "pointer"}:
             raise ValueError("unsupported policy_head")
+        if self.trunk not in {"exphormer", "sage"}:
+            raise ValueError("unsupported trunk")
+        if self.sage_layers <= 0:
+            raise ValueError("sage_layers must be positive")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -60,6 +66,8 @@ class ArchConfig:
             "global_tokens": self.global_tokens,
             "value_input": self.value_input,
             "policy_head": self.policy_head,
+            "trunk": self.trunk,
+            "sage_layers": self.sage_layers,
         }
 
     def encode(self) -> bytes:
@@ -85,8 +93,10 @@ class ArchConfig:
             "global_tokens",
             "value_input",
             "policy_head",
+            "trunk",
+            "sage_layers",
         }
-        optional = {"value_input", "policy_head"}
+        optional = {"value_input", "policy_head", "trunk", "sage_layers"}
         keys = set(value)
         if not (fields - optional <= keys <= fields):
             raise ValueError("arch config fields mismatch")
@@ -102,6 +112,8 @@ class ArchConfig:
             global_tokens=_int(value, "global_tokens"),
             value_input=_str(value, "value_input", "single"),
             policy_head=_str(value, "policy_head", "mlp"),
+            trunk=_str(value, "trunk", "exphormer"),
+            sage_layers=_int(value, "sage_layers", 3),
         )
 
 
@@ -382,7 +394,12 @@ def _model_class():
             self.attr_proj = nn.Linear(schema.node_attr_dim, arch.dim, bias=False) if schema.node_attr_dim else None
             self.position_proj = nn.Linear(4, arch.dim)
             self.global_tokens = nn.Parameter(torch.zeros(arch.global_tokens, arch.dim))
-            self.layers = nn.ModuleList([GraphLayer(schema, arch) for _ in range(arch.layers)])
+            if arch.trunk == "sage":
+                self.sage = nn.ModuleList([DirectionalSageLayer(arch) for _ in range(arch.sage_layers)])
+                self.layers = nn.ModuleList([TransformerBlock(arch) for _ in range(arch.layers)])
+            else:
+                self.sage = None
+                self.layers = nn.ModuleList([GraphLayer(schema, arch) for _ in range(arch.layers)])
             self.kind_embedding = nn.Embedding(schema.action_kind_vocab_size, arch.dim, padding_idx=0)
             if arch.policy_head == "pointer":
                 self.policy = PointerPolicyHead(arch)
@@ -440,8 +457,19 @@ def _model_class():
 
             position = self.position_proj(graph.position).unsqueeze(1)
             g = self.global_tokens.unsqueeze(0).expand(b, -1, -1) + position
-            for layer in self.layers:
-                h, g = layer(h, g, graph, node_mask)
+            if self.sage is not None:
+                for layer in self.sage:
+                    h = layer(h, graph, node_mask)
+                seq = torch.cat((g, h), dim=1)
+                ones = node_mask.new_ones((b, g.shape[1]))
+                seq_mask = torch.cat((ones, node_mask), dim=1)
+                for layer in self.layers:
+                    seq = layer(seq, seq_mask)
+                g = seq[:, : g.shape[1]]
+                h = seq[:, g.shape[1] :] * node_mask.unsqueeze(-1)
+            else:
+                for layer in self.layers:
+                    h, g = layer(h, g, graph, node_mask)
 
             return h, g.mean(dim=1), node_mask
 
@@ -487,6 +515,51 @@ def _model_class():
             board = board + self.board_ffn(board)
             raw = torch.einsum("bd,bad->ba", board, self.pointer_key(tokens)) / math.sqrt(dim)
             return self.CLIP * torch.tanh(raw)
+
+    class DirectionalSageLayer(nn.Module):
+        # whittlezero's DirectionalSAGELayer (model/graphsage.py) over gz
+        # edge lists: sigmoid messages from each edge endpoint, max-pooled
+        # per direction via scatter-amax, combined with the node state and
+        # L2-normalized. Edge types are ignored, matching the original.
+        # Sigmoid messages are strictly positive, so a zeros-initialized
+        # amax scatter reproduces the original's masked-max-else-zero.
+        def __init__(self, arch: ArchConfig) -> None:
+            super().__init__()
+            self.src_msg = nn.Linear(arch.dim, arch.dim)
+            self.dst_msg = nn.Linear(arch.dim, arch.dim)
+            self.combine = nn.Linear(arch.dim * 3, arch.dim)
+
+        def forward(self, h, graph: GraphStateTensors, node_mask):
+            b, n, d = h.shape
+            src, dst, mask = _valid_edges(torch, graph, node_mask)
+            weight = mask.unsqueeze(-1).to(h.dtype)
+            fwd = torch.sigmoid(self.src_msg(_gather_nodes(torch, h, src))) * weight
+            rev = torch.sigmoid(self.dst_msg(_gather_nodes(torch, h, dst))) * weight
+            fwd_agg = torch.zeros((b, n, d), dtype=h.dtype, device=h.device)
+            fwd_agg.scatter_reduce_(1, dst.unsqueeze(-1).expand(-1, -1, d), fwd, reduce="amax", include_self=True)
+            rev_agg = torch.zeros((b, n, d), dtype=h.dtype, device=h.device)
+            rev_agg.scatter_reduce_(1, src.unsqueeze(-1).expand(-1, -1, d), rev, reduce="amax", include_self=True)
+            out = torch.relu(self.combine(torch.cat((h, fwd_agg, rev_agg), dim=-1)))
+            out = functional.normalize(out, p=2.0, dim=-1, eps=1e-8)
+            return out * node_mask.unsqueeze(-1)
+
+    class TransformerBlock(nn.Module):
+        # Pre-norm encoder block (whittlezero's build_transformer_encoder
+        # with norm_first=True), run over [global tokens | nodes] with the
+        # padded nodes masked out of the keys.
+        def __init__(self, arch: ArchConfig) -> None:
+            super().__init__()
+            self.norm_attn = nn.LayerNorm(arch.dim)
+            self.norm_ffn = nn.LayerNorm(arch.dim)
+            self.attn = DenseAttention(arch)
+            self.drop = nn.Dropout(arch.dropout)
+            self.ffn = _mlp(nn, arch.dim, arch.ffn_dim, arch.dim, arch.activation, arch.dropout)
+
+        def forward(self, seq, seq_mask):
+            x = self.norm_attn(seq)
+            seq = seq + self.drop(self.attn(x, x, seq_mask))
+            seq = seq + self.ffn(self.norm_ffn(seq))
+            return seq
 
     class GraphLayer(nn.Module):
         def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
@@ -622,6 +695,17 @@ def _opponent_graph(batch: GraphBatchTensors) -> GraphStateTensors:
     )
 
 
+def _valid_edges(torch: object, graph: GraphStateTensors, node_mask: object):
+    e = graph.edge_src.shape[1]
+    edge_index = torch.arange(e, device=graph.edge_src.device)
+    mask = edge_index.unsqueeze(0) < graph.edge_count.unsqueeze(1)
+    mask = mask & (graph.edge_src < graph.node_count.unsqueeze(1))
+    mask = mask & (graph.edge_dst < graph.node_count.unsqueeze(1))
+    src = graph.edge_src.clamp(0, node_mask.shape[1] - 1)
+    dst = graph.edge_dst.clamp(0, node_mask.shape[1] - 1)
+    return src, dst, mask
+
+
 def _mirrored_edges(torch: object, graph: GraphStateTensors, node_mask: object, edge_type_count: int):
     e = graph.edge_src.shape[1]
     edge_index = torch.arange(e, device=graph.edge_src.device)
@@ -694,8 +778,8 @@ def _update_chunk(hasher: object, value: bytes) -> None:
     hasher.update(value)
 
 
-def _int(value: dict[str, object], name: str) -> int:
-    field = value[name]
+def _int(value: dict[str, object], name: str, default: int | None = None) -> int:
+    field = value[name] if default is None else value.get(name, default)
     if not isinstance(field, int):
         raise ValueError(f"{name} must be an integer")
     return field
