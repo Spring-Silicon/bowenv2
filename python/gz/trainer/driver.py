@@ -29,6 +29,7 @@ class TrainerConfig:
     total_steps: int = 1000
     publish_interval: int = 500
     value_weight: float = 1.0
+    weight_decay: float = 0.01
     ema_decay: float = 0.999
     grad_clip: float = 1.0
     min_startup_rows: int = 256
@@ -206,6 +207,7 @@ def run(config_path: str | Path) -> None:
                 warmup_steps=config.trainer.warmup_steps,
                 total_steps=config.trainer.total_steps,
                 value_weight=config.trainer.value_weight,
+                weight_decay=config.trainer.weight_decay,
                 grad_clip=config.trainer.grad_clip,
                 run_seed=config.trainer.seed,
             ),
