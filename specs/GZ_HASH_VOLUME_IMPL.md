@@ -1,6 +1,17 @@
 # Blake3 Volume Reduction Implementation Spec
 
-Status: implementation work order
+Status: CLOSED -- Stage 1 measured below the gate and was reverted
+(2026-07-07). Fingerprint dedup + lazy memoized blake3 cut hash calls
+exactly as designed (490,558 -> 248,060, the 49% dedup rate; episodes
+bit-identical) but user CPU was 259.6s vs 259.0 baseline over 3
+trials: the fingerprint reads every canonical byte and the dedup
+byte-compare reads them again, so total memory traffic over the ~1KB
+canonical buffers -- the actual cost blake3's profile share was
+measuring -- did not drop. Together with the hasher-swap dead end
+below, this closes the hashing thread: the remaining lever on this
+path would be avoiding canonicalization itself (serialize_wav1 per
+insert), a different and larger change. Stage 0 counters remain in
+tree (committed fd871f4).
 
 Purpose: cut selfplay CPU by computing FEWER blake3 digests, not
 cheaper ones. blake3 is 15% of stub-selfplay CPU samples (19-21% in
