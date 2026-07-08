@@ -65,6 +65,10 @@ pub struct SelfplayConfig {
     /// root (whittlezero's no_backtrack). Learner search only; reference
     /// rollouts stay plain greedy.
     pub no_backtrack: bool,
+    /// Mask STOP out of the learner's search wherever a rewrite exists
+    /// (STOP-only nodes keep it); episodes then run to the step budget.
+    /// Reference rollouts always mask STOP regardless.
+    pub mask_stop: bool,
     /// Evaluator processes to spawn and stripe lanes across (featurized
     /// evaluators only). Each process parallelizes per-batch host work
     /// on its own interpreter and keeps the GPU kernel queue dense.
@@ -101,6 +105,7 @@ impl Default for SelfplayConfig {
             replay_retain: None,
             position_features: true,
             no_backtrack: false,
+            mask_stop: false,
             eval_processes: 1,
         }
     }
@@ -639,7 +644,7 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         temperature_moves: 0,
         tree_reuse: config.tree_reuse,
         export_position: config.position_features,
-        mask_stop: false,
+        mask_stop: config.mask_stop,
         no_backtrack: config.no_backtrack,
         candidate_options: match config.evaluator {
             EvaluatorMode::Random => CandidateOptions::default(),

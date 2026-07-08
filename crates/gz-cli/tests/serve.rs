@@ -70,6 +70,7 @@ fn replay_serve_returns_feature_batch_and_targets() {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     })
     .unwrap();
@@ -176,6 +177,7 @@ fn replay_serve_rejects_featureless_store() {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     })
     .unwrap();

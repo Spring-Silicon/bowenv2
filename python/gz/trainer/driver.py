@@ -77,6 +77,8 @@ class SelfplayConfig:
     no_backtrack: bool = False
     # Auto-temper root noise to policy sharpness; negative disables.
     gumbel_noise_overlap: float = -1.0
+    # Mask STOP out of learner search wherever a rewrite exists.
+    mask_stop: bool = False
     # Evaluator server processes; lanes stripe across them (torch only).
     eval_processes: int = 1
 
@@ -684,6 +686,8 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             "true" if config.selfplay.no_backtrack else "false",
             "--gumbel-noise-overlap",
             str(config.selfplay.gumbel_noise_overlap),
+            "--mask-stop",
+            "true" if config.selfplay.mask_stop else "false",
             "--eval-processes",
             str(config.selfplay.eval_processes),
             "--evaluator",

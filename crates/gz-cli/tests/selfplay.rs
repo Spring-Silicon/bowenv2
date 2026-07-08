@@ -94,6 +94,7 @@ fn selfplay_run_writes_replay_rows() {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     })
     .unwrap();
@@ -137,6 +138,7 @@ fn selfplay_run_supports_stub_evaluator() {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     })
     .unwrap();
@@ -177,6 +179,7 @@ fn selfplay_run_supports_self_average_reference() {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     })
     .unwrap();
@@ -218,6 +221,7 @@ fn selfplay_run_supports_policy_reference() {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     })
     .unwrap();
@@ -273,6 +277,7 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     }
 }
@@ -458,6 +463,7 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         replay_retain: None,
         position_features: true,
         no_backtrack: false,
+        mask_stop: false,
         eval_processes: 1,
     })
     .unwrap();
