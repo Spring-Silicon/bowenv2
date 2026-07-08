@@ -14,7 +14,7 @@ torch = pytest.importorskip("torch")
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
-@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage"])
+@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage", "match"])
 def test_padding_invariance(aggregation: str) -> None:
     small = BatchView.parse(make_batch(attr_dim=1, capacity=2))
     padded = BatchView.parse(make_batch(attr_dim=1, capacity=3))
@@ -29,7 +29,7 @@ def test_padding_invariance(aggregation: str) -> None:
     torch.testing.assert_close(padded_logits[:2], small_logits, rtol=0, atol=1e-7)
 
 
-@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage"])
+@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage", "match"])
 def test_batch_independence(aggregation: str) -> None:
     original = BatchView.parse(make_batch(attr_dim=1))
     mutated_bytes = bytearray(make_batch(attr_dim=1))
@@ -50,7 +50,7 @@ def test_batch_independence(aggregation: str) -> None:
     torch.testing.assert_close(mutated_logits[:1], logits[:1], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage"])
+@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage", "match"])
 def test_masks_reject_padding_edges_and_subjects(aggregation: str) -> None:
     baseline = BatchView.parse(make_batch(attr_dim=0))
     mutated_bytes = bytearray(make_batch(attr_dim=0))
@@ -74,8 +74,12 @@ def test_masks_reject_padding_edges_and_subjects(aggregation: str) -> None:
     assert torch.isfinite(logits[0, 1])
 
 
-@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage"])
+@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage", "match"])
 def test_compile_fullgraph_and_no_recompile_for_row_count_change(aggregation: str) -> None:
+    # Each variant compiles a fresh model; without a reset the process-wide
+    # dynamo cache fills up and later in-process compiles (the serving
+    # backend tests) fall over.
+    torch._dynamo.reset()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     view = BatchView.parse(make_batch(attr_dim=1))
     changed = bytearray(make_batch(attr_dim=1))
@@ -100,7 +104,7 @@ def test_compile_fullgraph_and_no_recompile_for_row_count_change(aggregation: st
     assert counter.frame_count == 1
 
 
-@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage"])
+@pytest.mark.parametrize("aggregation", ["attention", "gine", "sage", "match"])
 def test_expander_fixture_flows_through_model(aggregation: str) -> None:
     view = BatchView.parse((FIXTURES / "batch_expander.gzfb").read_bytes())
     schema = schema_for_view(view, node_vocab_size=8, edge_type_count=3, action_kind_vocab_size=8)
@@ -228,6 +232,33 @@ def test_tanh_value_activation_bounds_values() -> None:
     assert ArchConfig.from_dict(legacy).value_activation == "logit"
 
 
+def test_match_encoding_distinguishes_subject_order() -> None:
+    # Two candidates over the same node set in different roles must score
+    # differently under match encoding; the mean pool aliases them.
+    base = bytearray(make_batch(attr_dim=1))
+    layout = _layout(2, 3, 2, 3, 2, 1)
+    base[layout["subject_count"]] = 2
+    _u16(base, layout["action_subjects"], [0, 1])
+    swapped = bytearray(base)
+    _u16(swapped, layout["action_subjects"], [1, 0])
+    schema = schema_for_view(BatchView.parse(base), node_vocab_size=7, edge_type_count=2, action_kind_vocab_size=8)
+
+    match_model = build_model(schema, make_arch("match")).eval()
+    mean_model = build_model(schema, make_arch("attention")).eval()
+    with torch.no_grad():
+        _, match_a = match_model(tensors_of(schema, BatchView.parse(base)))
+        _, match_b = match_model(tensors_of(schema, BatchView.parse(swapped)))
+        _, mean_a = mean_model(tensors_of(schema, BatchView.parse(base)))
+        _, mean_b = mean_model(tensors_of(schema, BatchView.parse(swapped)))
+
+    assert not torch.equal(match_a[0, :1], match_b[0, :1]), "match encoding sees role order"
+    torch.testing.assert_close(mean_a[0, :1], mean_b[0, :1], rtol=0, atol=0)
+
+
+def tensors_of(schema: FeatureSchemaConfig, view: BatchView):
+    return BatchStager(schema, view.batch_capacity, "cpu").copy(view)
+
+
 def test_sage_trunk_arch_round_trip_and_legacy_defaults() -> None:
     arch = make_arch("sage")
     assert ArchConfig.from_dict(arch.to_dict()) == arch
@@ -243,10 +274,13 @@ def run_model(model: object, schema: FeatureSchemaConfig, view: BatchView):
 
 
 def make_arch(aggregation: str) -> ArchConfig:
-    # "sage" is the whittlezero SAGE+transformer trunk; the exphormer
-    # trunk variants select the edge aggregation instead.
+    # "sage" is the whittlezero SAGE+transformer trunk and "match" its
+    # role-preserving subject encoding; the exphormer trunk variants
+    # select the edge aggregation instead.
     if aggregation == "sage":
         return ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0, trunk="sage", sage_layers=2)
+    if aggregation == "match":
+        return ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0, subject_encoding="match")
     return ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0, aggregation=aggregation)
 
 

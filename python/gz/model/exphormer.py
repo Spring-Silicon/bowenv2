@@ -29,6 +29,7 @@ class ArchConfig:
     trunk: str = "exphormer"
     sage_layers: int = 3
     value_activation: str = "logit"
+    subject_encoding: str = "mean"
 
     def __post_init__(self) -> None:
         if self.name != "gz-graph-v1":
@@ -55,6 +56,8 @@ class ArchConfig:
             raise ValueError("sage_layers must be positive")
         if self.value_activation not in {"logit", "tanh"}:
             raise ValueError("unsupported value_activation")
+        if self.subject_encoding not in {"mean", "match"}:
+            raise ValueError("unsupported subject_encoding")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -72,6 +75,7 @@ class ArchConfig:
             "trunk": self.trunk,
             "sage_layers": self.sage_layers,
             "value_activation": self.value_activation,
+            "subject_encoding": self.subject_encoding,
         }
 
     def encode(self) -> bytes:
@@ -100,8 +104,16 @@ class ArchConfig:
             "trunk",
             "sage_layers",
             "value_activation",
+            "subject_encoding",
         }
-        optional = {"value_input", "policy_head", "trunk", "sage_layers", "value_activation"}
+        optional = {
+            "value_input",
+            "policy_head",
+            "trunk",
+            "sage_layers",
+            "value_activation",
+            "subject_encoding",
+        }
         keys = set(value)
         if not (fields - optional <= keys <= fields):
             raise ValueError("arch config fields mismatch")
@@ -120,6 +132,7 @@ class ArchConfig:
             trunk=_str(value, "trunk", "exphormer"),
             sage_layers=_int(value, "sage_layers", 3),
             value_activation=_str(value, "value_activation", "logit"),
+            subject_encoding=_str(value, "subject_encoding", "mean"),
         )
 
 
@@ -407,10 +420,15 @@ def _model_class():
                 self.sage = None
                 self.layers = nn.ModuleList([GraphLayer(schema, arch) for _ in range(arch.layers)])
             self.kind_embedding = nn.Embedding(schema.action_kind_vocab_size, arch.dim, padding_idx=0)
-            if arch.policy_head == "pointer":
-                self.policy = PointerPolicyHead(arch)
+            if arch.subject_encoding == "match":
+                self.match = MatchAttention(schema, arch)
             else:
-                self.policy = _mlp(nn, arch.dim * 3 + 1, arch.ffn_dim, 1, arch.activation, arch.dropout)
+                self.match = None
+            action_feat_dim = _action_feat_dim(arch)
+            if arch.policy_head == "pointer":
+                self.policy = PointerPolicyHead(arch, action_feat_dim)
+            else:
+                self.policy = _mlp(nn, action_feat_dim, arch.ffn_dim, 1, arch.activation, arch.dropout)
             value_dim = arch.dim
             if arch.value_input == "scalar":
                 value_dim += 2
@@ -421,11 +439,14 @@ def _model_class():
         def forward(self, batch: GraphBatchTensors, value_flip: object = None):
             graph = _self_graph(batch)
             h, g_readout, node_mask = self._encode_graph(graph)
-            subject_pool = _subject_pool(torch, h, node_mask, batch.action_subjects, batch.subject_count)
             kind = self.kind_embedding(batch.action_kind.clamp(0, self.schema.action_kind_vocab_size - 1))
+            if self.match is not None:
+                subject_feat = self.match(h, node_mask, batch.action_subjects, batch.subject_count, kind)
+            else:
+                subject_feat = _subject_pool(torch, h, node_mask, batch.action_subjects, batch.subject_count)
             prior = batch.action_prior.unsqueeze(-1)
             readout = g_readout.unsqueeze(1).expand(-1, batch.action_kind.shape[1], -1)
-            action_feat = torch.cat((kind, prior, subject_pool, readout), dim=-1)
+            action_feat = torch.cat((kind, prior, subject_feat, readout), dim=-1)
             if self.arch.policy_head == "pointer":
                 action_index = torch.arange(action_feat.shape[1], device=action_feat.device)
                 action_mask = action_index.unsqueeze(0) < batch.action_count.unsqueeze(1)
@@ -483,6 +504,36 @@ def _model_class():
 
             return h, g.mean(dim=1), node_mask
 
+    class MatchAttention(nn.Module):
+        # whittlezero's policy_match_attention: the candidate's subject
+        # nodes keep their pattern roles. Slot embeddings are added to the
+        # gathered subject embeddings, the kind/rule embedding queries a
+        # single-head attention over them, and the candidate contributes
+        # [match root, attended] instead of an order-blind mean -- absorb,
+        # distribute, and consensus candidates over the same node set with
+        # different role assignments stop aliasing.
+        def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
+            super().__init__()
+            self.slot_embedding = nn.Embedding(max(1, schema.max_subjects), arch.dim)
+            self.query = nn.Linear(arch.dim, arch.dim, bias=False)
+            self.key = nn.Linear(arch.dim, arch.dim, bias=False)
+            self.value = nn.Linear(arch.dim, arch.dim, bias=False)
+
+        def forward(self, h, node_mask, action_subjects, subject_count, kind):
+            gathered, valid = _gather_subjects(torch, h, node_mask, action_subjects, subject_count)
+            root_valid = valid[:, :, 0].unsqueeze(-1)
+            root = torch.where(root_valid, gathered[:, :, 0, :], torch.zeros_like(gathered[:, :, 0, :]))
+            slots = torch.arange(gathered.shape[2], device=h.device)
+            keyed = gathered + self.slot_embedding(slots).view(1, 1, gathered.shape[2], -1)
+            query = self.query(kind).unsqueeze(2)
+            scores = (query * self.key(keyed)).sum(dim=-1) / math.sqrt(keyed.shape[-1])
+            scores = scores.masked_fill(~valid, -1.0e9)
+            weights = torch.softmax(scores, dim=2)
+            attended = (weights.unsqueeze(-1) * self.value(keyed)).sum(dim=2)
+            has_match = valid.any(dim=2, keepdim=True)
+            attended = torch.where(has_match, attended, torch.zeros_like(attended))
+            return torch.cat((root, attended), dim=-1)
+
     class PointerPolicyHead(nn.Module):
         # whittlezero's tsp_pointer scorer: a multi-head glimpse over the
         # action tokens refines the graph readout into a board query, and
@@ -492,11 +543,11 @@ def _model_class():
         # isolation and its logit scale is unbounded.
         CLIP = 10.0
 
-        def __init__(self, arch: ArchConfig) -> None:
+        def __init__(self, arch: ArchConfig, action_feat_dim: int) -> None:
             super().__init__()
             dim = arch.dim
             self.heads = arch.heads
-            self.token_proj = nn.Linear(arch.dim * 3 + 1, dim)
+            self.token_proj = nn.Linear(action_feat_dim, dim)
             self.glimpse_query = nn.Linear(dim, dim, bias=False)
             self.glimpse_key = nn.Linear(dim, dim, bias=False)
             self.glimpse_value = nn.Linear(dim, dim, bias=False)
@@ -736,7 +787,14 @@ def _gather_nodes(torch: object, h: object, index: object):
     return torch.gather(h, 1, index.unsqueeze(-1).expand(-1, -1, d))
 
 
-def _subject_pool(torch: object, h: object, node_mask: object, action_subjects: object, subject_count: object):
+def _action_feat_dim(arch: ArchConfig) -> int:
+    # kind + prior + subject encoding + readout; match mode contributes
+    # [root, attended] where mean mode contributes one pooled block.
+    subject_dim = arch.dim * 2 if arch.subject_encoding == "match" else arch.dim
+    return arch.dim * 2 + subject_dim + 1
+
+
+def _gather_subjects(torch: object, h: object, node_mask: object, action_subjects: object, subject_count: object):
     b, n, d = h.shape
     a = action_subjects.shape[1]
     s = action_subjects.shape[2]
@@ -749,6 +807,11 @@ def _subject_pool(torch: object, h: object, node_mask: object, action_subjects: 
     # (tens of GiB at wide action masks) before reducing it.
     flat = safe.reshape(b, a * s, 1).expand(b, a * s, d)
     gathered = torch.gather(h, 1, flat).reshape(b, a, s, d)
+    return gathered, valid
+
+
+def _subject_pool(torch: object, h: object, node_mask: object, action_subjects: object, subject_count: object):
+    gathered, valid = _gather_subjects(torch, h, node_mask, action_subjects, subject_count)
     weight = valid.unsqueeze(-1).to(h.dtype)
     denom = weight.sum(dim=2).clamp_min(1.0)
     return (gathered * weight).sum(dim=2) / denom
