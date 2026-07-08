@@ -406,3 +406,34 @@ fn outcome_emas_track_recent_episodes() {
         "same outcome keeps the EMA fixed"
     );
 }
+
+#[test]
+fn win_rate_ema_distinguishes_all_loss_from_unseeded() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert!(store.win_rate_ema().is_none());
+
+    // Unlabeled episodes leave the EMA unseeded.
+    let (mut record, mut rows) = episode_with_rows(1);
+    record.outcome.value_target = None;
+    record.outcome.reference = None;
+    rows[0].value_target = None;
+    store.append_episode(&record, &rows).unwrap();
+    assert!(store.win_rate_ema().is_none());
+
+    // A labeled loss seeds an honest 0.0 rate, distinct from unseeded.
+    let (mut record, mut rows) = episode_with_rows(1);
+    record.outcome.value_target = Some(-1.0);
+    record.outcome.reference.as_mut().unwrap().reward = 5.0;
+    rows[0].value_target = Some(-1.0);
+    store.append_episode(&record, &rows).unwrap();
+    assert!((store.win_rate_ema().unwrap() - 0.0).abs() < 1e-9);
+
+    // A win moves it by the EMA weight.
+    let (mut record, mut rows) = episode_with_rows(1);
+    record.outcome.value_target = Some(1.0);
+    record.outcome.reference.as_mut().unwrap().reward = 5.0;
+    rows[0].value_target = Some(1.0);
+    store.append_episode(&record, &rows).unwrap();
+    assert!((store.win_rate_ema().unwrap() - 0.01).abs() < 1e-9);
+}

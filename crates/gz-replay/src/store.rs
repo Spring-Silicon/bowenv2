@@ -35,6 +35,9 @@ pub struct ReplayStore {
     cost_ema_bits: AtomicU64,
     len_ema_bits: AtomicU64,
     stop_ema_bits: AtomicU64,
+    /// EMA of value_target > 0 over labeled appends only: the
+    /// episode-weighted learner win rate.
+    win_ema_bits: AtomicU64,
     best_cost_bits: AtomicU64,
 }
 
@@ -76,6 +79,7 @@ impl ReplayStore {
             retained_floor: AtomicU64::new(retained_floor),
             retain_rows,
             cost_ema_bits: AtomicU64::new(0),
+            win_ema_bits: AtomicU64::new(0),
             len_ema_bits: AtomicU64::new(0),
             stop_ema_bits: AtomicU64::new(0),
             best_cost_bits: AtomicU64::new(0),
@@ -150,6 +154,14 @@ impl ReplayStore {
             rows.len() as f64,
             f64::from(u8::from(record.outcome.stopped)),
         );
+        if let Some(value_target) = record.outcome.value_target {
+            // Stored biased by +1.0: an honest all-loss EMA of 0.0 would
+            // collide with the zero-bits unseeded sentinel.
+            self.update_ema(
+                &self.win_ema_bits,
+                f64::from(u8::from(value_target > 0.0)) + 1.0,
+            );
+        }
         let best = self.best_cost_bits.load(Ordering::Acquire);
         if best == 0 || cost < f64::from_bits(best) {
             self.best_cost_bits.store(cost.to_bits(), Ordering::Release);
@@ -330,14 +342,18 @@ impl ReplayStore {
             (&self.len_ema_bits, len),
             (&self.stop_ema_bits, stopped),
         ] {
-            let previous = bits.load(Ordering::Acquire);
-            let next = if previous == 0 {
-                value
-            } else {
-                OUTCOME_EMA_DECAY * f64::from_bits(previous) + (1.0 - OUTCOME_EMA_DECAY) * value
-            };
-            bits.store(next.to_bits(), Ordering::Release);
+            self.update_ema(bits, value);
         }
+    }
+
+    fn update_ema(&self, bits: &AtomicU64, value: f64) {
+        let previous = bits.load(Ordering::Acquire);
+        let next = if previous == 0 {
+            value
+        } else {
+            OUTCOME_EMA_DECAY * f64::from_bits(previous) + (1.0 - OUTCOME_EMA_DECAY) * value
+        };
+        bits.store(next.to_bits(), Ordering::Release);
     }
 
     /// Episode-weighted EMAs over recent appends:
@@ -353,6 +369,14 @@ impl ReplayStore {
             f64::from_bits(self.len_ema_bits.load(Ordering::Acquire)),
             f64::from_bits(self.stop_ema_bits.load(Ordering::Acquire)),
         ))
+    }
+
+    /// Episode-weighted EMA of "learner beat its reference" over labeled
+    /// appends. None until a labeled episode lands.
+    #[must_use]
+    pub fn win_rate_ema(&self) -> Option<f64> {
+        let bits = self.win_ema_bits.load(Ordering::Acquire);
+        (bits != 0).then(|| f64::from_bits(bits) - 1.0)
     }
 
     /// Lowest terminal cost of any appended episode. None until seeded.

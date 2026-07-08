@@ -17,7 +17,7 @@ from gz.proto import (
     write_frame,
 )
 
-SAMPLE_PROTOCOL_VERSION = 4
+SAMPLE_PROTOCOL_VERSION = 5
 
 FRAME_HELLO = 1
 FRAME_HELLO_ACK = 2
@@ -47,6 +47,7 @@ class SampleAck:
     episode_cost_ema: float
     episode_len_ema: float
     stop_rate_ema: float
+    learner_win_rate_ema: float
     best_cost: float
     root: RootInfo | None
     feature_schema: FeatureSchemaConfig
@@ -198,7 +199,7 @@ class SampleClient:
 
 
 def decode_ack(payload: memoryview) -> SampleAck:
-    if len(payload) < 100:
+    if len(payload) < 104:
         raise SampleError("sample HELLO_ACK truncated")
     protocol_version = struct.unpack_from("<I", payload, 0)[0]
     if protocol_version != SAMPLE_PROTOCOL_VERSION:
@@ -207,11 +208,11 @@ def decode_ack(payload: memoryview) -> SampleAck:
     produced_rows = struct.unpack_from("<Q", payload, 40)[0]
     episodes = struct.unpack_from("<Q", payload, 48)[0]
     episodes_stopped = struct.unpack_from("<Q", payload, 56)[0]
-    cost_ema, len_ema, stop_ema = struct.unpack_from("<fff", payload, 64)
-    best_cost = struct.unpack_from("<f", payload, 76)[0]
-    root_present = struct.unpack_from("<I", payload, 80)[0]
-    root_cost = struct.unpack_from("<f", payload, 84)[0]
-    root_nodes, root_edges, root_candidates = struct.unpack_from("<III", payload, 88)
+    cost_ema, len_ema, stop_ema, win_ema = struct.unpack_from("<ffff", payload, 64)
+    best_cost = struct.unpack_from("<f", payload, 80)[0]
+    root_present = struct.unpack_from("<I", payload, 84)[0]
+    root_cost = struct.unpack_from("<f", payload, 88)[0]
+    root_nodes, root_edges, root_candidates = struct.unpack_from("<III", payload, 92)
     root = (
         RootInfo(
             cost=root_cost,
@@ -231,9 +232,11 @@ def decode_ack(payload: memoryview) -> SampleAck:
         episode_cost_ema=cost_ema,
         episode_len_ema=len_ema,
         stop_rate_ema=stop_ema,
+        # -1.0 = unseeded (no labeled episode yet); 0.0 is a real rate.
+        learner_win_rate_ema=win_ema,
         best_cost=best_cost,
         root=root,
-        feature_schema=FeatureSchemaConfig.decode(payload[100:]),
+        feature_schema=FeatureSchemaConfig.decode(payload[104:]),
     )
 
 
