@@ -698,6 +698,14 @@ where
         true
     }
 
+    /// Whether learner episodes may be admitted right now. False while
+    /// a rollout-backed provider has no reference yet: the seed rollout
+    /// (admitted in before_root_admission) plays first, so no episode
+    /// is ever admitted unlabeled.
+    fn admission_open(&self) -> bool {
+        true
+    }
+
     fn gate_poll(&self) -> Option<Duration> {
         None
     }
@@ -761,7 +769,7 @@ where
     loop {
         if !roots_exhausted {
             mode.before_root_admission(&mut pool, &mut engine, &mut roots, &mut next_episode_id)?;
-            if mode.gate_open() {
+            if mode.gate_open() && mode.admission_open() {
                 let mut admission = Admission {
                     search: runtime.search,
                     identity,
@@ -1001,6 +1009,10 @@ where
         replay_gate_open(self.store, self.backpressure)
     }
 
+    fn admission_open(&self) -> bool {
+        self.provider.admission_ready()
+    }
+
     fn gate_poll(&self) -> Option<Duration> {
         self.backpressure.map(|backpressure| backpressure.gate_poll)
     }
@@ -1172,6 +1184,10 @@ where
 
     fn gate_open(&self) -> bool {
         self.replay.gate_open()
+    }
+
+    fn admission_open(&self) -> bool {
+        self.replay.provider.admission_ready()
     }
 
     fn gate_poll(&self) -> Option<Duration> {
@@ -1690,10 +1706,10 @@ impl OpponentRollout {
         if self.in_flight.is_some() {
             return Ok(());
         }
-        let Some(version) = self.latest_version else {
-            return Ok(());
-        };
-        if !provider.rollout_due(Some(version)) {
+        // latest_version None at cold start does not block: providers
+        // that seed their reference answer due and the rollout's own
+        // eval replies name the version it played under.
+        if !provider.rollout_due(self.latest_version) {
             return Ok(());
         }
         let Some(root) = roots.fixed_root(engine)? else {
@@ -1713,7 +1729,7 @@ impl OpponentRollout {
         );
         if admitted {
             *next_episode_id += 1;
-            provider.begin_rollout(version);
+            provider.begin_rollout(self.latest_version);
             self.in_flight = Some(episode_id);
         }
         Ok(())
@@ -1749,6 +1765,7 @@ impl OpponentRollout {
             final_graph: completed.episode.final_context,
             steps: reference_steps_for_gumbel_episode(&completed.episode),
             search_config_hash: completed.episode.search_config_hash,
+            model_version: rollout_model_version(&completed.episode),
         }));
         Ok(true)
     }
@@ -1794,9 +1811,17 @@ impl OpponentRollout {
             final_graph: completed.episode.final_context,
             steps,
             search_config_hash: completed.episode.search_config_hash,
+            model_version: rollout_model_version(&completed.episode),
         }));
         Ok(true)
     }
+}
+
+/// The newest version the episode's eval replies named. Steps record
+/// the version each move was evaluated under; the last one wins when a
+/// publish swaps mid-episode.
+fn rollout_model_version<G, C>(episode: &GumbelEpisode<G, C>) -> Option<ModelVersion> {
+    episode.steps.last().map(|step| step.model_version)
 }
 
 fn clear_replayed_episode_trace<G, C>(episode: &mut GumbelEpisode<G, C>) {

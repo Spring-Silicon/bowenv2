@@ -1058,7 +1058,7 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
         }
     }
 
-    fn begin_rollout(&mut self, version: gz_engine::ModelVersion) {
+    fn begin_rollout(&mut self, version: Option<gz_engine::ModelVersion>) {
         if let Self::Policy(provider) = self {
             ReferenceProvider::<WhittleEngine>::begin_rollout(provider, version);
         }
@@ -1067,6 +1067,13 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
     fn finish_rollout(&mut self, outcome: Option<RolloutOutcome>) {
         if let Self::Policy(provider) = self {
             ReferenceProvider::<WhittleEngine>::finish_rollout(provider, outcome);
+        }
+    }
+
+    fn admission_ready(&self) -> bool {
+        match self {
+            Self::Policy(provider) => ReferenceProvider::<WhittleEngine>::admission_ready(provider),
+            _ => true,
         }
     }
 }

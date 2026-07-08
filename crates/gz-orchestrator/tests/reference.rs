@@ -223,6 +223,7 @@ fn rollout_outcome(reward: f32) -> RolloutOutcome {
         ),
         steps: Vec::new(),
         search_config_hash: SearchConfigHash::from_bytes([9; 32]),
+        model_version: None,
     }
 }
 
@@ -235,13 +236,14 @@ fn policy_provider_rollout_lifecycle() {
     let v1 = ModelVersion::from_bytes([1; 16]);
     let v2 = ModelVersion::from_bytes([2; 16]);
 
-    // Idle and unlabeled before any model version is seen.
+    // Unlabeled before any rollout; with no version observed yet the
+    // cold-start seed rollout is due exactly once.
     assert!(provider.reference(&mut engine, root).unwrap().is_none());
-    assert!(!provider.rollout_due(None));
+    assert!(provider.rollout_due(None));
     assert!(provider.rollout_due(Some(v1)));
 
     // One rollout in flight blocks further admissions; still unlabeled.
-    provider.begin_rollout(v1);
+    provider.begin_rollout(Some(v1));
     assert!(!provider.rollout_due(Some(v1)));
     assert!(!provider.rollout_due(Some(v2)));
     assert!(provider.reference(&mut engine, root).unwrap().is_none());
@@ -269,22 +271,67 @@ fn policy_provider_failed_rollout_keeps_reference_and_retries() {
     let v1 = ModelVersion::from_bytes([1; 16]);
     let v2 = ModelVersion::from_bytes([2; 16]);
 
-    provider.begin_rollout(v1);
+    provider.begin_rollout(Some(v1));
     provider.finish_rollout(Some(rollout_outcome(-7.0)));
 
     // An unmeasured rollout keeps the old scalar and stays due.
-    provider.begin_rollout(v2);
+    provider.begin_rollout(Some(v2));
     provider.finish_rollout(None);
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.model_version, Some(v1));
     assert!(provider.rollout_due(Some(v2)));
 
     // The retry replaces it.
-    provider.begin_rollout(v2);
+    provider.begin_rollout(Some(v2));
     provider.finish_rollout(Some(rollout_outcome(-3.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.final_reward, -3.0);
     assert_eq!(reference.model_version, Some(v2));
+}
+
+#[test]
+fn seed_rollout_stamps_version_from_outcome_and_opens_admission() {
+    let mut engine = whittle();
+    let root = engine.root();
+    let mut policy = PolicyReferenceProvider::gated();
+    let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut policy;
+    let v1 = ModelVersion::from_bytes([1; 16]);
+    let v2 = ModelVersion::from_bytes([2; 16]);
+
+    // Cold start: admission held, seed rollout due before any version.
+    assert!(!provider.admission_ready());
+    assert!(provider.rollout_due(None));
+    provider.begin_rollout(None);
+    assert!(!provider.rollout_due(None));
+
+    // The finished episode's own replies name the version.
+    let mut outcome = rollout_outcome(-7.0);
+    outcome.model_version = Some(v1);
+    provider.finish_rollout(Some(outcome));
+
+    let reference = provider.reference(&mut engine, root).unwrap().unwrap();
+    assert_eq!(reference.model_version, Some(v1));
+    assert!(provider.admission_ready());
+    // The seed counts as v1's challenge; only a new version is due.
+    assert!(!provider.rollout_due(None));
+    assert!(!provider.rollout_due(Some(v1)));
+    assert!(provider.rollout_due(Some(v2)));
+}
+
+#[test]
+fn seed_rollout_without_named_version_retries() {
+    let mut engine = whittle();
+    let root = engine.root();
+    let mut policy = PolicyReferenceProvider::gated();
+    let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut policy;
+
+    provider.begin_rollout(None);
+    // Measured but no eval reply ever named a version (empty episode):
+    // treated as unmeasured, the seed stays due.
+    provider.finish_rollout(Some(rollout_outcome(-7.0)));
+    assert!(provider.reference(&mut engine, root).unwrap().is_none());
+    assert!(!provider.admission_ready());
+    assert!(provider.rollout_due(None));
 }
 
 #[test]
@@ -299,7 +346,7 @@ fn gated_policy_accepts_only_strictly_better_challengers() {
     let v4 = ModelVersion::from_bytes([4; 16]);
 
     // First measured rollout seats the incumbent.
-    provider.begin_rollout(v1);
+    provider.begin_rollout(Some(v1));
     provider.finish_rollout(Some(rollout_outcome(-7.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.kind, ReplayReferenceKind::GatedPolicy);
@@ -309,7 +356,7 @@ fn gated_policy_accepts_only_strictly_better_challengers() {
     // A worse challenger is rejected but counts as challenged: the bar
     // and its version attribution stay with the incumbent, no retry.
     assert!(provider.rollout_due(Some(v2)));
-    provider.begin_rollout(v2);
+    provider.begin_rollout(Some(v2));
     provider.finish_rollout(Some(rollout_outcome(-9.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.final_reward, -7.0);
@@ -317,13 +364,13 @@ fn gated_policy_accepts_only_strictly_better_challengers() {
     assert!(!provider.rollout_due(Some(v2)));
 
     // An exact tie keeps the older incumbent (strict inequality).
-    provider.begin_rollout(v3);
+    provider.begin_rollout(Some(v3));
     provider.finish_rollout(Some(rollout_outcome(-7.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.model_version, Some(v1));
 
     // A strictly better challenger takes the bar; monotone increase.
-    provider.begin_rollout(v4);
+    provider.begin_rollout(Some(v4));
     provider.finish_rollout(Some(rollout_outcome(-5.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.final_reward, -5.0);
@@ -339,11 +386,11 @@ fn gated_policy_unmeasured_challenger_retries() {
     let v1 = ModelVersion::from_bytes([1; 16]);
     let v2 = ModelVersion::from_bytes([2; 16]);
 
-    provider.begin_rollout(v1);
+    provider.begin_rollout(Some(v1));
     provider.finish_rollout(Some(rollout_outcome(-7.0)));
 
     // Unmeasured: incumbent untouched, the same version stays due.
-    provider.begin_rollout(v2);
+    provider.begin_rollout(Some(v2));
     provider.finish_rollout(None);
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.model_version, Some(v1));
@@ -521,9 +568,9 @@ fn gamma_mix_picks_latest_rollout_a_fraction_of_the_time() {
     // challenger lands in the latest slot.
     let mut gated = PolicyReferenceProvider::gated_with_gamma(0.0, 7);
     let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut gated;
-    provider.begin_rollout(v1);
+    provider.begin_rollout(Some(v1));
     provider.finish_rollout(Some(rollout_outcome(-3.0)));
-    provider.begin_rollout(v2);
+    provider.begin_rollout(Some(v2));
     provider.finish_rollout(Some(rollout_outcome(-9.0)));
     for _ in 0..16 {
         let reference = provider.reference(&mut engine, root).unwrap().unwrap();
@@ -534,9 +581,9 @@ fn gamma_mix_picks_latest_rollout_a_fraction_of_the_time() {
     // gamma near 1: (almost) always the latest, here the rejected v2.
     let mut mixed = PolicyReferenceProvider::gated_with_gamma(0.999, 7);
     let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut mixed;
-    provider.begin_rollout(v1);
+    provider.begin_rollout(Some(v1));
     provider.finish_rollout(Some(rollout_outcome(-3.0)));
-    provider.begin_rollout(v2);
+    provider.begin_rollout(Some(v2));
     provider.finish_rollout(Some(rollout_outcome(-9.0)));
     let mut latest_picks = 0;
     for _ in 0..64 {
@@ -552,9 +599,9 @@ fn gamma_mix_picks_latest_rollout_a_fraction_of_the_time() {
     // sequence is deterministic per seed.
     let mut fifth = PolicyReferenceProvider::gated_with_gamma(0.2, 11);
     let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut fifth;
-    provider.begin_rollout(v1);
+    provider.begin_rollout(Some(v1));
     provider.finish_rollout(Some(rollout_outcome(-3.0)));
-    provider.begin_rollout(v2);
+    provider.begin_rollout(Some(v2));
     provider.finish_rollout(Some(rollout_outcome(-9.0)));
     let picks: Vec<bool> = (0..1000)
         .map(|_| {

@@ -35,14 +35,20 @@ pub trait ReferenceProvider<E: GraphEngine> {
     /// the lane should play one opponent episode from the fixed root:
     /// `latest` is the newest model version seen on this lane's eval
     /// replies, and a rollout is due whenever it differs from the version
-    /// the current reference was played under. Default: never.
+    /// the current reference was played under. `latest` None means no
+    /// eval reply has named a version yet; providers that seed their
+    /// reference with a cold-start rollout answer true exactly once
+    /// there. Default: never.
     fn rollout_due(&self, latest: Option<ModelVersion>) -> bool {
         let _ = latest;
         false
     }
 
-    /// The lane admitted the requested rollout episode under `version`.
-    fn begin_rollout(&mut self, version: ModelVersion) {
+    /// The lane admitted the requested rollout episode. `version` is
+    /// None for the cold-start seed rollout (admitted before any eval
+    /// reply named a version); the finished episode's own replies name
+    /// it via `RolloutOutcome::model_version`.
+    fn begin_rollout(&mut self, version: Option<ModelVersion>) {
         let _ = version;
     }
 
@@ -61,6 +67,15 @@ pub trait ReferenceProvider<E: GraphEngine> {
     fn expects_reference(&self) -> bool {
         true
     }
+
+    /// Whether admissions would receive a reference right now. Lanes
+    /// hold learner admission while this is false so the cold-start
+    /// wave is played against the seed rollout instead of being dropped
+    /// unlabeled. Providers whose reference can only come from played
+    /// episodes (self-average) must stay true or nothing ever plays.
+    fn admission_ready(&self) -> bool {
+        true
+    }
 }
 
 /// The measured result of an opponent rollout episode.
@@ -70,6 +85,9 @@ pub struct RolloutOutcome {
     pub final_graph: ReplayGraphContext,
     pub steps: Vec<ReferenceStep>,
     pub search_config_hash: SearchConfigHash,
+    /// The newest model version the episode's eval replies named; the
+    /// authoritative version for seed rollouts admitted cold.
+    pub model_version: Option<ModelVersion>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -628,7 +646,17 @@ pub struct PolicyReferenceProvider {
     mix_seed: u64,
     draws: u64,
     last_challenged: Option<ModelVersion>,
-    pending_version: Option<ModelVersion>,
+    pending: Option<PendingChallenge>,
+}
+
+/// A challenger rollout in flight: versioned when the lane knew the
+/// evaluator's checkpoint at admission, seed when it was admitted cold
+/// (before any eval reply) and the version comes from the finished
+/// episode itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingChallenge {
+    Versioned(ModelVersion),
+    Seed,
 }
 
 /// How a finished challenger rollout updates the reference.
@@ -685,7 +713,7 @@ impl PolicyReferenceProvider {
             mix_seed: 0,
             draws: 0,
             last_challenged: None,
-            pending_version: None,
+            pending: None,
         }
     }
 
@@ -734,7 +762,7 @@ where
     }
 
     fn rollout_due(&self, latest: Option<ModelVersion>) -> bool {
-        if self.pending_version.is_some() {
+        if self.pending.is_some() {
             return false;
         }
         // Dueness anchors on the last MEASURED challenge, not the
@@ -743,20 +771,35 @@ where
         // measured challenge, so last_challenged tracks current.version).
         match latest {
             Some(latest) => self.last_challenged != Some(latest),
-            None => false,
+            // No version observed yet: the seed rollout is due exactly
+            // once, so the lane's first act creates the reference and
+            // learner admission never runs unlabeled.
+            None => self.last_challenged.is_none(),
         }
     }
 
-    fn begin_rollout(&mut self, version: ModelVersion) {
-        self.pending_version = Some(version);
+    fn begin_rollout(&mut self, version: Option<ModelVersion>) {
+        self.pending = Some(match version {
+            Some(version) => PendingChallenge::Versioned(version),
+            None => PendingChallenge::Seed,
+        });
     }
 
     fn finish_rollout(&mut self, outcome: Option<RolloutOutcome>) {
-        let Some(version) = self.pending_version.take() else {
+        let Some(pending) = self.pending.take() else {
             return;
         };
         // Unmeasured challengers retry: last_challenged stays put.
         let Some(outcome) = outcome else {
+            return;
+        };
+        let version = match pending {
+            PendingChallenge::Versioned(version) => Some(version),
+            PendingChallenge::Seed => outcome.model_version,
+        };
+        // A seed rollout whose replies never named a version counts as
+        // unmeasured and retries.
+        let Some(version) = version else {
             return;
         };
         self.last_challenged = Some(version);
@@ -787,6 +830,10 @@ where
         if accepted {
             self.current = Some(challenger);
         }
+    }
+
+    fn admission_ready(&self) -> bool {
+        self.current.is_some() || self.latest.is_some()
     }
 }
 

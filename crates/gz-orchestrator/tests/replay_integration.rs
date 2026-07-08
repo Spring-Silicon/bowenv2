@@ -392,11 +392,11 @@ fn policy_reference_refreshes_per_model_version_and_skips_replay() {
         )
         .unwrap();
 
-    // Rollout episodes never reach the store or the counters. The first
-    // admission precedes the first completed rollout and is dropped
-    // rather than stored unlabeled.
-    assert_eq!(run.episodes_appended, episodes - 1);
-    assert_eq!(run.episodes_dropped, 1);
+    // Rollout episodes never reach the store or the counters, and
+    // learner admission holds for the seed rollout: every stored
+    // episode is labeled, nothing is dropped.
+    assert_eq!(run.episodes_appended, episodes);
+    assert_eq!(run.episodes_dropped, 0);
     let records = replay_records(&store, run.episodes_appended);
     let row_count = records
         .iter()

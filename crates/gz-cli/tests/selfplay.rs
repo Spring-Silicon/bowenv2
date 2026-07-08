@@ -236,14 +236,14 @@ fn selfplay_run_supports_policy_reference() {
     })
     .unwrap();
 
-    // The opponent rollout is excluded from the episode counters. The
-    // first admission precedes the first completed rollout and is
-    // dropped rather than stored unlabeled; every later episode labels
-    // against the rollout scalar.
-    assert_eq!(summary.episodes_appended, 3);
-    assert_eq!(summary.episodes_dropped, 1);
+    // The opponent rollout is excluded from the episode counters, and
+    // learner admission holds until it finishes (the seed rollout), so
+    // every episode labels against the rollout scalar -- no unlabeled
+    // admissions, nothing dropped.
+    assert_eq!(summary.episodes_appended, 4);
+    assert_eq!(summary.episodes_dropped, 0);
     let labeled = summary.wins + summary.losses + summary.ties;
-    assert_eq!(labeled, 3);
+    assert_eq!(labeled, 4);
 }
 
 #[test]
