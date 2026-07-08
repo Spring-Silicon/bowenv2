@@ -123,7 +123,7 @@ fn g1_multi_step_episode_golden() {
     assert_fingerprint(
         "g1",
         &episode_fingerprint(&episode),
-        "7e08b43248c3889f36e2114731c5bb333ff8edb139a0c825b0a2a21095cfbd83",
+        "4e6cee26b2a36d7fe6c8ddb63855afe487efafbb772e7377eba63c7ad3ec9231",
     );
 }
 
@@ -167,7 +167,7 @@ fn g1_reuse_on_multi_step_episode_golden() {
     assert_fingerprint(
         "g1-reuse",
         &episode_fingerprint(&episode),
-        "a64e5fc8d93852a152aee329615b9005a695ae3f6c3c694024fba9645aff6fe6",
+        "53e4c9c084f43f71805d8db8a75a07bd6883c7d8adf84ef2408b193d1aa6826c",
     );
 }
 
@@ -202,7 +202,7 @@ fn g2_temperature_episode_golden() {
     assert_fingerprint(
         "g2",
         &episode_fingerprint(&episode),
-        "7f4cc2b55f89b6de24138bf4a5c5ec49b75c10b3be430dbaab6e3a34310b8a80",
+        "52316d06970ea16295f50d2ae8ebf29286cf3058d42e7c96b18609a2f6202c80",
     );
 }
 
@@ -231,7 +231,7 @@ fn g3_opponent_stop_reeval_episode_golden() {
     assert_fingerprint(
         "g3",
         &episode_fingerprint(&episode),
-        "8d55eb9ff1892f21ce13ba5860d9e9152ba6fba739773dcfabb2abda97f8c6ff",
+        "32cc252d7cc2065f022c1e22c564ea9201dd7e3d8c7ea748fe44c1ee6efb70ba",
     );
 }
 
@@ -258,7 +258,7 @@ fn g4_rejected_candidate_episode_golden() {
     assert_fingerprint(
         "g4",
         &episode_fingerprint(&episode),
-        "bb7ea3b645f9ba7d12fb9d731dec2c20725f28160a71b8d957a4b4282e882f8c",
+        "f41bee5922ff45b00a61b1675766d169a91e702e50393e2ab335ef5e212a0fe1",
     );
 }
 
@@ -280,7 +280,7 @@ fn g5_zero_step_episode_golden() {
     assert_fingerprint(
         "g5",
         &episode_fingerprint(&episode),
-        "9aa89e5bf88364d62a1861532b6e2c6ed66175270294a667a65c9d1b3c6f7c28",
+        "0b8907953e2af4d28467a029def66f8adf98b7e1255462136a2a457fb1870fae",
     );
 }
 

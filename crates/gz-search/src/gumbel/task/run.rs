@@ -12,22 +12,6 @@ where
     G: Copy,
     C: Copy,
 {
-    /// Carried visits are information the previous step's search already
-    /// paid for, so a reused root spends its budget only on what is new.
-    /// A floor of a quarter budget keeps fresh exploration under the new
-    /// Gumbel draw even when the carried subtree exceeds the budget.
-    pub(super) fn fresh_simulation_budget(&self) -> usize {
-        let simulations = self.config.simulations.get();
-        let carried = self.tree.carried_root_visits as usize;
-        if carried == 0 {
-            return simulations;
-        }
-
-        simulations
-            .saturating_sub(carried)
-            .max((simulations / 4).max(1))
-    }
-
     pub(super) fn next_token(&mut self) -> WorkToken {
         let token = WorkToken::new(self.next_token);
         self.next_token += 1;
@@ -69,7 +53,9 @@ where
         }
 
         let considered = considered_actions(&base_scores, self.config.max_considered_actions.get());
-        let schedule = considered_visit_sequence(considered.len(), self.fresh_simulation_budget());
+        // Full budget every move: reuse carries cached evals, not simulation
+        // credit, so the halving is always a complete fresh election.
+        let schedule = considered_visit_sequence(considered.len(), self.config.simulations.get());
 
         RunState {
             base_scores,

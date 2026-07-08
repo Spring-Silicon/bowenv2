@@ -59,7 +59,8 @@ where
 
         let mut nodes = Vec::with_capacity(old_indices.len());
         let mut handles = GumbelHandleBatch::default();
-        for &old_index in &old_indices {
+        let mut carried_root_visits = 0;
+        for (new_index, &old_index) in old_indices.iter().enumerate() {
             let mut node = self.nodes[old_index].clone();
             handles.graphs.push(node.graph);
             handles.candidates.extend(node.candidates.iter().copied());
@@ -68,6 +69,25 @@ where
                     *child = remap[old_child];
                 }
             }
+            if new_index == 0 {
+                carried_root_visits = node.visits.iter().sum();
+            }
+            // Reuse carries COMPUTATION only: graphs, candidate lists, and
+            // NN evals (logits/priors/values) survive, so simulations into
+            // carried territory need no eval requests. Decision statistics
+            // reset -- the next move's halving is a fresh election at full
+            // budget, and its visit-count winner stays meaningful. (The
+            // old ledger-carrying reuse let a carried favorite's count
+            // outvote fresh evidence.)
+            for visits in &mut node.visits {
+                *visits = 0;
+            }
+            for sum in &mut node.value_sum {
+                *sum = 0.0;
+            }
+            for q in &mut node.q {
+                *q = 0.0;
+            }
             nodes.push(node);
         }
 
@@ -75,7 +95,6 @@ where
             .first()
             .map(|node| node.context)
             .ok_or_else(|| internal("empty reused subtree"))?;
-        let carried_root_visits = nodes[0].visits.iter().sum();
         let carried_nodes = nodes.len();
 
         Ok((

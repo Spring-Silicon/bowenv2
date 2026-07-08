@@ -425,14 +425,10 @@ fn tree_reuse_skips_later_root_evals() {
     assert!(episode.root_stats[1..].iter().all(|stats| {
         stats.eval_count < episode.root_stats[0].eval_count && stats.carried_root_visits > 0
     }));
-    // Budget crediting: a reused root runs at most
-    // max(simulations - carried, simulations / 4) fresh simulations, and
-    // each simulation costs at most one eval (stop re-evals included).
+    // Full budget every move: reuse saves evals (cached nodes), never
+    // simulations.
     assert!(episode.root_stats[1..].iter().all(|stats| {
-        let budget = 16usize
-            .saturating_sub(stats.carried_root_visits as usize)
-            .max(4);
-        stats.simulations <= budget && stats.eval_count <= budget
+        stats.simulations <= 16 && stats.eval_count < episode.root_stats[0].eval_count
     }));
     let root_eval_steps = evaluator
         .requests
@@ -570,4 +566,86 @@ fn opponent_context_aligns_to_leaf_time_and_clamps_to_horizon() {
         final_reward: 0.0,
     };
     assert_eq!(empty.aligned_to(5).row, 0);
+}
+
+#[test]
+fn ledger_reset_reuse_matches_fresh_trees_with_fewer_evals() {
+    // With a deterministic evaluator, reuse must change WHAT is computed
+    // (cached evals serve carried nodes) but not WHAT is decided: the
+    // ledgers reset and every move runs the full budget, so episodes are
+    // step-for-step identical to fresh trees.
+    let build_engine = || {
+        TestEngine::new()
+            .candidates(0, [1, 2])
+            .candidates(10, [3, 4])
+            .candidates(20, [5])
+            .candidates(30, [])
+            .candidates(40, [])
+            .apply(0, 1, 10)
+            .apply(0, 2, 30)
+            .apply(10, 3, 20)
+            .apply(10, 4, 40)
+            .apply(20, 5, 30)
+            .reward(0, 0.0)
+            .reward(10, 1.0)
+            .reward(20, 2.0)
+            .reward(30, 3.0)
+            .reward(40, 1.5)
+    };
+    let build_evaluator = || {
+        RecordedEvaluator::default()
+            .row(0, [4.0, -4.0, 0.0], 0.1)
+            .row(10, [3.0, 1.0, -1.0], 0.2)
+            .row(20, [2.0, 0.5], 0.3)
+            .row(30, [0.0], 0.4)
+            .row(40, [0.0], 0.2)
+    };
+
+    let mut config = config(3);
+    config.simulations = NonZeroUsize::new(6).unwrap();
+    config.max_considered_actions = NonZeroUsize::new(2).unwrap();
+    let mut reuse = config;
+    reuse.tree_reuse = true;
+
+    let fresh_episode = GumbelMcts::new(config)
+        .run(
+            &mut build_engine(),
+            &mut build_evaluator(),
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+    let reuse_episode = GumbelMcts::new(reuse)
+        .run(
+            &mut build_engine(),
+            &mut build_evaluator(),
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(fresh_episode.steps.len(), reuse_episode.steps.len());
+    for (fresh, reused) in fresh_episode.steps.iter().zip(&reuse_episode.steps) {
+        assert_eq!(fresh.step_ref, reused.step_ref);
+        assert_eq!(fresh.selected_rank, reused.selected_rank);
+        // Carried structure lets simulations probe deeper for the same
+        // budget, so Q estimates (and thus targets) shift slightly; the
+        // decisions must not.
+        for (a, b) in fresh.policy_target.iter().zip(&reused.policy_target) {
+            assert!((a - b).abs() < 0.05, "target drift {a} vs {b}");
+        }
+    }
+    assert_eq!(fresh_episode.final_context, reuse_episode.final_context);
+
+    let fresh_evals: usize = fresh_episode.root_stats.iter().map(|s| s.eval_count).sum();
+    let reuse_evals: usize = reuse_episode.root_stats.iter().map(|s| s.eval_count).sum();
+    assert!(
+        reuse_evals < fresh_evals,
+        "reuse evals {reuse_evals} vs fresh {fresh_evals}"
+    );
+    assert!(
+        reuse_episode.root_stats[1..]
+            .iter()
+            .any(|s| s.carried_nodes > 0)
+    );
 }

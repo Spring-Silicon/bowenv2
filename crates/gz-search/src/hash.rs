@@ -66,7 +66,10 @@ pub fn gumbel_search_config_hash(
     // v4: mask_stop joins the config shape.
     // v5: no_backtrack joins the config shape.
     // v6: gumbel_noise_overlap joins the config shape.
-    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v6");
+    // v7: tree reuse carries cached evals only -- decision ledgers reset
+    //     and every move runs the full simulation budget (semantics
+    //     change without a config-shape change).
+    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v7");
     update_u64(&mut hasher, max_steps as u64);
     update_u64(&mut hasher, simulations as u64);
     update_u64(&mut hasher, max_considered_actions as u64);
