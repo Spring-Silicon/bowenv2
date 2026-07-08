@@ -79,6 +79,9 @@ class SelfplayConfig:
     gumbel_noise_overlap: float = -1.0
     # Mask STOP out of learner search wherever a rewrite exists.
     mask_stop: bool = False
+    # Fraction of episodes referenced against the latest rollout instead
+    # of the gated best (whittlezero's ptp.gamma; gated-policy only).
+    reference_gamma: float = 0.0
     # Evaluator server processes; lanes stripe across them (torch only).
     eval_processes: int = 1
 
@@ -680,6 +683,8 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             config.selfplay.root_mode,
             "--reference-ema-decay",
             str(config.selfplay.reference_ema_decay),
+            "--reference-gamma",
+            str(config.selfplay.reference_gamma),
             "--position-features",
             "true" if config.selfplay.position_features else "false",
             "--no-backtrack",

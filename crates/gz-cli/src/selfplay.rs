@@ -38,6 +38,11 @@ pub struct SelfplayConfig {
     pub reference: ReferenceMode,
     pub root_mode: RootMode,
     pub reference_ema_decay: f32,
+    /// whittlezero's ptp.gamma: fraction of episodes referenced against
+    /// the latest measured rollout instead of the gated best, keeping
+    /// the label channel winnable when the bar outruns the noisy player.
+    /// Gated-policy only.
+    pub reference_gamma: f32,
     pub seed: u64,
     pub max_steps: usize,
     pub simulations: usize,
@@ -85,6 +90,7 @@ impl Default for SelfplayConfig {
             reference: ReferenceMode::Root,
             root_mode: RootMode::Generated,
             reference_ema_decay: 0.99,
+            reference_gamma: 0.0,
             seed: 0,
             max_steps: 8,
             simulations: 8,
@@ -148,6 +154,15 @@ impl SelfplayConfig {
             || self.reference_ema_decay >= 1.0
         {
             return Err("--reference-ema-decay must be in (0, 1)".to_owned());
+        }
+        if !self.reference_gamma.is_finite()
+            || self.reference_gamma < 0.0
+            || self.reference_gamma >= 1.0
+        {
+            return Err("--reference-gamma must be in [0, 1)".to_owned());
+        }
+        if self.reference_gamma > 0.0 && self.reference != ReferenceMode::GatedPolicy {
+            return Err("--reference-gamma requires --reference gated-policy".to_owned());
         }
         if self.serve_socket.is_some() {
             if self.episodes != 0 {
@@ -713,7 +728,10 @@ fn provider(
         }
         ReferenceMode::Policy => CliReferenceProvider::Policy(PolicyReferenceProvider::new()),
         ReferenceMode::GatedPolicy => {
-            CliReferenceProvider::Policy(PolicyReferenceProvider::gated())
+            CliReferenceProvider::Policy(PolicyReferenceProvider::gated_with_gamma(
+                config.reference_gamma,
+                config.seed ^ ((lane as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            ))
         }
     };
 
@@ -910,6 +928,9 @@ impl RootSource<WhittleEngine> for CliRoots {
     }
 }
 
+// One instance per lane; the policy variant's gamma-mix bookkeeping
+// outweighs the others and boxing it buys nothing at this count.
+#[allow(clippy::large_enum_variant)]
 enum CliReferenceProvider {
     None,
     Root(RootBaselineProvider),

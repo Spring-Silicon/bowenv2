@@ -610,6 +610,14 @@ where
 pub struct PolicyReferenceProvider {
     gate: PolicyGate,
     current: Option<PolicyReference>,
+    /// The newest measured rollout regardless of gate verdict, for the
+    /// gamma mix: whittlezero plays 1-gamma of its episodes against the
+    /// gated best and gamma against the current checkpoint, so the label
+    /// channel stays winnable when the bar outruns the noisy player.
+    latest: Option<PolicyReference>,
+    gamma: f32,
+    mix_seed: u64,
+    draws: u64,
     last_challenged: Option<ModelVersion>,
     pending_version: Option<ModelVersion>,
 }
@@ -627,6 +635,7 @@ pub enum PolicyGate {
     Best,
 }
 
+#[derive(Clone)]
 struct PolicyReference {
     reward: f32,
     version: ModelVersion,
@@ -646,13 +655,38 @@ impl PolicyReferenceProvider {
         Self::with_gate(PolicyGate::Best)
     }
 
+    /// The gated provider with whittlezero's gamma mix: each episode's
+    /// reference is the latest measured rollout with probability `gamma`
+    /// (seeded, per-provider draw sequence) and the gated incumbent
+    /// otherwise.
+    #[must_use]
+    pub const fn gated_with_gamma(gamma: f32, mix_seed: u64) -> Self {
+        let mut provider = Self::with_gate(PolicyGate::Best);
+        provider.gamma = gamma;
+        provider.mix_seed = mix_seed;
+        provider
+    }
+
     const fn with_gate(gate: PolicyGate) -> Self {
         Self {
             gate,
             current: None,
+            latest: None,
+            gamma: 0.0,
+            mix_seed: 0,
+            draws: 0,
             last_challenged: None,
             pending_version: None,
         }
+    }
+
+    fn mix_unit(&mut self) -> f32 {
+        self.draws += 1;
+        let mut value = self.mix_seed ^ self.draws.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        (value >> 40) as f32 / (1u64 << 24) as f32
     }
 }
 
@@ -667,7 +701,13 @@ where
     E: GraphEngine,
 {
     fn reference(&mut self, _engine: &mut E, _root: E::Graph) -> EngineResult<Option<Reference>> {
-        let Some(current) = &self.current else {
+        let use_latest = self.gamma > 0.0 && self.latest.is_some() && self.mix_unit() < self.gamma;
+        let chosen = if use_latest {
+            self.latest.as_ref()
+        } else {
+            self.current.as_ref()
+        };
+        let Some(current) = chosen else {
             return Ok(None);
         };
 
@@ -727,14 +767,16 @@ where
                     .map_or(outcome.final_reward, |incumbent| incumbent.reward),
             );
         }
+        let challenger = PolicyReference {
+            reward: outcome.final_reward,
+            version,
+            final_graph: outcome.final_graph,
+            steps: outcome.steps,
+            search_config_hash: outcome.search_config_hash,
+        };
+        self.latest = Some(challenger.clone());
         if accepted {
-            self.current = Some(PolicyReference {
-                reward: outcome.final_reward,
-                version,
-                final_graph: outcome.final_graph,
-                steps: outcome.steps,
-                search_config_hash: outcome.search_config_hash,
-            });
+            self.current = Some(challenger);
         }
     }
 }
