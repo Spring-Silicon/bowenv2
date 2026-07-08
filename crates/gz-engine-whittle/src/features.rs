@@ -9,6 +9,17 @@ use std::collections::HashMap;
 const WHITTLE_MAX_ACTIONS: u32 = 256;
 const WHITTLE_MAX_SUBJECTS: u32 = 8;
 const WHITTLE_ENGINE_EDGE_TYPES: u8 = 2;
+/// Input nodes keep their slot identity as distinct tokens (the engine
+/// caps arity at 16). Vocab: 0 pad, 1..=16 input slots, 17/18 const
+/// false/true, 19 not, 20 and, 21 or, 22 output. Collapsing inputs and
+/// constant polarity into single tokens made semantically opposite
+/// rewrites (x AND 0 vs x AND 1) indistinguishable to the model.
+const WHITTLE_INPUT_SLOT_TOKENS: u16 = 16;
+const WHITTLE_NODE_VOCAB: u16 = 23;
+/// Per-node structural attrs the trunks cannot recover on their own
+/// (max-pool SAGE is count-blind; attention has no positional encoding):
+/// fan-out / (n-1), fan-in / 2, depth-from-output / max-depth.
+const WHITTLE_NODE_ATTR_DIM: u16 = 3;
 const DEFAULT_EXPANDER_DEGREE: u8 = 5;
 const DEFAULT_OPPONENT_REWARD_SCALE: f32 = 256.0;
 
@@ -56,9 +67,9 @@ impl WhittleFeatureExtractor {
             WHITTLE_ENGINE_EDGE_TYPES + 1
         };
         let schema = FeatureSchema::new(FeatureSchemaConfig {
-            name: "whittle-v1".to_string(),
-            node_vocab_size: 7,
-            node_attr_dim: 0,
+            name: "whittle-v2".to_string(),
+            node_vocab_size: WHITTLE_NODE_VOCAB,
+            node_attr_dim: WHITTLE_NODE_ATTR_DIM,
             edge_type_count,
             action_kind_vocab_size: RULE_COUNT + 2,
             max_nodes: capacity,
@@ -110,7 +121,18 @@ impl FeatureExtractor<WhittleEngine> for WhittleFeatureExtractor {
             let graph_body = engine.graph(graph)?;
             let state = CachedStateFeatures {
                 node_count: graph_body.op.len() as u32,
-                node_tokens: graph_body.op.iter().copied().map(node_token).collect(),
+                node_tokens: graph_body
+                    .op
+                    .iter()
+                    .zip(graph_body.arg0.as_ref())
+                    .map(|(op, arg0)| node_token(*op, *arg0))
+                    .collect(),
+                node_attrs: node_attrs(
+                    graph_body.op.as_ref(),
+                    graph_body.arg0.as_ref(),
+                    graph_body.arg1.as_ref(),
+                    graph_body.output_node,
+                ),
                 edges: graph_edges(
                     graph_body.op.as_ref(),
                     graph_body.arg0.as_ref(),
@@ -148,7 +170,7 @@ impl FeatureExtractor<WhittleEngine> for WhittleFeatureExtractor {
         let row = FeatureRow {
             node_count: state.node_count,
             node_tokens: state.node_tokens,
-            node_attrs: Vec::new(),
+            node_attrs: state.node_attrs,
             edges,
             actions,
             position,
@@ -180,11 +202,74 @@ impl WhittleFeatureExtractor {
 struct CachedStateFeatures {
     node_count: u32,
     node_tokens: Vec<u16>,
+    node_attrs: Vec<f32>,
     edges: Vec<FeatureEdge>,
 }
 
-const fn node_token(op: OpCode) -> u16 {
-    op as u16 + 1
+fn node_token(op: OpCode, arg0: u32) -> u16 {
+    match op {
+        OpCode::Input => 1 + (arg0 as u16).min(WHITTLE_INPUT_SLOT_TOKENS - 1),
+        OpCode::Const => WHITTLE_INPUT_SLOT_TOKENS + 1 + u16::from(arg0 != 0),
+        OpCode::Not => WHITTLE_INPUT_SLOT_TOKENS + 3,
+        OpCode::And => WHITTLE_INPUT_SLOT_TOKENS + 4,
+        OpCode::Or => WHITTLE_INPUT_SLOT_TOKENS + 5,
+        OpCode::Output => WHITTLE_INPUT_SLOT_TOKENS + 6,
+    }
+}
+
+fn operands(op: OpCode, arg0: u32, arg1: u32) -> [Option<u32>; 2] {
+    let valid = |arg: u32| (arg != NO_NODE).then_some(arg);
+    match op {
+        OpCode::Input | OpCode::Const => [None, None],
+        OpCode::Not | OpCode::Output => [valid(arg0), None],
+        OpCode::And | OpCode::Or => [valid(arg0), valid(arg1)],
+    }
+}
+
+/// whittlezero's structural node features: normalized fan-out (users),
+/// fan-in (operands, at most 2), and BFS depth from the output over
+/// operand edges, unreachable nodes clamped to depth 0.
+fn node_attrs(op: &[OpCode], arg0: &[u32], arg1: &[u32], output_node: u32) -> Vec<f32> {
+    let n = op.len();
+    let mut fan_out = vec![0u32; n];
+    let mut fan_in = vec![0u32; n];
+    for (dst, code) in op.iter().copied().enumerate() {
+        for operand in operands(code, arg0[dst], arg1[dst]).into_iter().flatten() {
+            if (operand as usize) < n {
+                fan_out[operand as usize] += 1;
+                fan_in[dst] += 1;
+            }
+        }
+    }
+
+    let mut depth = vec![-1i64; n];
+    let mut queue = std::collections::VecDeque::new();
+    if (output_node as usize) < n {
+        depth[output_node as usize] = 0;
+        queue.push_back(output_node as usize);
+    }
+    while let Some(node) = queue.pop_front() {
+        for operand in operands(op[node], arg0[node], arg1[node])
+            .into_iter()
+            .flatten()
+        {
+            let operand = operand as usize;
+            if operand < n && depth[operand] < 0 {
+                depth[operand] = depth[node] + 1;
+                queue.push_back(operand);
+            }
+        }
+    }
+    let max_depth = depth.iter().copied().max().unwrap_or(0).max(1) as f32;
+
+    let fan_out_scale = (n.saturating_sub(1)).max(1) as f32;
+    let mut attrs = Vec::with_capacity(n * WHITTLE_NODE_ATTR_DIM as usize);
+    for node in 0..n {
+        attrs.push(fan_out[node] as f32 / fan_out_scale);
+        attrs.push(fan_in[node] as f32 / 2.0);
+        attrs.push(depth[node].max(0) as f32 / max_depth);
+    }
+    attrs
 }
 
 fn graph_edges(op: &[OpCode], arg0: &[u32], arg1: &[u32]) -> Vec<FeatureEdge> {

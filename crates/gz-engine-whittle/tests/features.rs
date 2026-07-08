@@ -10,9 +10,9 @@ use std::num::NonZeroUsize;
 
 const NO_NODE: u32 = u32::MAX;
 const AND_IDEMPOTENT_ROW_FINGERPRINT: &str =
-    "c897c847eefd3ec8557022312f7bc162f651d1e77ca474159d6e7a8b4115f139";
+    "202e4d6b7a63bd84134531456fedcd3aed03a320c128490936cf26e67f451416";
 const AND_IDEMPOTENT_BATCH_FINGERPRINT: &str =
-    "fb935af3dcfcd24f12369d4e6fa3da6b855412c2a22af941587ccf897443c391";
+    "16f2ca9a2f49ca93300f4c09e4aaf66a4c0cae5b8cd2038e21a4f176b206185f";
 
 fn and_idempotent_artifact() -> Vec<u8> {
     wav1(1, 16, 2, &[(0, 0, NO_NODE), (2, 0, 0), (5, 1, NO_NODE)])
@@ -82,12 +82,20 @@ fn whittle_extractor_maps_graph_and_actions() {
         )
         .unwrap();
 
-    assert_eq!(extractor.schema().config().name, "whittle-v1");
+    assert_eq!(extractor.schema().config().name, "whittle-v2");
     assert_eq!(extractor.schema().config().max_nodes, 16);
     assert_eq!(extractor.schema().config().edge_type_count, 3);
     assert_eq!(extractor.schema().config().expander_degree, 5);
+    assert_eq!(extractor.schema().config().node_vocab_size, 23);
+    assert_eq!(extractor.schema().config().node_attr_dim, 3);
     assert_eq!(row.node_count, 3);
-    assert_eq!(row.node_tokens, vec![1, 3, 6]);
+    // Input slot 0, And, Output.
+    assert_eq!(row.node_tokens, vec![1, 20, 22]);
+    // Per node: fan-out / (n-1), fan-in / 2, depth-from-output / max.
+    assert_eq!(
+        row.node_attrs,
+        vec![1.0, 0.0, 1.0, 0.5, 1.0, 0.5, 0.0, 0.5, 0.0]
+    );
     assert!(row.edges.len() >= 3);
     assert_eq!(row.actions.len(), candidates.len() + 1);
     assert_eq!(
@@ -118,6 +126,41 @@ fn whittle_extractor_maps_graph_and_actions() {
         .extract(&engine, root, &candidates, row.position)
         .unwrap();
     assert_eq!(again, row);
+}
+
+#[test]
+fn input_slots_and_const_polarity_get_distinct_tokens() {
+    // Two input slots, const false, const true, Or(c0, c1), Output.
+    let mut engine = WhittleEngine::new(WhittleEngineConfig {
+        root: WhittleRoot::Artifact(wav1(
+            2,
+            16,
+            5,
+            &[
+                (0, 0, NO_NODE),
+                (0, 1, NO_NODE),
+                (1, 0, NO_NODE),
+                (1, 1, NO_NODE),
+                (3, 2, 3),
+                (5, 4, NO_NODE),
+            ],
+        )),
+        ..WhittleEngineConfig::default()
+    })
+    .unwrap();
+    let root = engine.root();
+    let mut candidates = Vec::new();
+    engine
+        .candidates(root, CandidateOptions::default(), &mut candidates)
+        .unwrap();
+    let mut extractor = WhittleFeatureExtractor::new(&engine);
+    let row = feature_row(&mut extractor, &engine, root, &candidates);
+
+    // Slots 0/1 and const false/true are distinct; Or and Output follow.
+    assert_eq!(row.node_tokens, vec![1, 2, 17, 18, 21, 22]);
+    // Unreachable inputs sit at depth 0 like the output.
+    assert_eq!(row.node_attrs[2], 0.0, "input fan-out");
+    assert_eq!(row.node_attrs[3 * 4 + 1], 1.0, "or fan-in");
 }
 
 #[test]
