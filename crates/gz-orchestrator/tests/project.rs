@@ -114,8 +114,11 @@ fn length_tiebreak_breaks_reward_ties_shorter_wins() {
     let learner = episode.final_measure.scalar_reward.unwrap();
     let len = episode.steps.len();
 
-    for (reference_steps, expected) in [(len + 1, 1.0), (len.saturating_sub(1).max(1), -1.0)] {
-        if reference_steps == len {
+    // reference_with_steps counts position entries: moves + 1. The
+    // learner (len moves) wins ties against len+2 entries (len+1 moves)
+    // and loses against len entries (len-1 moves).
+    for (reference_steps, expected) in [(len + 2, 1.0), (len.max(1), -1.0)] {
+        if reference_steps == len + 1 {
             continue;
         }
         let reference = reference_with_steps(&episode, learner, reference_steps);
@@ -163,8 +166,8 @@ fn length_tiebreak_equal_lengths_and_flag_off_fall_to_coin() {
     .value_target
     .unwrap();
 
-    // Flag on, equal lengths: same coin as flag off.
-    let equal = reference_with_steps(&episode, learner, episode.steps.len());
+    // Flag on, equal lengths (entries = moves + 1): same coin as flag off.
+    let equal = reference_with_steps(&episode, learner, episode.steps.len() + 1);
     let target = project_episode(&episode, Some(&equal), None, true, 7)
         .unwrap()
         .0

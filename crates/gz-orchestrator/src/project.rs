@@ -23,8 +23,11 @@ pub fn project_episode<G, C>(
 
     let final_measure = MeasureSummary::from(&episode.final_measure);
     let value_target = reference.map(|reference| {
+        // Reference steps hold positions (root + one per move); the
+        // learner's steps hold moves. Compare move counts or every
+        // equal-length game "wins" the tie by the root entry.
         let reference_len =
-            (length_tiebreak && !reference.steps.is_empty()).then_some(reference.steps.len());
+            (length_tiebreak && !reference.steps.is_empty()).then(|| reference.steps.len() - 1);
         sign_target(
             learner_reward,
             reference.final_reward,
