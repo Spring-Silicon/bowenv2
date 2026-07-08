@@ -33,6 +33,7 @@ class StepMetrics:
     value_accuracy: float
     fraction_valid: float
     label_mean: float
+    learner_win_rate: float
     terminal_cost_mean: float
     terminal_cost_best: float
 
@@ -128,9 +129,16 @@ class TrainerLoop:
                 label = torch.where(value[valid] >= 0, 1.0, -1.0)
                 value_accuracy = (prediction == label).float().mean()
                 label_mean = batch.value[valid].mean()
+                # Fraction of valid rows whose stored label says the
+                # learner beat its reference. Row-weighted like
+                # label_mean; with hard +/-1 labels it is
+                # (label_mean + 1) / 2, but stays meaningful if labels
+                # ever grade.
+                learner_win_rate = (batch.value[valid] > 0).float().mean()
             else:
                 value_accuracy = value_raw.new_tensor(0.0)
                 label_mean = value_raw.new_tensor(0.0)
+                learner_win_rate = value_raw.new_tensor(0.0)
             fraction_valid = valid.float().mean()
             # Whittle reward is -(measured cost); report the cost directly.
             # Row-weighted: long episodes contribute more rows to the batch.
@@ -148,6 +156,7 @@ class TrainerLoop:
             value_accuracy=float(value_accuracy.detach().cpu()),
             fraction_valid=float(fraction_valid.detach().cpu()),
             label_mean=float(label_mean.detach().cpu()),
+            learner_win_rate=float(learner_win_rate.detach().cpu()),
             terminal_cost_mean=float(terminal_cost_mean.detach().cpu()),
             terminal_cost_best=float(terminal_cost_best.detach().cpu()),
         )
