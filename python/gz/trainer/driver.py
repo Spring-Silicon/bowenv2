@@ -130,7 +130,13 @@ def run(config_path: str | Path) -> None:
     ema = None
     published_snapshot = None
     resume_start = 0
+    bootstrap_rows = 0
     if not config.trainer.resume:
+        # The stub/root bootstrap exists to initialize the store (schema)
+        # and publish the version-0 checkpoint the torch evaluator needs.
+        # Its rows are OFF-distribution (stub evaluator, root reference)
+        # and are excluded from training below: the live wait requires a
+        # fully live sampling window on top of them.
         bootstrap_selfplay(config)
         serve = spawn_replay_serve(config)
         try:
@@ -139,10 +145,10 @@ def run(config_path: str | Path) -> None:
                 startup_timeout=config.trainer.startup_timeout,
                 reconnect_limit=config.trainer.reconnect_limit,
             )
-            sampler.wait_until_ready(
-                config.trainer.min_startup_rows,
+            bootstrap_rows = sampler.wait_until_ready(
+                1,
                 alive_check=lambda: check_child(serve, "replay-serve"),
-            )
+            ).produced_rows
             model = build_model(sampler.feature_schema, arch).to(config.trainer.device)
             ema = EmaWeights(model, config.trainer.ema_decay)
             first = publish_ema(
@@ -175,8 +181,13 @@ def run(config_path: str | Path) -> None:
             startup_timeout=config.trainer.startup_timeout,
             reconnect_limit=config.trainer.reconnect_limit,
         )
+        # Train only once the newest window_rows are all live-distribution
+        # rows: bootstrap rows seed the store but never reach a batch.
+        startup_rows = bootstrap_rows + max(
+            config.trainer.min_startup_rows, config.trainer.window_rows
+        )
         ready_ack = sampler.wait_until_ready(
-            config.trainer.min_startup_rows,
+            startup_rows,
             alive_check=lambda: check_child(selfplay, "selfplay"),
         )
         if ready_ack.root is not None and not config.trainer.resume:
@@ -583,12 +594,10 @@ class WandbRun:
 def _validate(config: RunConfig) -> RunConfig:
     if config.trainer.lr_schedule not in ("cosine", "constant"):
         raise ValueError(f"unknown lr_schedule: {config.trainer.lr_schedule}")
-    ceiling = config.trainer.bootstrap_episodes * config.selfplay.max_steps
-    if ceiling < config.trainer.min_startup_rows:
-        raise ValueError(
-            f"bootstrap_episodes x max_steps ({ceiling}) cannot reach "
-            f"min_startup_rows ({config.trainer.min_startup_rows}); startup would hang"
-        )
+    # Bootstrap only initializes the store and seeds the first publish;
+    # min_startup_rows is satisfied by live selfplay on top of it.
+    if config.trainer.bootstrap_episodes < 1:
+        raise ValueError("bootstrap_episodes must be at least 1 to initialize the store")
     return config
 
 

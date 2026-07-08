@@ -131,15 +131,22 @@ def test_load_config_parses_arch_table(tmp_path: Path) -> None:
     assert config.arch.heads == 4
 
 
-def test_load_config_rejects_unreachable_startup_rows(tmp_path: Path) -> None:
+def test_load_config_allows_small_bootstrap_but_requires_one_episode(tmp_path: Path) -> None:
+    # min_startup_rows is satisfied by live selfplay, not the bootstrap:
+    # a tiny bootstrap with a large startup floor is valid.
     config_path = tmp_path / "run.toml"
     config_path.write_text(
         '[trainer]\nbootstrap_episodes = 4\nmin_startup_rows = 512\n\n'
         '[selfplay]\nmax_steps = 8\n\n[paths]\nrun_dir = "run"\n',
         encoding="utf-8",
     )
+    assert load_config(config_path).trainer.bootstrap_episodes == 4
 
-    with pytest.raises(ValueError, match="cannot reach"):
+    config_path.write_text(
+        '[trainer]\nbootstrap_episodes = 0\n\n[paths]\nrun_dir = "run"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="at least 1"):
         load_config(config_path)
 
 
