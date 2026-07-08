@@ -79,6 +79,11 @@ class _ServingSlot:
     manifest: object
     runner: object
     model_version: ModelVersion
+    # Whether the model's value output is already bounded. Logit heads
+    # need the serve-side tanh -- BCE trains P(win) = sigmoid(2x), so
+    # E[z] = tanh(x) is the calibrated search value -- but tanh heads
+    # are bounded at the model and a second tanh double-compresses.
+    value_bounded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,7 +246,7 @@ class TorchBackend:
             return PendingEval(
                 model_version=active.model_version,
                 slot=None,
-                value_raw=value_raw,
+                value_raw=self._serve_value(active, value_raw),
                 logits=logits,
                 row_count=staged.row_count,
                 encoder=staged.encoder,
@@ -253,7 +258,7 @@ class TorchBackend:
         # CUDA-graph outputs BEFORE any later replay overwrites them;
         # the event marks when the pinned copies are complete.
         with torch.inference_mode():
-            slot.values.copy_(torch.tanh(value_raw).float(), non_blocking=True)
+            slot.values.copy_(self._serve_value(active, value_raw).float(), non_blocking=True)
             slot.logits.copy_(logits.float(), non_blocking=True)
         slot.event.record()
         return PendingEval(
@@ -276,15 +281,20 @@ class TorchBackend:
                     pending.row_count,
                 ),
             )
-        torch = _torch()
         return EvalResult(
             model_version=pending.model_version,
             payload=pending.encoder.encode(
-                torch.tanh(pending.value_raw).detach().float().cpu().numpy(),
+                pending.value_raw.detach().float().cpu().numpy(),
                 pending.logits.detach().float().cpu().numpy(),
                 pending.row_count,
             ),
         )
+
+    def _serve_value(self, slot: _ServingSlot, value_raw: object) -> object:
+        if slot.value_bounded:
+            return value_raw
+        torch = _torch()
+        return torch.tanh(value_raw)
 
     def _start_loader(self) -> None:
         if self._loader_started:
@@ -336,6 +346,7 @@ class TorchBackend:
             manifest=resolved.manifest,
             runner=runner,
             model_version=resolved.manifest.model_version,
+            value_bounded=arch.value_activation == "tanh",
         )
 
     def _warm_runner(self, runner: object, stager: BatchStager, count: int) -> None:

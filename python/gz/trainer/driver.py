@@ -45,6 +45,11 @@ class TrainerConfig:
     # taking the socket read/decode off the step critical path. Off = the
     # historical strictly-serial loop, kept for A/B comparison.
     prefetch: bool = True
+    # Pace the trainer against fresh production: step N+1 waits until
+    # produced_rows >= (N+1)*batch/max_reuse, capping cumulative samples
+    # per produced row (whittlezero's generate-then-train ratio is ~0.55;
+    # our free-running loop measured 7-18). 0 disables.
+    max_reuse: float = 0.0
     # Continue an interrupted run in place: skip bootstrap, load the latest
     # published checkpoint (EMA weights seed both the live model and the
     # EMA -- an approximate resume; optimizer moments restart), and start
@@ -234,14 +239,24 @@ def run(config_path: str | Path) -> None:
                 start_step=resume_start,
             )
             prefetcher.start()
+        produced_floor = 0
         for step in range(resume_start, config.trainer.total_steps):
             check_child(selfplay, "selfplay")
             if step % 50 == 0:
                 check_memory(config.trainer.min_available_gb)
             # With prefetch, sample_ms measures the wait for the queued
             # batch: ~0 while sampling keeps up, the residual stall when it
-            # does not.
+            # does not. The reuse gate stalls inside the same window.
             sample_started = time.perf_counter()
+            if config.trainer.max_reuse > 0:
+                needed = int((step + 1) * config.trainer.batch / config.trainer.max_reuse)
+                while produced_floor < needed:
+                    ack = prefetcher.refresh() if prefetcher is not None else sampler.refresh()
+                    produced_floor = ack.produced_rows
+                    if produced_floor >= needed:
+                        break
+                    check_child(selfplay, "selfplay")
+                    time.sleep(0.1)
             if prefetcher is not None:
                 result = prefetcher.next()
             else:

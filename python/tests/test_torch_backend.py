@@ -13,7 +13,7 @@ from gz.checkpoints import DirectorySource, publish_checkpoint
 from gz.codec import BatchView, FeatureSchemaConfig
 from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash, ModelVersion
 from gz.evaluator import TorchBackend, serve
-from gz.model.exphormer import ArchConfig, build_model
+from gz.model.exphormer import ArchConfig, BatchStager, build_model
 from gz.proto import (
     BATCH_ENCODING_VERSION,
     ERROR_SCHEMA,
@@ -212,6 +212,7 @@ def publish_random_checkpoint(
     seed: int = 11,
     feature_schema_hash: FeatureSchemaHash | None = None,
     schema_name: str = "expander-test",
+    value_activation: str = "logit",
 ):
     schema = FeatureSchemaConfig(
         name=schema_name,
@@ -226,7 +227,7 @@ def publish_random_checkpoint(
         expander_degree=2,
         expander_seed=0,
     )
-    arch = ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0)
+    arch = ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0, value_activation=value_activation)
     torch.manual_seed(seed)
     model = build_model(schema, arch)
     return publish_checkpoint(
@@ -337,3 +338,50 @@ def wait_for_version(client: socket.socket, batch: bytes, version: ModelVersion,
 
 def result_version(payload: bytes) -> ModelVersion:
     return ModelVersion.from_bytes(payload[8:24])
+
+
+def test_serve_tanh_applies_once_per_head_kind(tmp_path: Path) -> None:
+    # Logit heads get the calibrating serve tanh (E[z] = tanh(x) under
+    # BCE on 2x); tanh heads are already bounded and must not be
+    # compressed a second time.
+    from gz.evaluator.backends import TorchBackend
+
+    view = BatchView.parse((FIXTURES / "batch_expander.gzfb").read_bytes())
+    for value_activation in ("logit", "tanh"):
+        root = tmp_path / value_activation
+        manifest = publish_random_checkpoint(root, view, value_activation=value_activation)
+        backend = TorchBackend(
+            str(root),
+            device="cpu",
+            poll_interval=0.0,
+            compile_model=False,
+        )
+        backend.handshake(make_hello(view, manifest.feature_schema_hash))
+        staged = backend.stage(view)
+        pending = backend.launch(staged)
+        result = backend.finish(pending)
+        values = np.frombuffer(result.payload, dtype=np.dtype("<f4"), count=view.row_count, offset=16)
+
+        schema = FeatureSchemaConfig(
+            name="expander-test",
+            node_vocab_size=8,
+            node_attr_dim=view.dims.node_attr_dim,
+            edge_type_count=3,
+            action_kind_vocab_size=8,
+            max_nodes=view.dims.max_nodes,
+            max_edges=view.dims.max_edges,
+            max_actions=view.dims.max_actions,
+            max_subjects=view.dims.max_subjects,
+            expander_degree=2,
+            expander_seed=0,
+        )
+        torch.manual_seed(11)
+        reference = build_model(
+            schema,
+            ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0, value_activation=value_activation),
+        ).eval()
+        stager = BatchStager(schema, view.batch_capacity, "cpu")
+        with torch.inference_mode():
+            raw, _ = reference(stager.copy(view))
+        expected = torch.tanh(raw) if value_activation == "logit" else raw
+        assert np.allclose(values, expected[: view.row_count].numpy(), atol=1e-5), value_activation
