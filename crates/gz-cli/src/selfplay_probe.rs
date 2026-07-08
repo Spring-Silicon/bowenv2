@@ -11,7 +11,8 @@ use gz_engine_whittle::{
     WhittleGraphGenerator, WhittleGraphGeneratorConfig, WhittleGraphId, WhittleRoot,
 };
 use gz_features::{
-    FeatureCollator, FeatureExtractor, FeatureRow, OpponentStateFeatures, PositionFeatures,
+    FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaConfig,
+    OpponentStateFeatures, PositionFeatures,
 };
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
@@ -226,6 +227,33 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), String> {
         &args.out_dir.join("orientation.gzfb"),
         &orient_rows,
     )?;
+
+    // Legacy (whittle-v1) variants of the same batches, for checkpoints
+    // trained before the featurization port: tokens downgrade
+    // deterministically (input slots and const polarity collapse) and
+    // attrs drop.
+    let legacy_schema = FeatureSchema::new(FeatureSchemaConfig {
+        name: "whittle-v1".to_string(),
+        node_vocab_size: 7,
+        node_attr_dim: 0,
+        ..extractor.schema().config().clone()
+    })
+    .map_err(|error| format!("{error:?}"))?;
+    for (name, rows) in [
+        ("sweep", &sweep_rows),
+        ("opponents", &opp_rows),
+        ("orientation", &orient_rows),
+    ] {
+        let legacy_rows: Vec<FeatureRow> = rows.iter().map(downgrade_row).collect();
+        let capacity = NonZeroUsize::new(legacy_rows.len()).ok_or("empty batch")?;
+        let mut collator = FeatureCollator::new(legacy_schema.clone(), capacity);
+        let mut bytes = Vec::new();
+        collator
+            .collate_into(&legacy_rows, &mut bytes)
+            .map_err(|error| format!("{error:?}"))?;
+        std::fs::write(args.out_dir.join(format!("{name}_v1.gzfb")), &bytes)
+            .map_err(|error| error.to_string())?;
+    }
     std::fs::write(args.out_dir.join("meta.json"), meta).map_err(|error| error.to_string())?;
     println!(
         "root_cost={root_cost} candidates={} applied={} sweep_rows={}",
@@ -239,6 +267,36 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), String> {
 struct OpponentRow {
     features: OpponentStateFeatures,
     cost: f32,
+}
+
+/// whittle-v2 tokens collapse onto the v1 vocabulary: input slots 1..=16
+/// -> 1, const 17/18 -> 2, and 20 -> 3, or 21 -> 4, not 19 -> 5,
+/// output 22 -> 6 (v1 was opcode + 1 with no attrs).
+fn downgrade_token(token: u16) -> u16 {
+    match token {
+        1..=16 => 1,
+        17 | 18 => 2,
+        20 => 3,
+        21 => 4,
+        19 => 5,
+        22 => 6,
+        other => other,
+    }
+}
+
+fn downgrade_row(row: &FeatureRow) -> FeatureRow {
+    let mut row = row.clone();
+    for token in &mut row.node_tokens {
+        *token = downgrade_token(*token);
+    }
+    row.node_attrs = Vec::new();
+    if let Some(opponent) = &mut row.opponent {
+        for token in &mut opponent.node_tokens {
+            *token = downgrade_token(*token);
+        }
+        opponent.node_attrs = Vec::new();
+    }
+    row
 }
 
 fn measure_cost(engine: &mut WhittleEngine, graph: WhittleGraphId) -> Result<f32, String> {
