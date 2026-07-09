@@ -1957,14 +1957,14 @@ fn run_featurized_batcher<B>(
 where
     B: FeatureEvalBackend,
 {
-    type Routing = Vec<(usize, usize, WorkToken, u32)>;
+    type Routing = BatcherRouting;
 
     // Up to PIPELINE_DEPTH submitted batches ride the backend at once
     // (the evaluator moves outputs off its static buffers at launch, so
     // its GPU queue holds a batch while the previous one drains); replies
-    // are FIFO. Depth 2 hides the server's per-batch host work under the
-    // preceding batch's compute.
-    const PIPELINE_DEPTH: usize = 2;
+    // are FIFO. Depth 3: one computing, one staged behind it, one in the
+    // socket buffer, so the server never starves between client drains.
+    const PIPELINE_DEPTH: usize = 3;
 
     let mut batch_sizes = Vec::new();
     let mut batch = Vec::with_capacity(config.max_batch.get());
@@ -1978,32 +1978,41 @@ where
     while intake_open || !in_flight.is_empty() {
         batch.clear();
         if intake_open && in_flight.len() < PIPELINE_DEPTH {
-            if in_flight.is_empty() {
-                // Nothing on the backend: block for work.
-                match intake_rx.recv() {
-                    Ok(job) => batch.push(job),
-                    Err(_) => intake_open = false,
+            // Fill toward a FULL batch. The evaluator's buffers (and its
+            // CUDA-graph forward) are capacity-shaped, so a half batch
+            // costs the same GPU time as a full one: padding rows are
+            // pure waste. While the backend holds work, a partial batch
+            // therefore waits -- each flush-window timeout drains the
+            // oldest reply instead, and the workers that unblocks come
+            // straight back with new evals to finish the fill. Only a
+            // backend about to go idle flushes a partial batch.
+            loop {
+                if batch.len() >= config.max_batch.get() {
+                    break;
                 }
-            } else {
-                // A batch is in flight: collect only within the flush
-                // window so its replies are never held hostage to intake.
-                match intake_rx.recv_timeout(config.flush_after) {
-                    Ok(job) => batch.push(job),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => intake_open = false,
-                }
-            }
-            if !batch.is_empty() {
-                let deadline = Instant::now() + config.flush_after;
-                while batch.len() < config.max_batch.get() {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    match intake_rx.recv_timeout(remaining) {
+                if batch.is_empty() && in_flight.is_empty() {
+                    // Nothing anywhere: block for work.
+                    match intake_rx.recv() {
                         Ok(job) => batch.push(job),
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => {
+                        Err(_) => {
                             intake_open = false;
                             break;
                         }
+                    }
+                    continue;
+                }
+                match intake_rx.recv_timeout(config.flush_after) {
+                    Ok(job) => batch.push(job),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if in_flight.is_empty() {
+                            // Backend idle: ship what we have now.
+                            break;
+                        }
+                        drain_oldest(&mut backend, &mut in_flight, &reply_txs, &mut batch_sizes)?;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        intake_open = false;
+                        break;
                     }
                 }
             }
@@ -2037,32 +2046,48 @@ where
         if !must_drain {
             continue;
         }
-        if let Some((routing, pending)) = in_flight.pop_front() {
-            let outputs = backend
-                .receive(pending)
-                .map_err(|_| internal("feature eval backend failed"))?;
-            let counts = routing
-                .iter()
-                .map(|&(_, _, _, action_count)| action_count)
-                .collect::<Vec<_>>();
-            validate_backend_outputs(&outputs, &counts)?;
-            batch_sizes.push(routing.len());
-
-            for ((lane, slot, token, _), row) in routing.into_iter().zip(outputs.rows) {
-                let _ = reply_txs[lane].send(EvalReply {
-                    slot,
-                    token,
-                    output: EvalOutput {
-                        model_version: outputs.model_version,
-                        policy_logits: row.policy_logits,
-                        value: row.value,
-                    },
-                });
-            }
-        }
+        drain_oldest(&mut backend, &mut in_flight, &reply_txs, &mut batch_sizes)?;
     }
 
     Ok(batch_sizes)
+}
+
+type BatcherRouting = Vec<(usize, usize, WorkToken, u32)>;
+
+fn drain_oldest<B>(
+    backend: &mut B,
+    in_flight: &mut std::collections::VecDeque<(BatcherRouting, gz_eval_service::PendingBatch)>,
+    reply_txs: &[SyncSender<EvalReply>],
+    batch_sizes: &mut Vec<usize>,
+) -> EngineResult<()>
+where
+    B: FeatureEvalBackend,
+{
+    let Some((routing, pending)) = in_flight.pop_front() else {
+        return Ok(());
+    };
+    let outputs = backend
+        .receive(pending)
+        .map_err(|_| internal("feature eval backend failed"))?;
+    let counts = routing
+        .iter()
+        .map(|&(_, _, _, action_count)| action_count)
+        .collect::<Vec<_>>();
+    validate_backend_outputs(&outputs, &counts)?;
+    batch_sizes.push(routing.len());
+
+    for ((lane, slot, token, _), row) in routing.into_iter().zip(outputs.rows) {
+        let _ = reply_txs[lane].send(EvalReply {
+            slot,
+            token,
+            output: EvalOutput {
+                model_version: outputs.model_version,
+                policy_logits: row.policy_logits,
+                value: row.value,
+            },
+        });
+    }
+    Ok(())
 }
 
 fn validate_backend_outputs(outputs: &BackendOutputs, action_counts: &[u32]) -> EngineResult<()> {
