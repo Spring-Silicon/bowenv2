@@ -90,9 +90,6 @@ class SelfplayConfig:
     # Break equal-reward games by episode length, shorter wins
     # (whittlezero's ptp_duration_tiebreak, discrete form).
     length_tiebreak: bool = False
-    # Fraction of episodes referenced against the latest rollout instead
-    # of the gated best (whittlezero's ptp.gamma; gated-policy only).
-    reference_gamma: float = 0.0
     # Carry the selected subtree across moves. whittlezero searches a
     # fresh tree per move; visit-based final selection is only faithful
     # with reuse off.
@@ -706,6 +703,16 @@ def _validate(config: RunConfig) -> RunConfig:
     # min_startup_rows is satisfied by live selfplay on top of it.
     if config.trainer.bootstrap_episodes < 1:
         raise ValueError("bootstrap_episodes must be at least 1 to initialize the store")
+    # The opponent reward scalar lives in the position feature block, so
+    # blinding the model (position_features = false) removes the value
+    # head's ONLY opponent signal unless the pair input carries the full
+    # opponent graph through the separate opponent_* tensors. single and
+    # scalar modes under blinding are unlearnable-by-construction.
+    if not config.selfplay.position_features and config.arch.value_input != "pair":
+        raise ValueError(
+            "position_features = false requires value_input = 'pair': "
+            f"'{config.arch.value_input}' leaves the value head opponent-blind"
+        )
     return config
 
 
@@ -815,8 +822,6 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             config.selfplay.root_mode,
             "--reference-ema-decay",
             str(config.selfplay.reference_ema_decay),
-            "--reference-gamma",
-            str(config.selfplay.reference_gamma),
             "--position-features",
             "true" if config.selfplay.position_features else "false",
             "--no-backtrack",
