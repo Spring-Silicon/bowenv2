@@ -52,7 +52,12 @@ def test_server_eval_and_ping(tmp_path: Path) -> None:
         assert bytes(payload[8:24]) == bytes(STUB_MODEL_VERSION)
 
         values, logits = stub(batch_view)
-        expected = expected_output_bytes(values, logits, batch_view.row_count)
+        expected = expected_output_bytes(
+            values,
+            logits,
+            batch_view.row_count,
+            batch_view.action_count[: batch_view.row_count],
+        )
         assert bytes(payload[24:]) == expected
     finally:
         client.close()
@@ -163,10 +168,16 @@ def assert_error(client: socket.socket, code: int) -> None:
     assert actual == code
 
 
-def expected_output_bytes(values: np.ndarray, logits: np.ndarray, row_count: int) -> bytes:
+def expected_output_bytes(
+    values: np.ndarray,
+    logits: np.ndarray,
+    row_count: int,
+    action_counts: np.ndarray,
+) -> bytes:
     out = bytearray()
     out.extend(b"GZFO")
     out.extend(struct.pack("<III", BATCH_ENCODING_VERSION, row_count, logits.shape[1]))
-    out.extend(values.astype("<f4", copy=False).tobytes())
-    out.extend(logits.astype("<f4", copy=False).tobytes())
+    out.extend(values[:row_count].astype("<f4", copy=False).tobytes())
+    for row, count in enumerate(action_counts.tolist()):
+        out.extend(logits[row, :count].astype("<f4", copy=False).tobytes())
     return bytes(out)

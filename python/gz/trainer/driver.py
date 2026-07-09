@@ -39,7 +39,6 @@ class TrainerConfig:
     reconnect_limit: int = 5
     log_interval: int = 1
     step_sleep: float = 0.0
-    bootstrap_episodes: int = 64
     min_available_gb: float = 40.0
     # Sample batch N+1 on a background thread while the GPU trains batch N,
     # taking the socket read/decode off the step critical path. Off = the
@@ -53,7 +52,7 @@ class TrainerConfig:
     # Train both orientations of every pair (whittlezero's mirrored value
     # stream) instead of the random per-step flip.
     value_mirror: bool = False
-    # Continue an interrupted run in place: skip bootstrap, load the latest
+    # Continue an interrupted run in place: load the latest
     # published checkpoint (EMA weights seed both the live model and the
     # EMA -- an approximate resume; optimizer moments restart), and start
     # the step counter at the checkpoint's training_step.
@@ -96,6 +95,9 @@ class SelfplayConfig:
     tree_reuse: bool = True
     # Evaluator server processes; lanes stripe across them (torch only).
     eval_processes: int = 1
+    # Minimum delay between root episode admissions in each lane. Used to
+    # ramp worker cohorts instead of launching every slot at startup.
+    admission_stagger_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +128,10 @@ class RunConfig:
     arch: ArchConfig
 
 
+def _sample_window_rows(window_rows: int, produced_rows: int) -> int:
+    return max(1, min(int(window_rows), int(produced_rows)))
+
+
 def run(config_path: str | Path) -> None:
     config = load_config(config_path)
     for path in (config.paths.replay_dir, config.paths.checkpoint_dir, config.paths.run_dir):
@@ -137,14 +143,8 @@ def run(config_path: str | Path) -> None:
     ema = None
     published_snapshot = None
     resume_start = 0
-    bootstrap_rows = 0
     if not config.trainer.resume:
-        # The stub/root bootstrap exists to initialize the store (schema)
-        # and publish the version-0 checkpoint the torch evaluator needs.
-        # Its rows are OFF-distribution (stub evaluator, root reference)
-        # and are excluded from training below: the live wait requires a
-        # fully live sampling window on top of them.
-        bootstrap_selfplay(config)
+        init_replay(config)
         serve = spawn_replay_serve(config)
         try:
             sampler = SampleClient(
@@ -152,10 +152,7 @@ def run(config_path: str | Path) -> None:
                 startup_timeout=config.trainer.startup_timeout,
                 reconnect_limit=config.trainer.reconnect_limit,
             )
-            bootstrap_rows = sampler.wait_until_ready(
-                1,
-                alive_check=lambda: check_child(serve, "replay-serve"),
-            ).produced_rows
+            sampler.wait_until_ready(0, alive_check=lambda: check_child(serve, "replay-serve"))
             model = build_model(sampler.feature_schema, arch).to(config.trainer.device)
             ema = EmaWeights(model, config.trainer.ema_decay)
             first = publish_ema(
@@ -183,8 +180,11 @@ def run(config_path: str | Path) -> None:
 
     selfplay = spawn_torch_selfplay(config)
     opponent = OpponentTracker()
+    selfplay_stats = SelfplayStatsTracker()
     threading.Thread(
-        target=pump_selfplay_stderr, args=(selfplay, opponent), daemon=True
+        target=pump_selfplay_stderr,
+        args=(selfplay, opponent, selfplay_stats),
+        daemon=True,
     ).start()
     try:
         sampler = SampleClient(
@@ -192,13 +192,8 @@ def run(config_path: str | Path) -> None:
             startup_timeout=config.trainer.startup_timeout,
             reconnect_limit=config.trainer.reconnect_limit,
         )
-        # Train only once the newest window_rows are all live-distribution
-        # rows: bootstrap rows seed the store but never reach a batch.
-        startup_rows = bootstrap_rows + max(
-            config.trainer.min_startup_rows, config.trainer.window_rows
-        )
         ready_ack = sampler.wait_until_ready(
-            startup_rows,
+            config.trainer.min_startup_rows,
             alive_check=lambda: check_child(selfplay, "selfplay"),
         )
         if ready_ack.root is not None and not config.trainer.resume:
@@ -283,9 +278,10 @@ def run(config_path: str | Path) -> None:
             if prefetcher is not None:
                 result = prefetcher.next()
             else:
+                ack = sampler.refresh()
                 result = sampler.sample(
                     config.trainer.batch,
-                    config.trainer.window_rows,
+                    _sample_window_rows(config.trainer.window_rows, ack.produced_rows),
                     step_seed(config.trainer.seed, step),
                 )
             train_started = time.perf_counter()
@@ -325,10 +321,13 @@ def run(config_path: str | Path) -> None:
                     "stop_rate_ema": ack.stop_rate_ema,
                     "best_cost": ack.best_cost,
                     **opponent.step_fields(),
+                    **selfplay_stats.step_fields(),
                 }
                 # -1.0 = no labeled episode appended yet (unseeded EMA).
                 if ack.learner_win_rate_ema >= 0.0:
                     record["learner_win_rate_ema"] = ack.learner_win_rate_ema
+                if ack.episode_latency_ema >= 0.0:
+                    record["episode_latency_s"] = ack.episode_latency_ema
                 # Outcome gauges are per-store-open; a zero means unseeded
                 # (no episode appended by this selfplay process yet).
                 if ack.root is not None and ack.episode_cost_ema > 0.0:
@@ -461,15 +460,93 @@ class OpponentTracker:
             }
 
 
-def pump_selfplay_stderr(process: subprocess.Popen[bytes], tracker: OpponentTracker) -> None:
-    """Relays the child's stderr to ours line-by-line, feeding gate lines
-    to the tracker. Runs as a daemon thread until the pipe closes."""
+class SelfplayStatsTracker:
+    """Parses eval_stats / measure_stats heartbeats off the selfplay
+    stderr pump. The selfplay side emits cumulative counters every 30s;
+    step_fields() reports window rates (delta since the last fold) plus
+    the cumulative ledger, so batch fill and the measure repeat rate
+    are live in wandb instead of dying with the killed process's exit
+    summary."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.eval_batches = None
+        self.eval_rows = None
+        self.eval_at = None
+        self.folded = None
+        self.measure: dict[str, int] = {}
+
+    def observe_eval(self, fields: dict[str, str]) -> None:
+        try:
+            batches = int(fields["batches"])
+            rows = int(fields["rows"])
+        except (KeyError, ValueError):
+            return
+        with self.lock:
+            self.eval_batches = batches
+            self.eval_rows = rows
+            self.eval_at = time.time()
+
+    def observe_measure(self, fields: dict[str, str]) -> None:
+        try:
+            parsed = {
+                key: int(fields[key])
+                for key in ("appended", "dropped", "finals", "distinct")
+            }
+        except (KeyError, ValueError):
+            return
+        with self.lock:
+            self.measure = parsed
+
+    def step_fields(self) -> dict[str, object]:
+        with self.lock:
+            out: dict[str, object] = {}
+            if self.eval_batches is not None:
+                out["eval_batches_total"] = self.eval_batches
+                out["eval_rows_total"] = self.eval_rows
+                if self.folded is not None:
+                    prev_batches, prev_rows, prev_at = self.folded
+                    d_batches = self.eval_batches - prev_batches
+                    d_rows = self.eval_rows - prev_rows
+                    dt = self.eval_at - prev_at
+                    if d_batches > 0 and dt > 0:
+                        out["eval_mean_batch"] = d_rows / d_batches
+                        out["eval_batches_per_s"] = d_batches / dt
+                        out["eval_evals_per_s"] = d_rows / dt
+                if self.folded is None or self.folded[0] != self.eval_batches:
+                    self.folded = (self.eval_batches, self.eval_rows, self.eval_at)
+            if self.measure:
+                out["measure_finals"] = self.measure["finals"]
+                out["measure_distinct_finals"] = self.measure["distinct"]
+                if self.measure["finals"] > 0:
+                    out["measure_repeat_rate"] = (
+                        self.measure["finals"] - self.measure["distinct"]
+                    ) / self.measure["finals"]
+            return out
+
+
+def parse_stat_fields(line: str) -> dict[str, str]:
+    return dict(token.split("=", 1) for token in line.strip().split() if "=" in token)
+
+
+def pump_selfplay_stderr(
+    process: subprocess.Popen[bytes],
+    tracker: OpponentTracker,
+    stats: SelfplayStatsTracker,
+) -> None:
+    """Relays the child's stderr to ours line-by-line, feeding gate and
+    heartbeat lines to the trackers. Runs as a daemon thread until the
+    pipe closes."""
     assert process.stderr is not None
     for raw in iter(process.stderr.readline, b""):
         sys.stderr.buffer.write(raw)
         sys.stderr.buffer.flush()
         if raw.startswith(b"event=policy_gate "):
             tracker.observe(raw.decode("utf-8", "replace"))
+        elif raw.startswith(b"event=eval_stats "):
+            stats.observe_eval(parse_stat_fields(raw.decode("utf-8", "replace")))
+        elif raw.startswith(b"event=measure_stats "):
+            stats.observe_measure(parse_stat_fields(raw.decode("utf-8", "replace")))
 
 
 class MetricsWriter:
@@ -545,9 +622,10 @@ class SamplePrefetcher:
                 return
             try:
                 with self._lock:
+                    ack = self._sampler.refresh()
                     result = self._sampler.sample(
                         self._batch,
-                        self._window_rows,
+                        _sample_window_rows(self._window_rows, ack.produced_rows),
                         step_seed(self._seed, step),
                     )
             except BaseException as error:  # surfaced on next()
@@ -610,12 +688,19 @@ WANDB_KEYS = {
     "label_mean": "train/label_mean",
     "learner_win_rate": "train/learner_win_rate",
     "learner_win_rate_ema": "selfplay/learner_win_rate_ema",
+    "episode_latency_s": "lag/episode_latency_s",
     "opponent_challenger_cost": "opponent/challenger_cost",
     "opponent_best_cost": "opponent/best_cost",
     "opponent_rollout_len": "opponent/rollout_len",
     "opponent_accepted_total": "opponent/accepted_total",
     "opponent_rejected_total": "opponent/rejected_total",
     "opponent_accept_rate": "opponent/accept_rate",
+    "eval_mean_batch": "eval/mean_batch",
+    "eval_batches_per_s": "eval/batches_per_s",
+    "eval_evals_per_s": "eval/evals_per_s",
+    "measure_finals": "measure/finals",
+    "measure_distinct_finals": "measure/distinct_finals",
+    "measure_repeat_rate": "measure/repeat_rate",
     "terminal_cost_mean": "selfplay/terminal_cost_mean",
     "terminal_cost_best": "selfplay/terminal_cost_best",
     "stop_rate": "selfplay/stop_rate",
@@ -699,10 +784,8 @@ class WandbRun:
 def _validate(config: RunConfig) -> RunConfig:
     if config.trainer.lr_schedule not in ("cosine", "constant"):
         raise ValueError(f"unknown lr_schedule: {config.trainer.lr_schedule}")
-    # Bootstrap only initializes the store and seeds the first publish;
-    # min_startup_rows is satisfied by live selfplay on top of it.
-    if config.trainer.bootstrap_episodes < 1:
-        raise ValueError("bootstrap_episodes must be at least 1 to initialize the store")
+    if config.trainer.min_startup_rows < 1:
+        raise ValueError("min_startup_rows must be at least 1")
     # The opponent reward scalar lives in the position feature block, so
     # blinding the model (position_features = false) removes the value
     # head's ONLY opponent signal unless the pair input carries the full
@@ -713,11 +796,13 @@ def _validate(config: RunConfig) -> RunConfig:
             "position_features = false requires value_input = 'pair': "
             f"'{config.arch.value_input}' leaves the value head opponent-blind"
         )
+    if config.selfplay.admission_stagger_ms < 0:
+        raise ValueError("admission_stagger_ms must be non-negative")
     return config
 
 
 def load_config(path: str | Path) -> RunConfig:
-    data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    data = _load_config_table(Path(path))
     trainer = _dataclass_from_dict(TrainerConfig, data.get("trainer", {}))
     selfplay = _dataclass_from_dict(SelfplayConfig, data.get("selfplay", {}))
     wandb = _dataclass_from_dict(WandbConfig, data.get("wandb", {}))
@@ -752,38 +837,40 @@ def load_config(path: str | Path) -> RunConfig:
     ))
 
 
-def bootstrap_selfplay(config: RunConfig) -> None:
+def _load_config_table(path: Path) -> dict[str, object]:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    extends = data.pop("extends", None)
+    if extends is None:
+        return data
+    if not isinstance(extends, str):
+        raise ValueError("extends must be a string")
+
+    base_path = (path.parent / extends).resolve()
+    base = tomllib.loads(base_path.read_text(encoding="utf-8"))
+    if "extends" in base:
+        raise ValueError("config inheritance is limited to one layer")
+    return _merge_config_tables(base, data)
+
+
+def _merge_config_tables(base: dict[str, object], child: dict[str, object]) -> dict[str, object]:
+    merged = dict(base)
+    for key, value in child.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_config_tables(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def init_replay(config: RunConfig) -> None:
     command = [
         config.paths.graphzero_bin,
-        "selfplay",
+        "replay-init",
         "--replay-dir",
         str(config.paths.replay_dir),
-        "--episodes",
-        str(config.trainer.bootstrap_episodes),
-        "--lanes",
-        str(config.selfplay.lanes),
-        "--workers-per-lane",
-        str(config.selfplay.workers_per_lane),
-        "--reference",
-        "root",
-        "--root-mode",
-        config.selfplay.root_mode,
-        "--evaluator",
-        "stub",
-        "--seed",
-        str(config.selfplay.seed),
-        "--max-steps",
-        str(config.selfplay.max_steps),
-        "--simulations",
-        str(config.selfplay.simulations),
-        "--max-considered",
-        str(config.selfplay.max_considered),
-        "--gumbel-scale",
-        str(config.selfplay.gumbel_scale),
         "--max-candidates",
         str(config.selfplay.max_candidates),
-        "--max-batch",
-        str(config.selfplay.max_batch),
     ]
     subprocess.run(command, check=True)
 
@@ -836,6 +923,8 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             "true" if config.selfplay.length_tiebreak else "false",
             "--eval-processes",
             str(config.selfplay.eval_processes),
+            "--admission-stagger-ms",
+            str(config.selfplay.admission_stagger_ms),
             "--evaluator",
             "torch",
             "--python-dir",

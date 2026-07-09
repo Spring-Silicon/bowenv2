@@ -1,0 +1,9 @@
+[package]
+name = "gz-measurer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gz-engine = { path = "../gz-engine" }
+gz-features = { path = "../gz-features" }
+gz-replay = { path = "../gz-replay" }

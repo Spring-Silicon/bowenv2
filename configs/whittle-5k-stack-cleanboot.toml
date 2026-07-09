@@ -1,9 +1,6 @@
-# The clean-bootstrap leg: the gamma stack rerun on the driver fix
-# that keeps stub/root bootstrap rows out of training. Bootstrap still
-# initializes the store and seeds the version-0 publish, but the
-# trainer now waits for a fully live sampling window on top of the
-# bootstrap rows, so step 1 trains on torch-evaluator, gated-reference
-# episodes instead of off-distribution stub data. max_reuse stays off.
+# The cleanboot leg: the gamma stack rerun on the driver fix that keeps
+# startup schema/checkpoint initialization out of replay data. Step 1
+# trains on torch-evaluator, gated-reference episodes. max_reuse stays off.
 
 [arch]
 dim = 128
@@ -36,7 +33,6 @@ startup_timeout = 600.0
 reconnect_limit = 5
 log_interval = 10
 step_sleep = 0.0
-bootstrap_episodes = 128
 
 [selfplay]
 lanes = 44

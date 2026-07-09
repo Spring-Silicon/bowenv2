@@ -1,5 +1,6 @@
 use gz_cli::selfplay::{
-    EvaluatorMode, ReferenceMode, RootMode, SelfplayConfig, run as run_selfplay,
+    EvaluatorMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig, init_replay,
+    run as run_selfplay,
 };
 use gz_cli::serve::{ReplayServeConfig, SAMPLE_PROTOCOL_VERSION, run_one};
 use gz_features::{
@@ -50,7 +51,6 @@ fn replay_serve_returns_feature_batch_and_targets() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
         seed: 5,
         max_steps: 2,
         simulations: 2,
@@ -74,6 +74,7 @@ fn replay_serve_returns_feature_batch_and_targets() {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     })
     .unwrap();
     let expected_schema_config = ReplayStore::open(dir.path())
@@ -117,11 +118,14 @@ fn replay_serve_returns_feature_batch_and_targets() {
     let win_ema = f32::from_le_bytes(ack[76..80].try_into().unwrap());
     // -1.0 = unseeded; otherwise a rate.
     assert!(win_ema == -1.0 || (0.0..=1.0).contains(&win_ema));
-    let best_cost = f32::from_le_bytes(ack[80..84].try_into().unwrap());
+    let latency_ema = f32::from_le_bytes(ack[80..84].try_into().unwrap());
+    // -1.0 = unseeded (reopened store); otherwise positive seconds.
+    assert!(latency_ema == -1.0 || latency_ema > 0.0);
+    let best_cost = f32::from_le_bytes(ack[84..88].try_into().unwrap());
     assert!(best_cost.is_finite());
-    let root_present = u32::from_le_bytes(ack[84..88].try_into().unwrap());
+    let root_present = u32::from_le_bytes(ack[88..92].try_into().unwrap());
     assert!(root_present <= 1);
-    let schema_config = decode_feature_schema_config(&ack[104..]).unwrap();
+    let schema_config = decode_feature_schema_config(&ack[108..]).unwrap();
     assert_eq!(Some(schema_config), expected_schema_config);
 
     let mut sample = Vec::new();
@@ -152,6 +156,39 @@ fn replay_serve_returns_feature_batch_and_targets() {
 }
 
 #[test]
+fn replay_serve_acks_initialized_store_before_rows_exist() {
+    let dir = TestDir::new();
+    init_replay(ReplayInitConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        max_candidates: 5,
+    })
+    .unwrap();
+    let socket = dir.path().join("empty.sock");
+    let server_config = ReplayServeConfig {
+        replay_dir: dir.path().to_path_buf(),
+        socket: socket.clone(),
+        max_batch: 2,
+    };
+    let server = std::thread::spawn(move || run_one(server_config));
+    let mut stream = connect_retry(&socket);
+
+    let mut hello = Vec::new();
+    hello.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
+    hello.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
+    write_frame(&mut stream, 1, &[&hello]);
+    let (frame_type, ack) = read_frame(&mut stream);
+    assert_eq!(frame_type, 2);
+    assert_eq!(u64::from_le_bytes(ack[40..48].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(ack[48..56].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(ack[56..64].try_into().unwrap()), 0);
+    let schema_config = decode_feature_schema_config(&ack[108..]).unwrap();
+    assert_eq!(schema_config.max_actions, 6);
+
+    drop(stream);
+    server.join().unwrap().unwrap();
+}
+
+#[test]
 fn replay_serve_rejects_featureless_store() {
     let dir = TestDir::new();
     run_selfplay(SelfplayConfig {
@@ -162,7 +199,6 @@ fn replay_serve_rejects_featureless_store() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
         seed: 7,
         max_steps: 1,
         simulations: 1,
@@ -186,6 +222,7 @@ fn replay_serve_rejects_featureless_store() {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     })
     .unwrap();
 
@@ -389,6 +426,7 @@ fn in_process_sample_service_serves_during_production() {
             workers_per_lane: NonZeroUsize::new(2).unwrap(),
             max_batch: NonZeroUsize::new(2).unwrap(),
             flush_after: Duration::from_millis(1),
+            admission_stagger: Duration::ZERO,
         },
     );
     let run = orchestrator
@@ -447,6 +485,7 @@ fn live_backpressure_gates_production_until_the_consumer_drains() {
             workers_per_lane: NonZeroUsize::new(1).unwrap(),
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
+            admission_stagger: Duration::ZERO,
         },
     );
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -501,6 +540,7 @@ fn replay_serve_reacks_a_repeated_hello_on_a_live_connection() {
             workers_per_lane: NonZeroUsize::new(1).unwrap(),
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
+            admission_stagger: Duration::ZERO,
         },
     );
     orchestrator
@@ -551,6 +591,7 @@ fn serve_survives_a_failed_connection_and_accepts_the_next() {
             workers_per_lane: NonZeroUsize::new(1).unwrap(),
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
+            admission_stagger: Duration::ZERO,
         },
     );
     orchestrator

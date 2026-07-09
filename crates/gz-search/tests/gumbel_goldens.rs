@@ -167,7 +167,7 @@ fn g1_reuse_on_multi_step_episode_golden() {
     assert_fingerprint(
         "g1-reuse",
         &episode_fingerprint(&episode),
-        "53e4c9c084f43f71805d8db8a75a07bd6883c7d8adf84ef2408b193d1aa6826c",
+        "cf5067f92bef414dd8724eede318e6bc2458faafa78317d7400305273e13a9a1",
     );
 }
 

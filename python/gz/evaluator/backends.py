@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,57 @@ class EvalResult:
     payload: memoryview
 
 
+class EvalTimingStats:
+    def __init__(self, interval: int = 100) -> None:
+        self.interval = interval
+        self.batches = 0
+        self.rows = 0
+        self.payload_bytes = 0
+        self.stage_s = 0.0
+        self.launch_s = 0.0
+        self.sync_s = 0.0
+        self.encode_s = 0.0
+
+    def record_stage(self, seconds: float) -> None:
+        self.stage_s += seconds
+
+    def record_launch(self, seconds: float) -> None:
+        self.launch_s += seconds
+
+    def record_finish(
+        self,
+        *,
+        rows: int,
+        payload_bytes: int,
+        sync_s: float,
+        encode_s: float,
+    ) -> None:
+        self.batches += 1
+        self.rows += rows
+        self.payload_bytes += payload_bytes
+        self.sync_s += sync_s
+        self.encode_s += encode_s
+        if self.batches % self.interval == 0:
+            denom = float(self.interval)
+            print(
+                "event=eval_timing"
+                f" batches={self.batches}"
+                f" rows={self.rows}"
+                f" stage_ms={self.stage_s * 1000.0 / denom:.3f}"
+                f" launch_ms={self.launch_s * 1000.0 / denom:.3f}"
+                f" sync_ms={self.sync_s * 1000.0 / denom:.3f}"
+                f" encode_ms={self.encode_s * 1000.0 / denom:.3f}"
+                f" payload_kb={self.payload_bytes / 1024.0 / denom:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.stage_s = 0.0
+            self.launch_s = 0.0
+            self.sync_s = 0.0
+            self.encode_s = 0.0
+            self.payload_bytes = 0
+
+
 # The pipelined serving contract: stage(view) copies everything it needs
 # out of the request buffer (the view dies when the next frame is read),
 # launch(staged) enqueues compute AND the device-to-host copy of its
@@ -30,7 +82,7 @@ class EvalResult:
 # replay), finish(pending) waits on the slot's event and encodes. Because
 # outputs leave the CUDA-graph static buffers at launch time, up to
 # HOST_SLOTS launches may be outstanding before a finish -- the server
-# runs the loop at depth 2:
+# runs the loop at the same depth:
 #   stage(N+1) -> launch(N+1) -> ... -> finish(N) -> write reply(N)
 # finish(N) waits only on N's event, never on replay(N+1) queued behind
 # it.
@@ -57,7 +109,12 @@ class StubBackend:
         values, logits = stub(view)
         return EvalResult(
             model_version=STUB_MODEL_VERSION,
-            payload=self._encoder.encode(values, logits, view.row_count),
+            payload=self._encoder.encode(
+                values,
+                logits,
+                view.row_count,
+                view.action_count[: view.row_count],
+            ),
         )
 
     # The stub computes eagerly at stage; the payload is copied because the
@@ -90,6 +147,7 @@ class _ServingSlot:
 class StagedEval:
     tensors: object
     row_count: int
+    action_counts: object
     encoder: OutputEncoder
 
 
@@ -109,10 +167,12 @@ class PendingEval:
     value_raw: object
     logits: object
     row_count: int
+    action_counts: object
     encoder: OutputEncoder
 
 
-HOST_SLOTS = 2
+PIPELINE_DEPTH = 3
+HOST_SLOTS = PIPELINE_DEPTH
 
 
 class TorchBackend:
@@ -147,6 +207,7 @@ class TorchBackend:
         self._logged_rejections: set[str] = set()
         self._loader_started = False
         self._stop_polling = threading.Event()
+        self._timings = EvalTimingStats()
 
     def handshake(self, hello: Hello) -> ModelVersion:
         if hello.feature_schema_hash != self._active.manifest.feature_schema_hash:
@@ -154,12 +215,16 @@ class TorchBackend:
         if hello.batch_capacity > self.max_batch:
             raise ProtocolError(ERROR_CAPACITY, "batch capacity exceeds backend maximum")
         self.stager = BatchStager(self._active.manifest.feature_schema, hello.batch_capacity, self.device)
-        # Ping-pong staging: stage(N+1) runs while N's H2D copy may still
-        # be in flight from the same buffers, so batches alternate between
-        # two independent staging sets.
-        self._stagers = (
-            self.stager,
-            BatchStager(self._active.manifest.feature_schema, hello.batch_capacity, self.device),
+        # Stage buffers cannot be reused while earlier H2D copies and CUDA
+        # graph replays that read them are queued, so match server pipeline
+        # depth with independent staging sets.
+        self._stagers = tuple(
+            self.stager if index == 0 else BatchStager(
+                self._active.manifest.feature_schema,
+                hello.batch_capacity,
+                self.device,
+            )
+            for index in range(PIPELINE_DEPTH)
         )
         self._stage_index = 0
         if self.device.type == "cuda":
@@ -175,7 +240,7 @@ class TorchBackend:
                     ),
                     event=torch.cuda.Event(),
                 )
-                for _ in range(HOST_SLOTS)
+            for _ in range(HOST_SLOTS)
             )
             self._slot_index = 0
         self._warm_runner(self._active.runner, self.stager, WARMUP_RUNS)
@@ -233,22 +298,34 @@ class TorchBackend:
             or self._encoder.max_actions != view.max_actions
         ):
             self._encoder = OutputEncoder(view.batch_capacity, view.max_actions)
+        started = time.perf_counter()
         stager = self._stagers[self._stage_index]
-        self._stage_index = 1 - self._stage_index
+        self._stage_index = (self._stage_index + 1) % len(self._stagers)
+        tensors = stager.copy(view)
+        action_counts = view.action_count[: view.row_count].copy()
+        self._timings.record_stage(time.perf_counter() - started)
         # The encoder rides with the batch: finish() runs after the NEXT
         # batch was staged, which may have re-keyed self._encoder.
-        return StagedEval(tensors=stager.copy(view), row_count=view.row_count, encoder=self._encoder)
+        return StagedEval(
+            tensors=tensors,
+            row_count=view.row_count,
+            action_counts=action_counts,
+            encoder=self._encoder,
+        )
 
     def launch(self, staged: StagedEval) -> PendingEval:
         active = self._active
+        started = time.perf_counter()
         value_raw, logits = self._run_runner(active.runner, staged.tensors)
         if not self._host_slots:
+            self._timings.record_launch(time.perf_counter() - started)
             return PendingEval(
                 model_version=active.model_version,
                 slot=None,
                 value_raw=self._serve_value(active, value_raw),
                 logits=logits,
                 row_count=staged.row_count,
+                action_counts=staged.action_counts,
                 encoder=staged.encoder,
             )
         torch = _torch()
@@ -258,36 +335,65 @@ class TorchBackend:
         # CUDA-graph outputs BEFORE any later replay overwrites them;
         # the event marks when the pinned copies are complete.
         with torch.inference_mode():
-            slot.values.copy_(self._serve_value(active, value_raw).float(), non_blocking=True)
-            slot.logits.copy_(logits.float(), non_blocking=True)
+            rows = staged.row_count
+            slot.values[:rows].copy_(self._serve_value(active, value_raw)[:rows].float(), non_blocking=True)
+            slot.logits[:rows].copy_(logits[:rows].float(), non_blocking=True)
         slot.event.record()
+        self._timings.record_launch(time.perf_counter() - started)
         return PendingEval(
             model_version=active.model_version,
             slot=slot,
             value_raw=None,
             logits=None,
             row_count=staged.row_count,
+            action_counts=staged.action_counts,
             encoder=staged.encoder,
         )
 
     def finish(self, pending: PendingEval) -> EvalResult:
         if pending.slot is not None:
+            sync_started = time.perf_counter()
             pending.slot.event.synchronize()
+            sync_s = time.perf_counter() - sync_started
+            encode_started = time.perf_counter()
+            payload = pending.encoder.encode(
+                pending.slot.values.numpy(),
+                pending.slot.logits.numpy(),
+                pending.row_count,
+                pending.action_counts,
+            )
+            encode_s = time.perf_counter() - encode_started
+            self._timings.record_finish(
+                rows=pending.row_count,
+                payload_bytes=len(payload),
+                sync_s=sync_s,
+                encode_s=encode_s,
+            )
             return EvalResult(
                 model_version=pending.model_version,
-                payload=pending.encoder.encode(
-                    pending.slot.values.numpy(),
-                    pending.slot.logits.numpy(),
-                    pending.row_count,
-                ),
+                payload=payload,
             )
+        sync_started = time.perf_counter()
+        values = pending.value_raw.detach().float().cpu().numpy()
+        logits = pending.logits.detach().float().cpu().numpy()
+        sync_s = time.perf_counter() - sync_started
+        encode_started = time.perf_counter()
+        payload = pending.encoder.encode(
+            values,
+            logits,
+            pending.row_count,
+            pending.action_counts,
+        )
+        encode_s = time.perf_counter() - encode_started
+        self._timings.record_finish(
+            rows=pending.row_count,
+            payload_bytes=len(payload),
+            sync_s=sync_s,
+            encode_s=encode_s,
+        )
         return EvalResult(
             model_version=pending.model_version,
-            payload=pending.encoder.encode(
-                pending.value_raw.detach().float().cpu().numpy(),
-                pending.logits.detach().float().cpu().numpy(),
-                pending.row_count,
-            ),
+            payload=payload,
         )
 
     def _serve_value(self, slot: _ServingSlot, value_raw: object) -> object:

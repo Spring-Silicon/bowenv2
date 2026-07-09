@@ -46,7 +46,7 @@ class _ConnectionState:
     action_set_hash: ActionSetHash
 
 
-PIPELINE_DEPTH = 2
+PIPELINE_DEPTH = 3
 
 
 def serve(socket_path: str | Path, backend: StubBackend, *, ready_event: Event | None = None) -> None:

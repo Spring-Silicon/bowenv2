@@ -1,6 +1,6 @@
 # The 20k long run of the post-audit stack: staging-race fix,
 # whittlezero-faithful visit selection on fresh trees (tree_reuse off),
-# clean bootstrap, gamma 0.2, logit pair value, match encoding,
+# schema-only startup, gamma 0.2, logit pair value, match encoding,
 # whittle-v2 features, overlap noise, no EMA. audit2 (5k) ended with
 # the bar still accepting at -85 and best episode 88; this run asks
 # whether the ratchet keeps walking when given room.
@@ -36,7 +36,6 @@ startup_timeout = 3600.0
 reconnect_limit = 5
 log_interval = 10
 step_sleep = 0.0
-bootstrap_episodes = 128
 
 [selfplay]
 lanes = 44

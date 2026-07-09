@@ -192,8 +192,12 @@ impl FeatureCollator {
                 "output action width mismatch",
             ));
         }
-        let capacity = output_capacity(bytes, action_counts.len(), max_actions)?;
-        if capacity != self.batch_capacity.get() {
+        if !output_length_valid(
+            bytes,
+            action_counts,
+            max_actions,
+            Some(self.batch_capacity.get()),
+        )? {
             return Err(FeatureError::InvalidEncoding("bad output length"));
         }
         decode_outputs(bytes, action_counts)
@@ -216,15 +220,39 @@ pub fn decode_outputs(bytes: &[u8], action_counts: &[u32]) -> FeatureResult<Vec<
         return Err(FeatureError::InvalidEncoding("output row count mismatch"));
     }
     let max_actions = read_u32_at(bytes, 12)? as usize;
-    let capacity = output_capacity(bytes, row_count, max_actions)?;
-    let expected_len = OUTPUT_HEADER_LEN + capacity * 4 + capacity * max_actions * 4;
-    if bytes.len() != expected_len {
+    if !output_length_valid(bytes, action_counts, max_actions, None)? {
         return Err(FeatureError::InvalidEncoding("bad output length"));
     }
 
     let values = OUTPUT_HEADER_LEN;
-    let policy = values + capacity * 4;
     let mut rows = Vec::with_capacity(row_count);
+    let compact_len = compact_output_len(action_counts)?;
+    if bytes.len() == compact_len {
+        let mut policy_offset = values + row_count * 4;
+        for (row_index, &action_count) in action_counts.iter().enumerate() {
+            let action_count = action_count as usize;
+            if action_count > max_actions {
+                return Err(FeatureError::ActionOverflow {
+                    max: max_actions as u32,
+                    actual: action_count,
+                });
+            }
+            let value = read_f32_at(bytes, values + row_index * 4)?;
+            let mut policy_logits = Vec::with_capacity(action_count);
+            for _ in 0..action_count {
+                policy_logits.push(read_f32_at(bytes, policy_offset)?);
+                policy_offset += 4;
+            }
+            rows.push(RowOutput {
+                policy_logits,
+                value,
+            });
+        }
+        return Ok(rows);
+    }
+
+    let capacity = output_capacity(bytes, row_count, max_actions)?;
+    let policy = values + capacity * 4;
     for (row_index, &action_count) in action_counts.iter().enumerate() {
         let action_count = action_count as usize;
         if action_count > max_actions {
@@ -706,6 +734,41 @@ fn read_position_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult
 
 fn output_max_actions(bytes: &[u8]) -> FeatureResult<usize> {
     read_u32_at(bytes, 12).map(|value| value as usize)
+}
+
+fn output_length_valid(
+    bytes: &[u8],
+    action_counts: &[u32],
+    max_actions: usize,
+    expected_dense_capacity: Option<usize>,
+) -> FeatureResult<bool> {
+    let compact_len = compact_output_len(action_counts)?;
+    if bytes.len() == compact_len {
+        return Ok(true);
+    }
+    let capacity = output_capacity(bytes, action_counts.len(), max_actions)?;
+    Ok(match expected_dense_capacity {
+        Some(expected) => capacity == expected,
+        None => true,
+    })
+}
+
+fn compact_output_len(action_counts: &[u32]) -> FeatureResult<usize> {
+    let logits = action_counts.iter().try_fold(0usize, |acc, &count| {
+        acc.checked_add(count as usize)
+            .ok_or(FeatureError::InvalidEncoding("output length overflow"))
+    })?;
+    let values = action_counts
+        .len()
+        .checked_mul(4)
+        .ok_or(FeatureError::InvalidEncoding("output length overflow"))?;
+    let policies = logits
+        .checked_mul(4)
+        .ok_or(FeatureError::InvalidEncoding("output length overflow"))?;
+    OUTPUT_HEADER_LEN
+        .checked_add(values)
+        .and_then(|len| len.checked_add(policies))
+        .ok_or(FeatureError::InvalidEncoding("output length overflow"))
 }
 
 fn output_capacity(bytes: &[u8], row_count: usize, max_actions: usize) -> FeatureResult<usize> {

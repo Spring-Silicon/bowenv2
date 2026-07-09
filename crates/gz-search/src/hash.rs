@@ -69,7 +69,15 @@ pub fn gumbel_search_config_hash(
     // v7: tree reuse carries cached evals only -- decision ledgers reset
     //     and every move runs the full simulation budget (semantics
     //     change without a config-shape change).
-    update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v7");
+    // v8: tree_reuse=true carries shifted subtree visit/Q ledgers like
+    //     policy-based-self-competition; fresh simulations are counted
+    //     relative to the carried visit baseline. tree_reuse=false keeps
+    //     the v7 namespace because fresh-tree semantics did not change.
+    if tree_reuse {
+        update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v8");
+    } else {
+        update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v7");
+    }
     update_u64(&mut hasher, max_steps as u64);
     update_u64(&mut hasher, simulations as u64);
     update_u64(&mut hasher, max_considered_actions as u64);

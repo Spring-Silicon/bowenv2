@@ -408,6 +408,24 @@ fn outcome_emas_track_recent_episodes() {
 }
 
 #[test]
+fn episode_latency_ema_seeds_and_updates() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert!(store.episode_latency_ema().is_none());
+
+    // Non-positive and non-finite observations are ignored.
+    store.observe_episode_latency(0.0);
+    store.observe_episode_latency(f64::NAN);
+    assert!(store.episode_latency_ema().is_none());
+
+    store.observe_episode_latency(10.0);
+    assert!((store.episode_latency_ema().unwrap() - 10.0).abs() < 1e-9);
+    store.observe_episode_latency(20.0);
+    // 0.99 * 10 + 0.01 * 20
+    assert!((store.episode_latency_ema().unwrap() - 10.1).abs() < 1e-9);
+}
+
+#[test]
 fn win_rate_ema_distinguishes_all_loss_from_unseeded() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();

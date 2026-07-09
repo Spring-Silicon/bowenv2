@@ -3,8 +3,11 @@ use gz_engine::{
     MeasureOptions, ModelVersion, PortableGraphId, ReplayGraphContext, SearchConfigHash,
 };
 use gz_features::{FeatureExtractor, FeatureRow, OpponentStateFeatures, PositionFeatures};
+use gz_measurer::{ReferenceRegistry, ReferenceSnapshot};
+pub use gz_measurer::{ReferenceStep, RolloutOutcome};
 use gz_replay::ReplayReferenceKind;
 use gz_search::{BeamSearch, GreedySearch, RandomSearch, SearchStep};
+use std::sync::Arc;
 
 pub trait ReferenceProvider<E: GraphEngine> {
     fn reference(&mut self, engine: &mut E, root: E::Graph) -> EngineResult<Option<Reference>>;
@@ -44,6 +47,18 @@ pub trait ReferenceProvider<E: GraphEngine> {
         false
     }
 
+    /// Atomically claims a rollout admission when one is due. Most
+    /// providers are lane-local and can use the legacy rollout_due +
+    /// begin_rollout pair. Shared providers override this to collapse
+    /// many lanes racing on the same checkpoint to one challenger.
+    fn claim_rollout(&mut self, latest: Option<ModelVersion>) -> bool {
+        if !self.rollout_due(latest) {
+            return false;
+        }
+        <Self as ReferenceProvider<E>>::begin_rollout(self, latest);
+        true
+    }
+
     /// The lane admitted the requested rollout episode. `version` is
     /// None for the cold-start seed rollout (admitted before any eval
     /// reply named a version); the finished episode's own replies name
@@ -78,32 +93,15 @@ pub trait ReferenceProvider<E: GraphEngine> {
     }
 }
 
-/// The measured result of an opponent rollout episode.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RolloutOutcome {
-    pub final_reward: f32,
-    pub final_graph: ReplayGraphContext,
-    pub steps: Vec<ReferenceStep>,
-    pub search_config_hash: SearchConfigHash,
-    /// The newest model version the episode's eval replies named; the
-    /// authoritative version for seed rollouts admitted cold.
-    pub model_version: Option<ModelVersion>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reference {
+    pub ref_id: Option<u64>,
     pub kind: ReplayReferenceKind,
     pub final_reward: f32,
     pub final_graph: Option<ReplayGraphContext>,
-    pub steps: Vec<ReferenceStep>,
+    pub steps: Arc<[ReferenceStep]>,
     pub search_config_hash: Option<SearchConfigHash>,
     pub model_version: Option<ModelVersion>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReferenceStep {
-    pub context: ReplayGraphContext,
-    pub features: Option<OpponentStateFeatures>,
 }
 
 pub struct RootBaselineProvider {
@@ -130,13 +128,15 @@ where
         let final_graph = context(engine, measure.graph_hash);
 
         Ok(Some(Reference {
+            ref_id: None,
             kind: ReplayReferenceKind::RootBaseline,
             final_reward,
             final_graph: Some(final_graph),
             steps: vec![ReferenceStep {
                 context: final_graph,
                 features: None,
-            }],
+            }]
+            .into(),
             search_config_hash: None,
             model_version: None,
         }))
@@ -178,10 +178,11 @@ where
         release?;
 
         Ok(Some(Reference {
+            ref_id: None,
             kind: ReplayReferenceKind::RootBaseline,
             final_reward,
             final_graph: Some(final_graph),
-            steps: vec![step],
+            steps: vec![step].into(),
             search_config_hash: None,
             model_version: None,
         }))
@@ -416,10 +417,11 @@ fn project_search_episode<G, C>(
     }));
 
     Some(Reference {
+        ref_id: None,
         kind,
         final_reward,
         final_graph: Some(final_graph),
-        steps: reference_steps,
+        steps: reference_steps.into(),
         search_config_hash,
         model_version: None,
     })
@@ -504,10 +506,11 @@ where
     release?;
 
     Ok(Some(Reference {
+        ref_id: None,
         kind: projection.kind,
         final_reward,
         final_graph: Some(projection.final_context),
-        steps,
+        steps: steps.into(),
         search_config_hash: projection.search_config_hash,
         model_version: None,
     }))
@@ -610,10 +613,11 @@ where
         };
 
         Ok(Some(Reference {
+            ref_id: None,
             kind: ReplayReferenceKind::SelfAverage,
             final_reward: ema as f32,
             final_graph: None,
-            steps: Vec::new(),
+            steps: Vec::new().into(),
             search_config_hash: None,
             model_version: None,
         }))
@@ -637,14 +641,7 @@ where
 pub struct PolicyReferenceProvider {
     gate: PolicyGate,
     current: Option<PolicyReference>,
-    /// The newest measured rollout regardless of gate verdict, for the
-    /// gamma mix: whittlezero plays 1-gamma of its episodes against the
-    /// gated best and gamma against the current checkpoint, so the label
-    /// channel stays winnable when the bar outruns the noisy player.
-    latest: Option<PolicyReference>,
-    gamma: f32,
-    mix_seed: u64,
-    draws: u64,
+    registry: Option<Arc<ReferenceRegistry>>,
     last_challenged: Option<ModelVersion>,
     pending: Option<PendingChallenge>,
 }
@@ -677,7 +674,7 @@ struct PolicyReference {
     reward: f32,
     version: ModelVersion,
     final_graph: ReplayGraphContext,
-    steps: Vec<ReferenceStep>,
+    steps: Arc<[ReferenceStep]>,
     search_config_hash: SearchConfigHash,
 }
 
@@ -692,15 +689,10 @@ impl PolicyReferenceProvider {
         Self::with_gate(PolicyGate::Best)
     }
 
-    /// The gated provider with whittlezero's gamma mix: each episode's
-    /// reference is the latest measured rollout with probability `gamma`
-    /// (seeded, per-provider draw sequence) and the gated incumbent
-    /// otherwise.
     #[must_use]
-    pub const fn gated_with_gamma(gamma: f32, mix_seed: u64) -> Self {
+    pub fn gated_with_registry(registry: Arc<ReferenceRegistry>) -> Self {
         let mut provider = Self::with_gate(PolicyGate::Best);
-        provider.gamma = gamma;
-        provider.mix_seed = mix_seed;
+        provider.registry = Some(registry);
         provider
     }
 
@@ -708,22 +700,10 @@ impl PolicyReferenceProvider {
         Self {
             gate,
             current: None,
-            latest: None,
-            gamma: 0.0,
-            mix_seed: 0,
-            draws: 0,
+            registry: None,
             last_challenged: None,
             pending: None,
         }
-    }
-
-    fn mix_unit(&mut self) -> f32 {
-        self.draws += 1;
-        let mut value = self.mix_seed ^ self.draws.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^= value >> 31;
-        (value >> 40) as f32 / (1u64 << 24) as f32
     }
 }
 
@@ -738,30 +718,31 @@ where
     E: GraphEngine,
 {
     fn reference(&mut self, _engine: &mut E, _root: E::Graph) -> EngineResult<Option<Reference>> {
-        let use_latest = self.gamma > 0.0 && self.latest.is_some() && self.mix_unit() < self.gamma;
-        let chosen = if use_latest {
-            self.latest.as_ref()
-        } else {
-            self.current.as_ref()
-        };
-        let Some(current) = chosen else {
+        if let Some(registry) = &self.registry {
+            return Ok(registry.current().as_deref().map(reference_from_snapshot));
+        }
+        let Some(current) = self.current.as_ref() else {
             return Ok(None);
         };
 
         Ok(Some(Reference {
+            ref_id: None,
             kind: match self.gate {
                 PolicyGate::Latest => ReplayReferenceKind::Gumbel,
                 PolicyGate::Best => ReplayReferenceKind::GatedPolicy,
             },
             final_reward: current.reward,
             final_graph: Some(current.final_graph),
-            steps: current.steps.clone(),
+            steps: Arc::clone(&current.steps),
             search_config_hash: Some(current.search_config_hash),
             model_version: Some(current.version),
         }))
     }
 
     fn rollout_due(&self, latest: Option<ModelVersion>) -> bool {
+        if let Some(registry) = &self.registry {
+            return registry.rollout_due(latest);
+        }
         if self.pending.is_some() {
             return false;
         }
@@ -778,7 +759,22 @@ where
         }
     }
 
+    fn claim_rollout(&mut self, latest: Option<ModelVersion>) -> bool {
+        if let Some(registry) = &self.registry {
+            return registry.claim_challenge(latest);
+        }
+        if !<Self as ReferenceProvider<E>>::rollout_due(self, latest) {
+            return false;
+        }
+        <Self as ReferenceProvider<E>>::begin_rollout(self, latest);
+        true
+    }
+
     fn begin_rollout(&mut self, version: Option<ModelVersion>) {
+        if let Some(registry) = &self.registry {
+            let _ = registry.claim_challenge(version);
+            return;
+        }
         self.pending = Some(match version {
             Some(version) => PendingChallenge::Versioned(version),
             None => PendingChallenge::Seed,
@@ -786,6 +782,15 @@ where
     }
 
     fn finish_rollout(&mut self, outcome: Option<RolloutOutcome>) {
+        if let Some(registry) = &self.registry {
+            if let Some(event) = registry.finish_challenge(outcome) {
+                eprintln!(
+                    "event=policy_gate accepted={} challenger={} best={} steps={} version={}",
+                    event.accepted, event.challenger, event.best, event.steps, event.version,
+                );
+            }
+            return;
+        }
         let Some(pending) = self.pending.take() else {
             return;
         };
@@ -826,17 +831,32 @@ where
             reward: outcome.final_reward,
             version,
             final_graph: outcome.final_graph,
-            steps: outcome.steps,
+            steps: outcome.steps.into(),
             search_config_hash: outcome.search_config_hash,
         };
-        self.latest = Some(challenger.clone());
         if accepted {
             self.current = Some(challenger);
         }
     }
 
     fn admission_ready(&self) -> bool {
-        self.current.is_some() || self.latest.is_some()
+        self.registry
+            .as_ref()
+            .map_or(self.current.is_some(), |registry| {
+                registry.admission_ready()
+            })
+    }
+}
+
+fn reference_from_snapshot(snapshot: &ReferenceSnapshot) -> Reference {
+    Reference {
+        ref_id: Some(snapshot.ref_id),
+        kind: snapshot.kind,
+        final_reward: snapshot.final_reward,
+        final_graph: snapshot.final_graph,
+        steps: Arc::clone(&snapshot.steps),
+        search_config_hash: Some(snapshot.search_config_hash),
+        model_version: Some(snapshot.version),
     }
 }
 

@@ -38,6 +38,9 @@ pub struct ReplayStore {
     /// EMA of value_target > 0 over labeled appends only: the
     /// episode-weighted learner win rate.
     win_ema_bits: AtomicU64,
+    /// EMA of admission-to-completion wall seconds, fed by lanes at
+    /// episode completion: the async lag's queueing term.
+    latency_ema_bits: AtomicU64,
     best_cost_bits: AtomicU64,
 }
 
@@ -80,6 +83,7 @@ impl ReplayStore {
             retain_rows,
             cost_ema_bits: AtomicU64::new(0),
             win_ema_bits: AtomicU64::new(0),
+            latency_ema_bits: AtomicU64::new(0),
             len_ema_bits: AtomicU64::new(0),
             stop_ema_bits: AtomicU64::new(0),
             best_cost_bits: AtomicU64::new(0),
@@ -369,6 +373,22 @@ impl ReplayStore {
             f64::from_bits(self.len_ema_bits.load(Ordering::Acquire)),
             f64::from_bits(self.stop_ema_bits.load(Ordering::Acquire)),
         ))
+    }
+
+    /// Observe one episode's admission-to-completion wall time. Called
+    /// by lanes at completion (dropped episodes included: their latency
+    /// is real even when their rows are not stored).
+    pub fn observe_episode_latency(&self, seconds: f64) {
+        if seconds > 0.0 && seconds.is_finite() {
+            self.update_ema(&self.latency_ema_bits, seconds);
+        }
+    }
+
+    /// EMA of episode wall-clock latency in seconds. None until seeded.
+    #[must_use]
+    pub fn episode_latency_ema(&self) -> Option<f64> {
+        let bits = self.latency_ema_bits.load(Ordering::Acquire);
+        (bits != 0).then(|| f64::from_bits(bits))
     }
 
     /// Episode-weighted EMA of "learner beat its reference" over labeled

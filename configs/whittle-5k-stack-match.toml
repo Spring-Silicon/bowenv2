@@ -2,10 +2,8 @@
 # whittlezero's role-preserving encoding (slot-embedded attention over
 # subjects, [root, attended] instead of an order-blind mean), stacked
 # on whittle-v2 features and the ovl-fix stack. mask_stop is OFF: the
-# nostop leg exposed a data cliff (128-move episodes always -> first
-# live rows land after the 5k-step trainer has already finished on
-# bootstrap replay), so stop stays enabled until the trainer can gate
-# on fresh data.
+# nostop leg exposed a data cliff (128-move episodes delayed live rows),
+# so stop stays enabled until the trainer can gate on fresh data.
 
 [arch]
 dim = 128
@@ -38,7 +36,6 @@ startup_timeout = 600.0
 reconnect_limit = 5
 log_interval = 10
 step_sleep = 0.0
-bootstrap_episodes = 128
 
 [selfplay]
 lanes = 44

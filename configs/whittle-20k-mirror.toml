@@ -40,7 +40,6 @@ startup_timeout = 3600.0
 reconnect_limit = 5
 log_interval = 10
 step_sleep = 0.0
-bootstrap_episodes = 128
 value_mirror = true
 
 [selfplay]

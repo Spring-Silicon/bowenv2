@@ -39,20 +39,16 @@ pub(super) fn considered_actions(base_scores: &[f32], max_considered: usize) -> 
 pub(super) fn best_eligible<G, C>(
     node: &Node<G, C>,
     considered: &[usize],
+    baseline_visits: &[u32],
     target_visits: u32,
     scores: &[f32],
-    tree_reuse: bool,
 ) -> Option<usize> {
     considered
         .iter()
         .copied()
         .filter(|&action| {
             node.logits[action].is_finite()
-                && if tree_reuse {
-                    node.visits[action] <= target_visits
-                } else {
-                    node.visits[action] == target_visits
-                }
+                && node.visits[action].saturating_sub(baseline_visits[action]) == target_visits
         })
         .max_by(|&left, &right| {
             scores[left]
@@ -78,6 +74,18 @@ pub(super) fn selectable_root_actions<G, C>(node: &Node<G, C>, considered: &[usi
     }
 
     actions
+}
+
+pub(super) fn best_score_action(scores: &[f32], considered: &[usize]) -> usize {
+    considered
+        .iter()
+        .copied()
+        .max_by(|&left, &right| {
+            scores[left]
+                .total_cmp(&scores[right])
+                .then_with(|| right.cmp(&left))
+        })
+        .expect("considered actions is non-empty")
 }
 
 pub(super) fn best_count_action(visits: &[u32], considered: &[usize], scores: &[f32]) -> usize {
@@ -253,6 +261,7 @@ pub(super) fn sample_root_gumbels(count: usize, scale: f32, rng: &mut GumbelRng)
 pub(super) fn sample_count_action(
     rng: &mut GumbelRng,
     visits: &[u32],
+    baseline_visits: &[u32],
     allowed: &[usize],
     temperature: f32,
     fallback: usize,
@@ -266,7 +275,7 @@ pub(super) fn sample_count_action(
     let mut weights = vec![0.0; visits.len()];
 
     for &action in allowed {
-        let count = visits[action];
+        let count = visits[action].saturating_sub(baseline_visits[action]);
         let weight = if count == 0 {
             0.0
         } else {

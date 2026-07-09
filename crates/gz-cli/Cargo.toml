@@ -13,6 +13,7 @@ gz-engine-whittle = { path = "../gz-engine-whittle" }
 gz-eval = { path = "../gz-eval" }
 gz-eval-service = { path = "../gz-eval-service" }
 gz-features = { path = "../gz-features" }
+gz-measurer = { path = "../gz-measurer" }
 gz-orchestrator = { path = "../gz-orchestrator" }
 gz-replay = { path = "../gz-replay" }
 gz-search = { path = "../gz-search" }

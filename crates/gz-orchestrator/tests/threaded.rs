@@ -39,6 +39,7 @@ fn config(workers_per_lane: usize, max_batch: usize) -> ThreadedOrchestratorConf
         workers_per_lane: NonZeroUsize::new(workers_per_lane).unwrap(),
         max_batch: NonZeroUsize::new(max_batch).unwrap(),
         flush_after: Duration::from_millis(50),
+        admission_stagger: Duration::ZERO,
     }
 }
 
@@ -160,6 +161,7 @@ fn slow_evaluator_batches_active_workers() {
             workers_per_lane: NonZeroUsize::new(8).unwrap(),
             max_batch: NonZeroUsize::new(8).unwrap(),
             flush_after: Duration::from_millis(250),
+            admission_stagger: Duration::ZERO,
         },
     );
     let run = orchestrator
@@ -171,6 +173,32 @@ fn slow_evaluator_batches_active_workers() {
     assert_eq!(run.lanes[0].episodes.len(), 16);
     assert_eq!(run.batch_sizes[0], 8);
     assert!(average >= 4.0);
+}
+
+#[test]
+fn admission_stagger_limits_initial_lane_fill() {
+    let engines = engines(1);
+    let search = search(&engines[0], false);
+    let orchestrator = ThreadedGumbelOrchestrator::new(
+        engines,
+        SlowEvaluator {
+            inner: evaluator(),
+            delay: Duration::from_millis(20),
+        },
+        search,
+        ThreadedOrchestratorConfig {
+            workers_per_lane: NonZeroUsize::new(8).unwrap(),
+            max_batch: NonZeroUsize::new(8).unwrap(),
+            flush_after: Duration::from_millis(250),
+            admission_stagger: Duration::from_millis(10),
+        },
+    );
+    let run = orchestrator
+        .run(vec![repeated_roots(8)], GumbelEpisodeContext::default())
+        .unwrap();
+
+    assert_eq!(run.lanes[0].episodes.len(), 8);
+    assert_eq!(run.batch_sizes[0], 1);
 }
 
 #[test]

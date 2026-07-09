@@ -8,6 +8,7 @@ gz-engine = { path = "../gz-engine" }
 gz-eval = { path = "../gz-eval" }
 gz-eval-service = { path = "../gz-eval-service" }
 gz-features = { path = "../gz-features" }
+gz-measurer = { path = "../gz-measurer" }
 gz-replay = { path = "../gz-replay" }
 gz-search = { path = "../gz-search" }
 

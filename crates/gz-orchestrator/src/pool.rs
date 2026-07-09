@@ -32,6 +32,12 @@ pub(crate) struct Admission<'a> {
     pub next_episode_id: &'a mut u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionResult {
+    pub roots_exhausted: bool,
+    pub admitted: usize,
+}
+
 struct Slot<G, C> {
     worker_id: WorkerId,
     state: SlotState<G, C>,
@@ -109,7 +115,7 @@ where
         engine: &mut E,
         roots: &mut R,
         admission: &mut Admission<'_>,
-        mut episode_context: F,
+        episode_context: F,
     ) -> EngineResult<bool>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
@@ -121,13 +127,50 @@ where
             gz_search::GumbelEpisodeContext,
         ) -> EngineResult<gz_search::GumbelEpisodeContext>,
     {
+        Ok(self
+            .admit_limited(engine, roots, admission, usize::MAX, episode_context)?
+            .roots_exhausted)
+    }
+
+    pub(crate) fn admit_limited<E, R, F>(
+        &mut self,
+        engine: &mut E,
+        roots: &mut R,
+        admission: &mut Admission<'_>,
+        limit: usize,
+        mut episode_context: F,
+    ) -> EngineResult<AdmissionResult>
+    where
+        E: GraphEngine<Graph = G, Candidate = C>,
+        R: RootSource<E>,
+        F: FnMut(
+            &mut E,
+            EpisodeId,
+            G,
+            gz_search::GumbelEpisodeContext,
+        ) -> EngineResult<gz_search::GumbelEpisodeContext>,
+    {
+        if limit == 0 {
+            return Ok(AdmissionResult {
+                roots_exhausted: false,
+                admitted: 0,
+            });
+        }
+
+        let mut admitted = 0;
         for slot in &mut self.slots {
+            if admitted >= limit {
+                break;
+            }
             if !matches!(slot.state, SlotState::Idle) {
                 continue;
             }
 
             let Some(root) = roots.next_root(engine)? else {
-                return Ok(true);
+                return Ok(AdmissionResult {
+                    roots_exhausted: true,
+                    admitted,
+                });
             };
 
             let episode_id = EpisodeId::new(*admission.next_episode_id);
@@ -145,9 +188,13 @@ where
                 task: GumbelEpisodeTask::new(admission.search, admission.identity, root, context),
                 episode_id,
             });
+            admitted += 1;
         }
 
-        Ok(false)
+        Ok(AdmissionResult {
+            roots_exhausted: false,
+            admitted,
+        })
     }
 
     /// Admits one episode outside the root source -- the opponent rollout

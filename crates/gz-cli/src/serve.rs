@@ -9,7 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const SAMPLE_PROTOCOL_VERSION: u32 = 5;
+pub const SAMPLE_PROTOCOL_VERSION: u32 = 6;
 
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const FRAME_HELLO: u8 = 1;
@@ -215,12 +215,13 @@ impl ReplaySampleServer {
         let (cost_ema, len_ema, stop_ema) = self.store.outcome_emas().unwrap_or((0.0, 0.0, 0.0));
         // Unseeded surfaces as -1.0: 0.0 is a legitimate all-loss rate.
         let win_ema = self.store.win_rate_ema().unwrap_or(-1.0);
+        let latency_ema = self.store.episode_latency_ema().unwrap_or(-1.0);
         let best_cost = self.store.best_cost().unwrap_or(0.0);
         let root_info = self
             .store
             .root_info()
             .map_err(|_| (ERROR_ENCODING, "corrupt root info"))?;
-        let mut payload = Vec::with_capacity(104 + schema_config.len());
+        let mut payload = Vec::with_capacity(108 + schema_config.len());
         payload.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
         payload.extend_from_slice(self.collator.schema().hash().as_bytes());
         payload.extend_from_slice(&(self.max_batch.get() as u32).to_le_bytes());
@@ -231,6 +232,7 @@ impl ReplaySampleServer {
         payload.extend_from_slice(&(len_ema as f32).to_le_bytes());
         payload.extend_from_slice(&(stop_ema as f32).to_le_bytes());
         payload.extend_from_slice(&(win_ema as f32).to_le_bytes());
+        payload.extend_from_slice(&(latency_ema as f32).to_le_bytes());
         payload.extend_from_slice(&(best_cost as f32).to_le_bytes());
         payload.extend_from_slice(&u32::from(root_info.is_some()).to_le_bytes());
         let root = root_info.unwrap_or(gz_replay::ReplayRootInfo {

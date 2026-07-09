@@ -1,4 +1,7 @@
-use gz_cli::selfplay::{EvaluatorMode, ReferenceMode, RootMode, SelfplayConfig, run};
+use gz_cli::selfplay::{
+    EvaluatorMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig, init_replay, run,
+};
+use gz_features::FeatureSchema;
 use gz_replay::ReplayStore;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +40,67 @@ fn selfplay_config_defaults_tree_reuse_on() {
 }
 
 #[test]
+fn replay_init_writes_feature_schema_without_rows() {
+    let dir = TestDir::new();
+    let summary = init_replay(ReplayInitConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        max_candidates: 7,
+    })
+    .unwrap();
+
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let config = store.feature_schema().unwrap().unwrap();
+
+    assert_eq!(config.max_actions, 8);
+    assert_eq!(summary.max_actions, 8);
+    assert_eq!(
+        summary.feature_schema_hash,
+        FeatureSchema::new(config).unwrap().hash()
+    );
+    assert_eq!(store.counters().produced_rows, 0);
+    assert_eq!(store.episode_counters(), (0, 0));
+}
+
+#[test]
+fn replay_init_cli_writes_feature_schema_without_rows() {
+    let dir = TestDir::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_graphzero"))
+        .args([
+            "replay-init",
+            "--replay-dir",
+            dir.path().to_str().unwrap(),
+            "--max-candidates",
+            "3",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("max_actions=4"),
+        "{output:?}"
+    );
+
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let config = store.feature_schema().unwrap().unwrap();
+    assert_eq!(config.max_actions, 4);
+    assert_eq!(store.counters().produced_rows, 0);
+    assert_eq!(store.episode_counters(), (0, 0));
+}
+
+#[test]
+fn replay_init_rejects_action_width_overflow() {
+    let error = ReplayInitConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        max_candidates: usize::MAX,
+    }
+    .validate()
+    .unwrap_err();
+
+    assert!(error.contains("--max-candidates"), "{error}");
+}
+
+#[test]
 fn selfplay_cli_accepts_tree_reuse_flag() {
     let dir = TestDir::new();
     let output = Command::new(env!("CARGO_BIN_EXE_graphzero"))
@@ -56,6 +120,8 @@ fn selfplay_cli_accepts_tree_reuse_flag() {
             "1",
             "--tree-reuse",
             "false",
+            "--admission-stagger-ms",
+            "1",
         ])
         .output()
         .unwrap();
@@ -74,7 +140,6 @@ fn selfplay_run_writes_replay_rows() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
         seed: 3,
         max_steps: 2,
         simulations: 2,
@@ -98,6 +163,7 @@ fn selfplay_run_writes_replay_rows() {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     })
     .unwrap();
     let store = ReplayStore::open(dir.path()).unwrap();
@@ -120,7 +186,6 @@ fn selfplay_run_supports_stub_evaluator() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
         seed: 4,
         max_steps: 2,
         simulations: 2,
@@ -144,6 +209,7 @@ fn selfplay_run_supports_stub_evaluator() {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     })
     .unwrap();
 
@@ -163,7 +229,6 @@ fn selfplay_run_supports_self_average_reference() {
         reference: ReferenceMode::SelfAverage,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.9,
-        reference_gamma: 0.0,
         seed: 11,
         max_steps: 2,
         simulations: 2,
@@ -187,6 +252,7 @@ fn selfplay_run_supports_self_average_reference() {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     })
     .unwrap();
 
@@ -208,8 +274,7 @@ fn selfplay_run_supports_policy_reference() {
         workers_per_lane: 1,
         reference: ReferenceMode::Policy,
         root_mode: RootMode::Fixed,
-        reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
+        reference_ema_decay: 0.0,
         seed: 11,
         max_steps: 2,
         simulations: 2,
@@ -233,6 +298,7 @@ fn selfplay_run_supports_policy_reference() {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     })
     .unwrap();
 
@@ -244,6 +310,30 @@ fn selfplay_run_supports_policy_reference() {
     assert_eq!(summary.episodes_dropped, 0);
     let labeled = summary.wins + summary.losses + summary.ties;
     assert_eq!(labeled, 4);
+}
+
+#[test]
+fn reference_ema_decay_zero_is_only_valid_for_non_self_average_references() {
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::Policy,
+        root_mode: RootMode::Fixed,
+        reference_ema_decay: 0.0,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    let error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::SelfAverage,
+        reference_ema_decay: 0.0,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+
+    assert!(error.contains("self-average"), "{error}");
 }
 
 #[test]
@@ -269,7 +359,6 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
         seed: 3,
         max_steps: 2,
         simulations: 2,
@@ -293,6 +382,7 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     }
 }
 
@@ -457,7 +547,6 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         reference: ReferenceMode::SelfAverage,
         root_mode: RootMode::Fixed,
         reference_ema_decay: 0.9,
-        reference_gamma: 0.0,
         seed: 11,
         max_steps: 3,
         simulations: 4,
@@ -481,6 +570,7 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         mask_stop: false,
         length_tiebreak: false,
         eval_processes: 1,
+        admission_stagger_ms: 0,
     })
     .unwrap();
     // Admissions that precede a lane's first completed episode have no

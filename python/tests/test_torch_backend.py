@@ -48,7 +48,7 @@ def test_torch_backend_serves_checkpoint_and_rejects_wrong_schema(tmp_path: Path
         assert struct.unpack_from("<Q", payload, 0)[0] == 44
         assert bytes(payload[8:24]) == bytes(manifest.model_version)
         assert output_shape(bytes(payload[24:])) == (view.row_count, view.max_actions)
-        assert output_is_finite(bytes(payload[24:]), view.batch_capacity, view.max_actions)
+        assert output_is_finite(bytes(payload[24:]), view.action_count[: view.row_count])
         del payload
 
         write_frame(client, FRAME_EVAL, struct.pack("<Q", 45), batch)
@@ -310,9 +310,14 @@ def output_shape(payload: bytes) -> tuple[int, int]:
     return row_count, max_actions
 
 
-def output_is_finite(payload: bytes, capacity: int, max_actions: int) -> bool:
-    values = np.frombuffer(payload, dtype=np.dtype("<f4"), count=capacity, offset=16)
-    logits = np.frombuffer(payload, dtype=np.dtype("<f4"), count=capacity * max_actions, offset=16 + capacity * 4)
+def output_is_finite(payload: bytes, action_counts: np.ndarray) -> bool:
+    values = np.frombuffer(payload, dtype=np.dtype("<f4"), count=len(action_counts), offset=16)
+    logits = np.frombuffer(
+        payload,
+        dtype=np.dtype("<f4"),
+        count=int(action_counts.sum()),
+        offset=16 + len(action_counts) * 4,
+    )
     return bool(np.isfinite(values).all() and np.isfinite(logits).all())
 
 

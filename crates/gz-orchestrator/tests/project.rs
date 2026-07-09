@@ -178,7 +178,7 @@ fn length_tiebreak_equal_lengths_and_flag_off_fall_to_coin() {
 
     // Flag on, stepless reference (no length recorded): opts out to coin.
     let mut stepless = reference_with_steps(&episode, learner, 1);
-    stepless.steps.clear();
+    stepless.steps = Vec::new().into();
     let target = project_episode(&episode, Some(&stepless), None, true, 7)
         .unwrap()
         .0
@@ -306,6 +306,7 @@ fn reference_with_steps(
     steps: usize,
 ) -> Reference {
     Reference {
+        ref_id: None,
         kind: ReplayReferenceKind::RootBaseline,
         final_reward,
         final_graph: Some(episode.root_context),
@@ -315,7 +316,8 @@ fn reference_with_steps(
                 features: None,
             };
             steps
-        ],
+        ]
+        .into(),
         search_config_hash: None,
         model_version: None,
     }

@@ -7,7 +7,8 @@ use gz_eval::{RandomValueEvaluator, RandomValueEvaluatorConfig};
 use gz_eval_service::{
     EvaluatorProcess, EvaluatorProcessConfig, Hello, STUB_MODEL_VERSION, StubBackend,
 };
-use gz_features::{FeatureExtractor, PositionFeatures};
+use gz_features::{FeatureExtractor, FeatureSchemaHash, PositionFeatures};
+use gz_measurer::{MeasureLedgerSnapshot, ReferenceRegistry};
 use gz_orchestrator::reference::{
     BeamReferenceProvider, GreedyReferenceProvider, PolicyReferenceProvider,
     RandomReferenceProvider, Reference, ReferenceProvider, RolloutOutcome, RootBaselineProvider,
@@ -25,6 +26,7 @@ use gz_search::{
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 const WHITTLE_FEATURE_MAX_ENGINE_CANDIDATES: usize = 255;
@@ -38,11 +40,6 @@ pub struct SelfplayConfig {
     pub reference: ReferenceMode,
     pub root_mode: RootMode,
     pub reference_ema_decay: f32,
-    /// whittlezero's ptp.gamma: fraction of episodes referenced against
-    /// the latest measured rollout instead of the gated best, keeping
-    /// the label channel winnable when the bar outruns the noisy player.
-    /// Gated-policy only.
-    pub reference_gamma: f32,
     pub seed: u64,
     pub max_steps: usize,
     pub simulations: usize,
@@ -81,6 +78,44 @@ pub struct SelfplayConfig {
     /// evaluators only). Each process parallelizes per-batch host work
     /// on its own interpreter and keeps the GPU kernel queue dense.
     pub eval_processes: usize,
+    /// Minimum wall-clock spacing between new root episodes admitted
+    /// within a lane. Nonzero startup-ramp values spread worker cohorts
+    /// instead of launching every lane slot at once.
+    pub admission_stagger_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplayInitConfig {
+    pub replay_dir: Option<PathBuf>,
+    pub max_candidates: usize,
+}
+
+impl Default for ReplayInitConfig {
+    fn default() -> Self {
+        Self {
+            replay_dir: None,
+            max_candidates: WHITTLE_FEATURE_MAX_ENGINE_CANDIDATES,
+        }
+    }
+}
+
+impl ReplayInitConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.replay_dir.is_none() {
+            return Err("missing required --replay-dir".to_owned());
+        }
+        if self.max_candidates == 0 {
+            return Err("--max-candidates must be greater than zero".to_owned());
+        }
+        feature_max_actions(self.max_candidates)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplayInitSummary {
+    pub feature_schema_hash: FeatureSchemaHash,
+    pub max_actions: u32,
 }
 
 impl Default for SelfplayConfig {
@@ -93,7 +128,6 @@ impl Default for SelfplayConfig {
             reference: ReferenceMode::Root,
             root_mode: RootMode::Generated,
             reference_ema_decay: 0.99,
-            reference_gamma: 0.0,
             seed: 0,
             max_steps: 8,
             simulations: 8,
@@ -117,6 +151,7 @@ impl Default for SelfplayConfig {
             mask_stop: false,
             length_tiebreak: false,
             eval_processes: 1,
+            admission_stagger_ms: 0,
         }
     }
 }
@@ -144,6 +179,7 @@ impl SelfplayConfig {
         if self.max_candidates == 0 {
             return Err("--max-candidates must be greater than zero".to_owned());
         }
+        feature_max_actions(self.max_candidates)?;
         if self.max_considered == 0 {
             return Err("--max-considered must be greater than zero".to_owned());
         }
@@ -154,19 +190,15 @@ impl SelfplayConfig {
             return Err("--gumbel-noise-overlap must be < 1 (negative disables)".to_owned());
         }
         if !self.reference_ema_decay.is_finite()
-            || self.reference_ema_decay <= 0.0
+            || self.reference_ema_decay < 0.0
             || self.reference_ema_decay >= 1.0
         {
-            return Err("--reference-ema-decay must be in (0, 1)".to_owned());
+            return Err("--reference-ema-decay must be in [0, 1)".to_owned());
         }
-        if !self.reference_gamma.is_finite()
-            || self.reference_gamma < 0.0
-            || self.reference_gamma >= 1.0
-        {
-            return Err("--reference-gamma must be in [0, 1)".to_owned());
-        }
-        if self.reference_gamma > 0.0 && self.reference != ReferenceMode::GatedPolicy {
-            return Err("--reference-gamma requires --reference gated-policy".to_owned());
+        if self.reference == ReferenceMode::SelfAverage && self.reference_ema_decay == 0.0 {
+            return Err(
+                "--reference self-average requires --reference-ema-decay in (0, 1)".to_owned(),
+            );
         }
         if self.serve_socket.is_some() {
             if self.episodes != 0 {
@@ -224,6 +256,9 @@ impl SelfplayConfig {
         }
         if self.eval_processes > self.lanes {
             return Err("--eval-processes cannot exceed --lanes".to_owned());
+        }
+        if self.admission_stagger_ms > u64::MAX / 1_000_000 {
+            return Err("--admission-stagger-ms is too large".to_owned());
         }
         if self.replay_backlog == Some(0) {
             return Err("--replay-backlog must be greater than zero".to_owned());
@@ -360,6 +395,35 @@ pub struct SelfplaySummary {
     pub replay_rows: u64,
     pub reference_steps: u64,
     pub counters: ReplayCounters,
+    pub measure_ledger: MeasureLedgerSnapshot,
+}
+
+pub fn init_replay(config: ReplayInitConfig) -> Result<ReplayInitSummary, String> {
+    config.validate()?;
+
+    let replay_dir = config
+        .replay_dir
+        .as_ref()
+        .expect("validated replay_dir exists");
+    let max_actions = feature_max_actions(config.max_candidates)?;
+    let store = ReplayStore::open(replay_dir).map_err(|error| error.to_string())?;
+    let engine = WhittleEngine::new(whittle_engine_config()).map_err(|error| error.to_string())?;
+    let extractor = WhittleFeatureExtractor::with_config(
+        &engine,
+        WhittleFeatureExtractorConfig {
+            max_actions,
+            ..WhittleFeatureExtractorConfig::default()
+        },
+    );
+    let schema = extractor.schema();
+    store
+        .ensure_feature_schema(schema.config())
+        .map_err(|error| error.to_string())?;
+
+    Ok(ReplayInitSummary {
+        feature_schema_hash: schema.hash(),
+        max_actions: schema.config().max_actions,
+    })
 }
 
 pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
@@ -378,10 +442,12 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let search = search(&engines[0], &config)?;
     let roots = root_sources(&config);
+    let registry = (config.reference == ReferenceMode::GatedPolicy)
+        .then(|| Arc::new(ReferenceRegistry::new()));
     let providers = engines
         .iter()
         .enumerate()
-        .map(|(lane, engine)| provider(engine, &config, lane))
+        .map(|(lane, engine)| provider(engine, &config, lane, registry.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     if config.root_mode == RootMode::Fixed {
@@ -436,8 +502,9 @@ fn run_random(
         ThreadedOrchestratorConfig {
             workers_per_lane: nonzero(config.workers_per_lane, "workers_per_lane")?,
             max_batch: nonzero(config.max_batch, "max_batch")?,
+            admission_stagger: Duration::from_millis(config.admission_stagger_ms),
             // 3ms: at ~10ms model forwards a 1ms lull shipped partial
-            // batches (bootstrap fill averaged 29/128); the deeper
+            // batches (historical fill averaged 29/128); the deeper
             // in-flight pool refills within this window.
             flush_after: Duration::from_millis(3),
         },
@@ -603,6 +670,7 @@ fn summarize(
         replay_rows: run.replay_rows,
         reference_steps: run.reference_steps,
         counters,
+        measure_ledger: run.measure_ledger,
     })
 }
 
@@ -617,8 +685,9 @@ fn threaded_config(config: &SelfplayConfig) -> Result<ThreadedOrchestratorConfig
     Ok(ThreadedOrchestratorConfig {
         workers_per_lane: nonzero(config.workers_per_lane, "workers_per_lane")?,
         max_batch: nonzero(config.max_batch, "max_batch")?,
+        admission_stagger: Duration::from_millis(config.admission_stagger_ms),
         // 3ms: at ~10ms model forwards a 1ms lull shipped partial
-        // batches (bootstrap fill averaged 29/128); the deeper
+        // batches (historical fill averaged 29/128); the deeper
         // in-flight pool refills within this window.
         flush_after: Duration::from_millis(3),
     })
@@ -690,16 +759,25 @@ fn feature_extractor(engine: &WhittleEngine, config: &SelfplayConfig) -> Whittle
     WhittleFeatureExtractor::with_config(
         engine,
         WhittleFeatureExtractorConfig {
-            max_actions: config.max_candidates as u32 + 1,
+            max_actions: feature_max_actions(config.max_candidates).expect("validated max_actions"),
             ..WhittleFeatureExtractorConfig::default()
         },
     )
+}
+
+fn feature_max_actions(max_candidates: usize) -> Result<u32, String> {
+    let candidates = u32::try_from(max_candidates)
+        .map_err(|_| "--max-candidates exceeds schema action limit".to_owned())?;
+    candidates
+        .checked_add(1)
+        .ok_or_else(|| "--max-candidates exceeds schema action limit".to_owned())
 }
 
 fn provider(
     engine: &WhittleEngine,
     config: &SelfplayConfig,
     lane: usize,
+    registry: Option<&Arc<ReferenceRegistry>>,
 ) -> Result<CliReferenceProvider, String> {
     let measure_options = engine.measure_options();
     let provider = match config.reference {
@@ -735,10 +813,9 @@ fn provider(
         }
         ReferenceMode::Policy => CliReferenceProvider::Policy(PolicyReferenceProvider::new()),
         ReferenceMode::GatedPolicy => {
-            CliReferenceProvider::Policy(PolicyReferenceProvider::gated_with_gamma(
-                config.reference_gamma,
-                config.seed ^ ((lane as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
-            ))
+            CliReferenceProvider::Policy(PolicyReferenceProvider::gated_with_registry(Arc::clone(
+                registry.expect("gated-policy registry exists"),
+            )))
         }
     };
 
@@ -935,7 +1012,7 @@ impl RootSource<WhittleEngine> for CliRoots {
     }
 }
 
-// One instance per lane; the policy variant's gamma-mix bookkeeping
+// One instance per lane; the policy variant's rollout bookkeeping
 // outweighs the others and boxing it buys nothing at this count.
 #[allow(clippy::large_enum_variant)]
 enum CliReferenceProvider {
@@ -970,8 +1047,8 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
     }
 
     // Forwarded explicitly: the trait default falls back to reference(),
-    // which silently drops per-step opponent features (bootstrap root
-    // references lost their states this way -- scalar present, no state).
+    // which silently drops per-step opponent features (root references lost
+    // their states this way -- scalar present, no state).
     fn reference_with_features<X>(
         &mut self,
         engine: &mut WhittleEngine,
@@ -1053,6 +1130,15 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
         match self {
             Self::Policy(provider) => {
                 ReferenceProvider::<WhittleEngine>::rollout_due(provider, latest)
+            }
+            _ => false,
+        }
+    }
+
+    fn claim_rollout(&mut self, latest: Option<gz_engine::ModelVersion>) -> bool {
+        match self {
+            Self::Policy(provider) => {
+                ReferenceProvider::<WhittleEngine>::claim_rollout(provider, latest)
             }
             _ => false,
         }

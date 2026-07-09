@@ -16,6 +16,7 @@ use gz_search::{
     RandomSearchConfig, SearchStep,
 };
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 fn whittle() -> WhittleEngine {
     WhittleEngine::new(WhittleEngineConfig::default()).unwrap()
@@ -558,61 +559,53 @@ fn self_average_rejects_decay_of_one() {
 }
 
 #[test]
-fn gamma_mix_picks_latest_rollout_a_fraction_of_the_time() {
+fn shared_gated_registry_claims_one_rollout_per_version() {
     let mut engine = whittle();
     let root = engine.root();
     let v1 = ModelVersion::from_bytes([1; 16]);
     let v2 = ModelVersion::from_bytes([2; 16]);
+    let registry = Arc::new(gz_measurer::ReferenceRegistry::new());
+    let mut first = PolicyReferenceProvider::gated_with_registry(Arc::clone(&registry));
+    let registry_view = Arc::clone(&registry);
+    let mut second = PolicyReferenceProvider::gated_with_registry(registry);
 
-    // gamma 0: always the gated incumbent, even after a rejected
-    // challenger lands in the latest slot.
-    let mut gated = PolicyReferenceProvider::gated_with_gamma(0.0, 7);
-    let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut gated;
-    provider.begin_rollout(Some(v1));
-    provider.finish_rollout(Some(rollout_outcome(-3.0)));
-    provider.begin_rollout(Some(v2));
-    provider.finish_rollout(Some(rollout_outcome(-9.0)));
-    for _ in 0..16 {
-        let reference = provider.reference(&mut engine, root).unwrap().unwrap();
-        assert_eq!(reference.final_reward, -3.0);
-        assert_eq!(reference.model_version, Some(v1));
-    }
+    assert!(ReferenceProvider::<WhittleEngine>::claim_rollout(
+        &mut first,
+        Some(v1)
+    ));
+    assert!(!ReferenceProvider::<WhittleEngine>::claim_rollout(
+        &mut second,
+        Some(v1)
+    ));
+    ReferenceProvider::<WhittleEngine>::finish_rollout(&mut first, Some(rollout_outcome(-3.0)));
+    assert!(ReferenceProvider::<WhittleEngine>::admission_ready(&second));
+    let reference = ReferenceProvider::<WhittleEngine>::reference(&mut second, &mut engine, root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.kind, ReplayReferenceKind::GatedPolicy);
+    assert_eq!(reference.final_reward, -3.0);
+    assert_eq!(reference.model_version, Some(v1));
+    assert!(Arc::ptr_eq(
+        &reference.steps,
+        &registry_view.current().unwrap().steps
+    ));
 
-    // gamma near 1: (almost) always the latest, here the rejected v2.
-    let mut mixed = PolicyReferenceProvider::gated_with_gamma(0.999, 7);
-    let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut mixed;
-    provider.begin_rollout(Some(v1));
-    provider.finish_rollout(Some(rollout_outcome(-3.0)));
-    provider.begin_rollout(Some(v2));
-    provider.finish_rollout(Some(rollout_outcome(-9.0)));
-    let mut latest_picks = 0;
-    for _ in 0..64 {
-        let reference = provider.reference(&mut engine, root).unwrap().unwrap();
-        if reference.model_version == Some(v2) {
-            assert_eq!(reference.final_reward, -9.0);
-            latest_picks += 1;
-        }
-    }
-    assert!(latest_picks >= 60, "latest picked {latest_picks}/64");
-
-    // gamma 0.2 lands near a fifth over many seeded draws, and the
-    // sequence is deterministic per seed.
-    let mut fifth = PolicyReferenceProvider::gated_with_gamma(0.2, 11);
-    let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut fifth;
-    provider.begin_rollout(Some(v1));
-    provider.finish_rollout(Some(rollout_outcome(-3.0)));
-    provider.begin_rollout(Some(v2));
-    provider.finish_rollout(Some(rollout_outcome(-9.0)));
-    let picks: Vec<bool> = (0..1000)
-        .map(|_| {
-            provider
-                .reference(&mut engine, root)
-                .unwrap()
-                .unwrap()
-                .model_version
-                == Some(v2)
-        })
-        .collect();
-    let count = picks.iter().filter(|&&pick| pick).count();
-    assert!((140..=260).contains(&count), "latest picked {count}/1000");
+    assert!(ReferenceProvider::<WhittleEngine>::claim_rollout(
+        &mut second,
+        Some(v2)
+    ));
+    assert!(!ReferenceProvider::<WhittleEngine>::claim_rollout(
+        &mut first,
+        Some(v2)
+    ));
+    ReferenceProvider::<WhittleEngine>::finish_rollout(&mut second, Some(rollout_outcome(-9.0)));
+    let reference = ReferenceProvider::<WhittleEngine>::reference(&mut first, &mut engine, root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.final_reward, -3.0);
+    assert_eq!(reference.model_version, Some(v1));
+    assert!(!ReferenceProvider::<WhittleEngine>::rollout_due(
+        &first,
+        Some(v2)
+    ));
 }

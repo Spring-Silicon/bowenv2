@@ -1,6 +1,6 @@
 use crate::EpisodeId;
 use crate::pool::{Admission, WorkerPool};
-use crate::project::{episode_reward, project_episode};
+use crate::project::{artifact_from_episode, projected_reference};
 use crate::reference::{Reference, ReferenceProvider, RolloutOutcome};
 use crate::root::RootSource;
 use crate::serial::OrchestratedEpisode;
@@ -14,7 +14,11 @@ use gz_features::{
     FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaHash,
     OpponentStateFeatures, PositionFeatures, encode_feature_row,
 };
-use gz_replay::{ReplayEpisodeRecord, ReplayError, ReplayRow, ReplayStore};
+use gz_measurer::{
+    MeasureLedgerSnapshot, MeasuredEpisode, MeasurerAdmission, MeasurerAdmissionStatus,
+    MeasurerError, MeasurerRunSummary, ProjectionMode, ReplayMeasurer,
+};
+use gz_replay::{ReplayError, ReplayStore};
 use gz_search::{
     EngineIdentity, GumbelEpisode, GumbelEpisodeContext, GumbelMcts, GumbelOpponentContext,
     WorkToken,
@@ -30,6 +34,7 @@ pub struct ThreadedOrchestratorConfig {
     pub workers_per_lane: NonZeroUsize,
     pub max_batch: NonZeroUsize,
     pub flush_after: Duration,
+    pub admission_stagger: Duration,
 }
 
 pub struct ThreadedGumbelOrchestrator<E, V> {
@@ -99,6 +104,7 @@ pub struct ThreadedReplayRun {
     pub search_contexts: u64,
     pub replay_rows: u64,
     pub reference_steps: u64,
+    pub measure_ledger: MeasureLedgerSnapshot,
 }
 
 struct EvalJob {
@@ -123,9 +129,8 @@ struct EvalReply {
 }
 
 struct ReplayJob {
-    record: ReplayEpisodeRecord,
-    rows: Vec<ReplayRow>,
-    ack: SyncSender<EngineResult<()>>,
+    episode: MeasuredEpisode,
+    ack: SyncSender<EngineResult<MeasurerAdmission>>,
 }
 
 impl<E, V> ThreadedGumbelOrchestrator<E, V>
@@ -203,8 +208,10 @@ where
                         roots,
                         LaneRuntime {
                             lane,
+                            lanes,
                             search,
                             workers_per_lane: config.workers_per_lane,
+                            admission_stagger: config.admission_stagger,
                             context,
                             intake_tx,
                             reply_rx,
@@ -282,7 +289,8 @@ where
         let (batch_result, sink_result, lane_results) = std::thread::scope(|scope| {
             let batch_handle =
                 scope.spawn(move || run_batcher(evaluator, intake_rx, reply_txs, config));
-            let sink_handle = scope.spawn(move || run_replay_sink(store, replay_rx));
+            let sink_handle =
+                scope.spawn(move || run_replay_sink(store, replay_rx, length_tiebreak));
             let mut lane_handles = Vec::with_capacity(lanes);
 
             for (lane, (((engine, roots), provider), reply_rx)) in engines
@@ -300,13 +308,15 @@ where
                         roots,
                         LaneRuntime {
                             lane,
+                            lanes,
                             search,
                             workers_per_lane: config.workers_per_lane,
+                            admission_stagger: config.admission_stagger,
                             context,
                             intake_tx,
                             reply_rx,
                         },
-                        ReplayMode::new(provider, replay_tx, store, backpressure, length_tiebreak),
+                        ReplayMode::new(lane, provider, replay_tx, store, backpressure),
                     )
                 }));
             }
@@ -333,18 +343,15 @@ where
         });
 
         let batch_sizes = batch_result?;
-        let episodes_appended = sink_result?;
+        let measurer_summary = sink_result?;
         let mut lanes = Vec::with_capacity(lane_results.len());
-        let mut episodes_dropped = 0;
         let mut search_contexts = 0;
-        let mut replay_rows = 0;
         let mut reference_steps = 0;
 
         for result in lane_results {
-            let result = result?;
-            episodes_dropped += result.episodes_dropped;
+            let mut result = result?;
+            merge_lane_measurer_summary(&mut result, &measurer_summary);
             search_contexts += result.search_contexts;
-            replay_rows += result.replay_rows;
             reference_steps += result.reference_steps;
             lanes.push(result);
         }
@@ -352,11 +359,12 @@ where
         Ok(ThreadedReplayRun {
             lanes,
             batch_sizes,
-            episodes_appended,
-            episodes_dropped,
+            episodes_appended: measurer_summary.episodes_appended,
+            episodes_dropped: measurer_summary.episodes_dropped,
             search_contexts,
-            replay_rows,
+            replay_rows: measurer_summary.replay_rows,
             reference_steps,
+            measure_ledger: measurer_summary.measure_ledger,
         })
     }
 
@@ -436,8 +444,10 @@ where
                         roots,
                         LaneRuntime {
                             lane,
+                            lanes,
                             search,
                             workers_per_lane: config.workers_per_lane,
+                            admission_stagger: config.admission_stagger,
                             context,
                             intake_tx,
                             reply_rx,
@@ -555,7 +565,8 @@ where
                 }));
             }
             drop(reply_txs);
-            let sink_handle = scope.spawn(move || run_replay_sink(store, replay_rx));
+            let sink_handle =
+                scope.spawn(move || run_replay_sink(store, replay_rx, length_tiebreak));
             let mut lane_handles = Vec::with_capacity(lanes);
 
             for (lane, ((((engine, roots), extractor), provider), reply_rx)) in engines
@@ -574,19 +585,21 @@ where
                         roots,
                         LaneRuntime {
                             lane,
+                            lanes,
                             search,
                             workers_per_lane: config.workers_per_lane,
+                            admission_stagger: config.admission_stagger,
                             context,
                             intake_tx,
                             reply_rx,
                         },
                         FeaturizedReplayMode::new(
+                            lane,
                             extractor,
                             provider,
                             replay_tx,
                             store,
                             backpressure,
-                            length_tiebreak,
                         ),
                     )
                 }));
@@ -622,18 +635,15 @@ where
         for result in batch_results {
             batch_sizes.extend(result?);
         }
-        let episodes_appended = sink_result?;
+        let measurer_summary = sink_result?;
         let mut lanes = Vec::with_capacity(lane_results.len());
-        let mut episodes_dropped = 0;
         let mut search_contexts = 0;
-        let mut replay_rows = 0;
         let mut reference_steps = 0;
 
         for result in lane_results {
-            let result = result?;
-            episodes_dropped += result.episodes_dropped;
+            let mut result = result?;
+            merge_lane_measurer_summary(&mut result, &measurer_summary);
             search_contexts += result.search_contexts;
-            replay_rows += result.replay_rows;
             reference_steps += result.reference_steps;
             lanes.push(result);
         }
@@ -641,19 +651,22 @@ where
         Ok(ThreadedReplayRun {
             lanes,
             batch_sizes,
-            episodes_appended,
-            episodes_dropped,
+            episodes_appended: measurer_summary.episodes_appended,
+            episodes_dropped: measurer_summary.episodes_dropped,
             search_contexts,
-            replay_rows,
+            replay_rows: measurer_summary.replay_rows,
             reference_steps,
+            measure_ledger: measurer_summary.measure_ledger,
         })
     }
 }
 
 struct LaneRuntime<'a, J> {
     lane: usize,
+    lanes: usize,
     search: &'a GumbelMcts,
     workers_per_lane: NonZeroUsize,
+    admission_stagger: Duration,
     context: GumbelEpisodeContext,
     intake_tx: SyncSender<J>,
     reply_rx: Receiver<EvalReply>,
@@ -764,24 +777,39 @@ where
     let mut pool = WorkerPool::new(runtime.workers_per_lane, worker_id_base);
     let mut roots_exhausted = false;
     let mut next_episode_id = (runtime.lane as u64) << 32;
+    let mut admission_ramp = AdmissionRamp::new(
+        runtime.lane,
+        runtime.lanes,
+        runtime.workers_per_lane.get(),
+        runtime.admission_stagger,
+    );
     mode.begin(runtime.search, identity, runtime.context);
 
     loop {
         if !roots_exhausted {
             mode.before_root_admission(&mut pool, &mut engine, &mut roots, &mut next_episode_id)?;
-            if mode.gate_open() && mode.admission_open() {
+            if mode.gate_open() && mode.admission_open() && admission_ramp.ready() {
                 let mut admission = Admission {
                     search: runtime.search,
                     identity,
                     context: runtime.context,
                     next_episode_id: &mut next_episode_id,
                 };
-                roots_exhausted = pool.admit(
+                let result = pool.admit_limited(
                     &mut engine,
                     &mut roots,
                     &mut admission,
+                    admission_ramp.limit(),
                     |engine, id, root, context| mode.episode_context(engine, id, root, context),
                 )?;
+                roots_exhausted = result.roots_exhausted;
+                admission_ramp.record(result.admitted);
+            } else if mode.gate_open()
+                && mode.admission_open()
+                && !pool.active()
+                && let Some(sleep) = admission_ramp.sleep_until_ready()
+            {
+                std::thread::sleep(sleep);
             } else if !pool.active()
                 && let Some(gate_poll) = mode.gate_poll()
             {
@@ -809,6 +837,66 @@ where
             mode.observe_version(version);
         }
     }
+}
+
+struct AdmissionRamp {
+    stagger: Duration,
+    next: Instant,
+}
+
+impl AdmissionRamp {
+    fn new(lane: usize, lanes: usize, workers_per_lane: usize, stagger: Duration) -> Self {
+        let now = Instant::now();
+        if stagger.is_zero() {
+            return Self { stagger, next: now };
+        }
+        let offset = spread_duration(stagger, lane, lanes);
+        let slots = workers_per_lane.saturating_sub(1) as u32;
+        eprintln!(
+            "event=admission_ramp lane={lane} stagger_ms={} first_delay_ms={} fill_ms={}",
+            stagger.as_millis(),
+            offset.as_millis(),
+            stagger.as_millis() * u128::from(slots),
+        );
+        Self {
+            stagger,
+            next: now + offset,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.stagger.is_zero() || Instant::now() >= self.next
+    }
+
+    fn limit(&self) -> usize {
+        if self.stagger.is_zero() {
+            usize::MAX
+        } else {
+            1
+        }
+    }
+
+    fn record(&mut self, admitted: usize) {
+        if self.stagger.is_zero() || admitted == 0 {
+            return;
+        }
+        self.next = Instant::now() + self.stagger;
+    }
+
+    fn sleep_until_ready(&self) -> Option<Duration> {
+        if self.stagger.is_zero() {
+            return None;
+        }
+        Some(self.next.saturating_duration_since(Instant::now())).filter(|sleep| !sleep.is_zero())
+    }
+}
+
+fn spread_duration(duration: Duration, index: usize, count: usize) -> Duration {
+    if count <= 1 || index == 0 || duration.is_zero() {
+        return Duration::ZERO;
+    }
+    let nanos = duration.as_nanos().saturating_mul(index as u128) / count as u128;
+    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 struct CollectMode<G, C> {
@@ -930,33 +1018,35 @@ where
 }
 
 struct ReplayMode<'a, P> {
+    lane: usize,
     provider: P,
     replay_tx: SyncSender<ReplayJob>,
     store: &'a ReplayStore,
     backpressure: Option<ReplayBackpressure>,
-    length_tiebreak: bool,
     references: HashMap<EpisodeId, Option<Reference>>,
+    admitted_at: HashMap<EpisodeId, Instant>,
     summary: ReplayLaneSummary,
     rollout: Option<OpponentRollout>,
 }
 
 impl<'a, P> ReplayMode<'a, P> {
     fn new(
+        lane: usize,
         provider: P,
         replay_tx: SyncSender<ReplayJob>,
         store: &'a ReplayStore,
         backpressure: Option<ReplayBackpressure>,
-        length_tiebreak: bool,
     ) -> Self {
         Self {
+            lane,
             provider,
             replay_tx,
             store,
             backpressure,
-            length_tiebreak,
             references: HashMap::new(),
+            admitted_at: HashMap::new(),
             summary: ReplayLaneSummary {
-                lane: 0,
+                lane,
                 episodes_completed: 0,
                 episodes_appended: 0,
                 episodes_dropped: 0,
@@ -1027,6 +1117,7 @@ where
         let reference = self.provider.reference(engine, root)?;
         context.opponent = reference.as_ref().map(opponent_context);
         self.references.insert(episode_id, reference);
+        self.admitted_at.insert(episode_id, Instant::now());
         Ok(context)
     }
 
@@ -1073,44 +1164,31 @@ where
             .references
             .remove(&completed.episode_id)
             .ok_or_else(|| internal("missing replay reference"))?;
+        if let Some(admitted_at) = self.admitted_at.remove(&completed.episode_id) {
+            self.store
+                .observe_episode_latency(admitted_at.elapsed().as_secs_f64());
+        }
         self.summary.episodes_completed += 1;
         self.summary.search_contexts += episode_search_contexts(&completed.episode);
         self.summary.reference_steps += reference
             .as_ref()
             .map_or(0, |reference| reference.steps.len() as u64);
 
-        // Episodes admitted before the provider's first reference existed
-        // carry none; storing them would seed training with unlabeled,
-        // off-distribution rows.
-        if reference.is_none() && self.provider.expects_reference() {
-            release_episode_handles(engine, &completed.episode, &[])?;
-            // The reward still feeds the provider (it seeds self-average
-            // EMAs); only the store is skipped.
-            if let Some(reward) = episode_reward(&completed.episode) {
-                self.provider.observe(reward);
-            }
-            self.summary.episodes_dropped += 1;
-            clear_replayed_episode_trace(&mut completed.episode);
-            return Ok(());
-        }
-
-        if let Some((record, rows)) = project_episode(
+        let episode = measured_episode(
+            self.lane,
+            completed.episode_id.value(),
             &completed.episode,
             reference.as_ref(),
             None,
-            self.length_tiebreak,
-            completed.episode_id.value(),
-        ) {
-            let reward = record.outcome.learner_reward;
-            self.summary.replay_rows += rows.len() as u64;
-            let append = append_replay_job(&self.replay_tx, record, rows);
-            release_episode_handles(engine, &completed.episode, &[])?;
-            append?;
+            self.provider.expects_reference(),
+        );
+        let append = append_replay_job(&self.replay_tx, episode);
+        release_episode_handles(engine, &completed.episode, &[])?;
+        let admission = append?;
+        if should_observe_admission(admission)
+            && let Some(reward) = admission.learner_reward
+        {
             self.provider.observe(reward);
-            self.summary.episodes_appended += 1;
-        } else {
-            release_episode_handles(engine, &completed.episode, &[])?;
-            self.summary.episodes_dropped += 1;
         }
 
         clear_replayed_episode_trace(&mut completed.episode);
@@ -1132,16 +1210,16 @@ struct FeaturizedReplayMode<'a, X, P> {
 
 impl<'a, X, P> FeaturizedReplayMode<'a, X, P> {
     fn new(
+        lane: usize,
         extractor: X,
         provider: P,
         replay_tx: SyncSender<ReplayJob>,
         store: &'a ReplayStore,
         backpressure: Option<ReplayBackpressure>,
-        length_tiebreak: bool,
     ) -> Self {
         Self {
             extractor,
-            replay: ReplayMode::new(provider, replay_tx, store, backpressure, length_tiebreak),
+            replay: ReplayMode::new(lane, provider, replay_tx, store, backpressure),
             candidate_options: CandidateOptions::default(),
             export_position: true,
         }
@@ -1211,6 +1289,7 @@ where
         let mut context = context;
         context.opponent = reference.as_ref().map(opponent_context);
         self.replay.references.insert(episode_id, reference);
+        self.replay.admitted_at.insert(episode_id, Instant::now());
         Ok(context)
     }
 
@@ -1270,16 +1349,10 @@ where
             .references
             .remove(&completed.episode_id)
             .ok_or_else(|| internal("missing replay reference"))?;
-        if reference.is_none() && self.replay.provider.expects_reference() {
-            self.replay.summary.episodes_completed += 1;
-            self.replay.summary.search_contexts += episode_search_contexts(&completed.episode);
-            release_episode_handles(engine, &completed.episode, &[])?;
-            if let Some(reward) = episode_reward(&completed.episode) {
-                self.replay.provider.observe(reward);
-            }
-            self.replay.summary.episodes_dropped += 1;
-            clear_replayed_episode_trace(&mut completed.episode);
-            return Ok(());
+        if let Some(admitted_at) = self.replay.admitted_at.remove(&completed.episode_id) {
+            self.replay
+                .store
+                .observe_episode_latency(admitted_at.elapsed().as_secs_f64());
         }
         let feature_rows = feature_rows_for_episode(
             engine,
@@ -1294,23 +1367,21 @@ where
             .as_ref()
             .map_or(0, |reference| reference.steps.len() as u64);
 
-        if let Some((record, rows)) = project_episode(
+        let episode = measured_episode(
+            self.replay.lane,
+            completed.episode_id.value(),
             &completed.episode,
             reference.as_ref(),
             Some(&feature_rows.rows),
-            self.replay.length_tiebreak,
-            completed.episode_id.value(),
-        ) {
-            let reward = record.outcome.learner_reward;
-            self.replay.summary.replay_rows += rows.len() as u64;
-            let append = append_replay_job(&self.replay.replay_tx, record, rows);
-            release_episode_handles(engine, &completed.episode, &feature_rows.candidates)?;
-            append?;
+            self.replay.provider.expects_reference(),
+        );
+        let append = append_replay_job(&self.replay.replay_tx, episode);
+        release_episode_handles(engine, &completed.episode, &feature_rows.candidates)?;
+        let admission = append?;
+        if should_observe_admission(admission)
+            && let Some(reward) = admission.learner_reward
+        {
             self.replay.provider.observe(reward);
-            self.replay.summary.episodes_appended += 1;
-        } else {
-            release_episode_handles(engine, &completed.episode, &feature_rows.candidates)?;
-            self.replay.summary.episodes_dropped += 1;
         }
 
         clear_replayed_episode_trace(&mut completed.episode);
@@ -1353,6 +1424,46 @@ fn episode_search_contexts<G, C>(episode: &GumbelEpisode<G, C>) -> u64 {
         .iter()
         .map(|stats| stats.portable_contexts as u64)
         .sum()
+}
+
+fn measured_episode<G, C>(
+    lane: usize,
+    episode_id: u64,
+    episode: &GumbelEpisode<G, C>,
+    reference: Option<&Reference>,
+    feature_rows: Option<&[Vec<u8>]>,
+    expects_reference: bool,
+) -> MeasuredEpisode {
+    MeasuredEpisode {
+        lane,
+        episode_id,
+        artifact: artifact_from_episode(episode, feature_rows),
+        reference: reference.map(projected_reference),
+        mode: if expects_reference {
+            ProjectionMode::RequireReference
+        } else {
+            ProjectionMode::AllowUnlabeled
+        },
+    }
+}
+
+fn should_observe_admission(admission: MeasurerAdmission) -> bool {
+    matches!(
+        admission.status,
+        MeasurerAdmissionStatus::Appended { .. }
+            | MeasurerAdmissionStatus::Dropped {
+                reason: MeasurerError::MissingReference
+            }
+    )
+}
+
+fn merge_lane_measurer_summary(lane: &mut ReplayLaneSummary, measurer: &MeasurerRunSummary) {
+    let Some(measured) = measurer.lanes.get(lane.lane) else {
+        return;
+    };
+    lane.episodes_appended = measured.episodes_appended;
+    lane.episodes_dropped = measured.episodes_dropped;
+    lane.replay_rows = measured.replay_rows;
 }
 
 fn send_plain_parked<G, C>(
@@ -1707,12 +1818,13 @@ impl OpponentRollout {
             return Ok(());
         }
         // latest_version None at cold start does not block: providers
-        // that seed their reference answer due and the rollout's own
-        // eval replies name the version it played under.
-        if !provider.rollout_due(self.latest_version) {
+        // that seed their reference claim and the rollout's own eval
+        // replies name the version it played under.
+        if !provider.claim_rollout(self.latest_version) {
             return Ok(());
         }
         let Some(root) = roots.fixed_root(engine)? else {
+            provider.finish_rollout(None);
             return Ok(());
         };
 
@@ -1729,8 +1841,9 @@ impl OpponentRollout {
         );
         if admitted {
             *next_episode_id += 1;
-            provider.begin_rollout(self.latest_version);
             self.in_flight = Some(episode_id);
+        } else {
+            provider.finish_rollout(None);
         }
         Ok(())
     }
@@ -1837,12 +1950,11 @@ fn clear_replayed_episode_trace<G, C>(episode: &mut GumbelEpisode<G, C>) {
 
 fn append_replay_job(
     replay_tx: &SyncSender<ReplayJob>,
-    record: ReplayEpisodeRecord,
-    rows: Vec<ReplayRow>,
-) -> EngineResult<()> {
+    episode: MeasuredEpisode,
+) -> EngineResult<MeasurerAdmission> {
     let (ack, done) = sync_channel(1);
     replay_tx
-        .send(ReplayJob { record, rows, ack })
+        .send(ReplayJob { episode, ack })
         .map_err(|_| internal("replay sink failed"))?;
     done.recv().map_err(|_| internal("replay sink failed"))?
 }
@@ -1965,6 +2077,10 @@ where
     // are FIFO. Depth 3: one computing, one staged behind it, one in the
     // socket buffer, so the server never starves between client drains.
     const PIPELINE_DEPTH: usize = 3;
+    // Machine-parsed by the trainer driver (eval fill metrics); field
+    // changes must update its parser. Counters are cumulative: the
+    // driver computes rates and window means from deltas.
+    const STATS_INTERVAL: Duration = Duration::from_secs(30);
 
     let mut batch_sizes = Vec::new();
     let mut batch = Vec::with_capacity(config.max_batch.get());
@@ -1974,6 +2090,8 @@ where
     let mut in_flight: std::collections::VecDeque<(Routing, gz_eval_service::PendingBatch)> =
         std::collections::VecDeque::with_capacity(PIPELINE_DEPTH);
     let mut intake_open = true;
+    let mut stats_batches: usize = 0;
+    let mut last_stats = Instant::now();
 
     while intake_open || !in_flight.is_empty() {
         batch.clear();
@@ -2043,10 +2161,15 @@ where
         // round collected nothing (idle lanes are waiting on replies),
         // or when intake closed and only the tail remains.
         let must_drain = in_flight.len() >= PIPELINE_DEPTH || (!submitted && !in_flight.is_empty());
-        if !must_drain {
-            continue;
+        if must_drain {
+            drain_oldest(&mut backend, &mut in_flight, &reply_txs, &mut batch_sizes)?;
         }
-        drain_oldest(&mut backend, &mut in_flight, &reply_txs, &mut batch_sizes)?;
+        if last_stats.elapsed() >= STATS_INTERVAL && batch_sizes.len() > stats_batches {
+            stats_batches = batch_sizes.len();
+            let stats_rows: u64 = batch_sizes.iter().map(|&size| size as u64).sum();
+            last_stats = Instant::now();
+            eprintln!("event=eval_stats batches={stats_batches} rows={stats_rows}");
+        }
     }
 
     Ok(batch_sizes)
@@ -2105,23 +2228,38 @@ fn validate_backend_outputs(outputs: &BackendOutputs, action_counts: &[u32]) -> 
     Ok(())
 }
 
-fn run_replay_sink(store: &ReplayStore, replay_rx: Receiver<ReplayJob>) -> EngineResult<u64> {
-    let mut episodes_appended = 0;
+fn run_replay_sink(
+    store: &ReplayStore,
+    replay_rx: Receiver<ReplayJob>,
+    length_tiebreak: bool,
+) -> EngineResult<MeasurerRunSummary> {
+    let mut measurer = ReplayMeasurer::new(store, length_tiebreak);
+    // Machine-parsed by the trainer driver (measure ledger metrics);
+    // field changes must update its parser. Counters are cumulative.
+    const STATS_INTERVAL: Duration = Duration::from_secs(30);
+    let mut last_stats = Instant::now();
 
     while let Ok(job) = replay_rx.recv() {
-        let result = store
-            .append_episode(&job.record, &job.rows)
-            .map(|_| ())
-            .map_err(map_replay_error);
-        let failed = result.clone().err();
+        let result = measurer.admit(job.episode).map_err(map_replay_error);
+        let failed = result.as_ref().err().cloned();
         let _ = job.ack.send(result);
         if let Some(error) = failed {
             return Err(error);
         }
-        episodes_appended += 1;
+        if last_stats.elapsed() >= STATS_INTERVAL {
+            last_stats = Instant::now();
+            let stats = measurer.stats();
+            eprintln!(
+                "event=measure_stats appended={} dropped={} finals={} distinct={}",
+                stats.episodes_appended,
+                stats.episodes_dropped,
+                stats.finals,
+                stats.distinct_finals,
+            );
+        }
     }
 
-    Ok(episodes_appended)
+    Ok(measurer.finish())
 }
 
 fn map_replay_error(error: ReplayError) -> EngineError {

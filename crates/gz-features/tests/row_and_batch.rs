@@ -341,6 +341,29 @@ fn decode_outputs_truncates_policy_by_action_count() {
 }
 
 #[test]
+fn decode_outputs_accepts_compact_policy_payload() {
+    let schema = schema();
+    let collator = FeatureCollator::new(schema, NonZeroUsize::new(2).unwrap());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GZFO");
+    bytes.extend_from_slice(&gz_features::BATCH_ENCODING_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    for value in [0.5f32, -0.25] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [1.0f32, 2.0, -1.0, -2.0, -3.0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    let rows = collator.decode_outputs(&bytes, &[2, 3]).unwrap();
+    assert_eq!(rows[0].value, 0.5);
+    assert_eq!(rows[0].policy_logits, vec![1.0, 2.0]);
+    assert_eq!(rows[1].value, -0.25);
+    assert_eq!(rows[1].policy_logits, vec![-1.0, -2.0, -3.0]);
+}
+
+#[test]
 fn validate_batch_action_counts_checks_lengths_mismatches_and_overflow() {
     let schema = schema();
     let mut collator = FeatureCollator::new(schema, NonZeroUsize::new(2).unwrap());

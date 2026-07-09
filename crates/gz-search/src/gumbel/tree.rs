@@ -72,22 +72,6 @@ where
             if new_index == 0 {
                 carried_root_visits = node.visits.iter().sum();
             }
-            // Reuse carries COMPUTATION only: graphs, candidate lists, and
-            // NN evals (logits/priors/values) survive, so simulations into
-            // carried territory need no eval requests. Decision statistics
-            // reset -- the next move's halving is a fresh election at full
-            // budget, and its visit-count winner stays meaningful. (The
-            // old ledger-carrying reuse let a carried favorite's count
-            // outvote fresh evidence.)
-            for visits in &mut node.visits {
-                *visits = 0;
-            }
-            for sum in &mut node.value_sum {
-                *sum = 0.0;
-            }
-            for q in &mut node.q {
-                *q = 0.0;
-            }
             nodes.push(node);
         }
 

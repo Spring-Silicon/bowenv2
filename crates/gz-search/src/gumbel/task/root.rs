@@ -1,6 +1,6 @@
 use super::super::schedule::{
-    best_count_action, best_eligible, root_q_max, sample_count_action, search_value,
-    selectable_root_actions, softmax,
+    best_count_action, best_eligible, best_score_action, root_q_max, sample_count_action,
+    search_value, selectable_root_actions, softmax,
 };
 use super::super::tree::{Edge, Node, Tree};
 use super::super::{
@@ -260,18 +260,14 @@ where
             if let Some(action) = best_eligible(
                 &self.tree.nodes[0],
                 &run.considered,
+                &run.baseline_visits,
                 target_visits,
                 &root_scores,
-                self.config.tree_reuse,
             ) {
                 break action;
             }
 
-            if !self.config.tree_reuse {
-                return false;
-            }
-
-            run.schedule_index += 1;
+            return false;
         };
 
         run.descent = Some(DescentState {
@@ -574,18 +570,20 @@ where
         let root_scores = self.tree.root_scores(root_index, &run.base_scores);
         let policy_target = self.tree.improved_policy(root_index);
         let selectable = selectable_root_actions(root_node, &run.considered);
-        // whittlezero's rule: the most-visited considered action, score
-        // tie-break -- winning the halving is an implicit consolidation
-        // filter (a raw score argmax plays 1-visit actions with lucky Q
-        // samples, which measurably sends weak-net episodes wandering).
-        // Correct only on fresh trees: carried visits freeze the previous
-        // move's preference, so whittlezero-faithful selection requires
-        // tree_reuse off.
-        let fallback = best_count_action(&root_node.visits, &selectable, &root_scores);
+        let fallback = if self.config.tree_reuse {
+            best_score_action(&root_scores, &selectable)
+        } else {
+            // whittlezero's fresh-tree rule: the most-visited considered
+            // action, score tie-break. With ledger-carrying reuse, total
+            // visits include the previous root's evidence, so score argmax
+            // matches policy-based-self-competition's shifted-tree choice.
+            best_count_action(&root_node.visits, &selectable, &root_scores)
+        };
         let selected = if self.context.selection_temperature > 0.0 {
             sample_count_action(
                 &mut run.rng,
                 &root_node.visits,
+                &run.baseline_visits,
                 &selectable,
                 self.context.selection_temperature,
                 fallback,

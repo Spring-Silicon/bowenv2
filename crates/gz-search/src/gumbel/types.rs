@@ -23,6 +23,10 @@ pub struct GumbelMctsConfig {
     /// softmax(logits/scale)). Sharp policies get more noise, flat ones
     /// less; negative disables. Part of the search config hash.
     pub gumbel_noise_overlap: f32,
+    /// Shift the selected child subtree into the next root. This carries
+    /// cached graph/candidate/eval bodies and the subtree's visit/Q ledgers;
+    /// the next root still receives a fresh simulation budget, counted
+    /// relative to the carried visit baseline.
     pub tree_reuse: bool,
     /// Export real position features (root_step, leaf_depth, budget) to
     /// evals and feature rows. Off zeroes the exported values so the

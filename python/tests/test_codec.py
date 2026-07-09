@@ -91,6 +91,21 @@ def test_output_encoder_exact_bytes_and_reuse() -> None:
     assert second == first
 
 
+def test_output_encoder_compacts_policy_by_action_count() -> None:
+    encoder = OutputEncoder(capacity=2, max_actions=3)
+    values = np.array([0.5, -0.25], dtype=np.float32)
+    logits = np.array([[1.0, 2.0, 99.0], [-1.0, 99.0, 99.0]], dtype=np.float32)
+
+    actual = bytes(encoder.encode(values, logits, row_count=2, action_counts=[2, 1]))
+
+    expected = bytearray()
+    expected.extend(b"GZFO")
+    expected.extend(struct.pack("<III", BATCH_ENCODING_VERSION, 2, 3))
+    expected.extend(np.array([0.5, -0.25], dtype="<f4").tobytes())
+    expected.extend(np.array([1.0, 2.0, -1.0], dtype="<f4").tobytes())
+    assert actual == bytes(expected)
+
+
 def test_feature_schema_config_codec_roundtrip_and_golden() -> None:
     config = FeatureSchemaConfig(
         name="whittle-v1",

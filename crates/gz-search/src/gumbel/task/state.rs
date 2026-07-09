@@ -71,6 +71,7 @@ pub(super) struct NodeExpansion<G, C> {
 pub(super) struct RunState<G, C> {
     pub(super) base_scores: Vec<f32>,
     pub(super) considered: Vec<usize>,
+    pub(super) baseline_visits: Vec<u32>,
     pub(super) schedule: Vec<u32>,
     pub(super) schedule_index: usize,
     pub(super) simulations: usize,

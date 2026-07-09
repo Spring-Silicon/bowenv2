@@ -569,11 +569,10 @@ fn opponent_context_aligns_to_leaf_time_and_clamps_to_horizon() {
 }
 
 #[test]
-fn ledger_reset_reuse_matches_fresh_trees_with_fewer_evals() {
-    // With a deterministic evaluator, reuse must change WHAT is computed
-    // (cached evals serve carried nodes) but not WHAT is decided: the
-    // ledgers reset and every move runs the full budget, so episodes are
-    // step-for-step identical to fresh trees.
+fn tree_reuse_preserves_decisions_with_fewer_evals_on_stable_fixture() {
+    // On this stable fixture, shifted-tree reuse saves evals while preserving
+    // the selected path. This guards deterministic orchestration parity; the
+    // next test checks that carried ledgers are semantically live.
     let build_engine = || {
         TestEngine::new()
             .candidates(0, [1, 2])
@@ -647,5 +646,61 @@ fn ledger_reset_reuse_matches_fresh_trees_with_fewer_evals() {
         reuse_episode.root_stats[1..]
             .iter()
             .any(|s| s.carried_nodes > 0)
+    );
+}
+
+#[test]
+fn tree_reuse_carries_shifted_root_ledgers() {
+    let build_engine = || {
+        TestEngine::new()
+            .candidates(0, [1])
+            .candidates(10, [2, 3])
+            .candidates(20, [])
+            .candidates(30, [])
+            .apply(0, 1, 10)
+            .apply(10, 2, 20)
+            .apply(10, 3, 30)
+            .reward(20, -1.0)
+            .reward(30, 1.0)
+    };
+    let build_evaluator = || {
+        RecordedEvaluator::default()
+            .row(0, [8.0, -8.0], 0.0)
+            .row(10, [5.0, -5.0, -10.0], 1.0)
+            .row(20, [0.0], -1.0)
+            .row(30, [0.0], 1.0)
+    };
+
+    let mut fresh = config(2);
+    fresh.simulations = NonZeroUsize::new(4).unwrap();
+    fresh.max_considered_actions = NonZeroUsize::new(2).unwrap();
+    let mut reuse = fresh;
+    reuse.tree_reuse = true;
+
+    let fresh_episode = GumbelMcts::new(fresh)
+        .run(
+            &mut build_engine(),
+            &mut build_evaluator(),
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+    let reuse_episode = GumbelMcts::new(reuse)
+        .run(
+            &mut build_engine(),
+            &mut build_evaluator(),
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(reuse_episode.steps.len(), 2);
+    assert!(reuse_episode.root_stats[1].carried_root_visits > 0);
+    assert!(
+        (fresh_episode.steps[1].root_search_value - reuse_episode.steps[1].root_search_value).abs()
+            > 0.1,
+        "fresh {} reuse {}",
+        fresh_episode.steps[1].root_search_value,
+        reuse_episode.steps[1].root_search_value
     );
 }

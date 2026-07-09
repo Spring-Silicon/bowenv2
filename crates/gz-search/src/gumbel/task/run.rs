@@ -41,6 +41,7 @@ where
             self.config.gumbel_scale
         };
         let root_gumbels = sample_root_gumbels(action_count, scale, &mut rng);
+        let baseline_visits = self.tree.nodes[root_index].visits.clone();
         let mut base_scores = Vec::with_capacity(action_count);
 
         for (index, logit) in self.tree.nodes[root_index]
@@ -60,6 +61,7 @@ where
         RunState {
             base_scores,
             considered,
+            baseline_visits,
             schedule,
             schedule_index: 0,
             simulations: 0,

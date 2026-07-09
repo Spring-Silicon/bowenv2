@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use gz_cli::selfplay::{SelfplayConfig, run};
+use gz_cli::selfplay::{ReplayInitConfig, SelfplayConfig, init_replay, run};
 
 // glibc malloc is pathological for this binary either way: default
 // per-thread arenas retain ~17 MB/s of fragmentation across ~300 threads,
@@ -45,8 +45,22 @@ fn main() {
                     summary.reference_steps,
                     summary.search_contexts + summary.replay_rows + summary.reference_steps,
                 );
+                println!(
+                    "measure_ledger finals={} distinct={} repeat={}",
+                    summary.measure_ledger.finals,
+                    summary.measure_ledger.distinct_finals,
+                    summary.measure_ledger.repeat_finals,
+                );
             }
         }),
+        "replay-init" => parse_replay_init(args.collect())
+            .and_then(init_replay)
+            .map(|summary| {
+                println!(
+                    "replay initialized feature_schema_hash={} max_actions={}",
+                    summary.feature_schema_hash, summary.max_actions,
+                );
+            }),
         "replay-serve" => parse_replay_serve(args.collect()).and_then(run_replay_serve),
         _ => Err(format!("unknown command: {command}\n{}", usage())),
     };
@@ -55,6 +69,30 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
+}
+
+fn parse_replay_init(args: Vec<String>) -> Result<ReplayInitConfig, String> {
+    let mut config = ReplayInitConfig::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = &args[index];
+        index += 1;
+
+        let Some(value) = args.get(index) else {
+            return Err(format!("missing value for {flag}\n{}", usage()));
+        };
+        index += 1;
+
+        match flag.as_str() {
+            "--replay-dir" => config.replay_dir = Some(PathBuf::from(value)),
+            "--max-candidates" => config.max_candidates = parse_usize(flag, value)?,
+            _ => return Err(format!("unknown flag: {flag}\n{}", usage())),
+        }
+    }
+
+    config.validate()?;
+    Ok(config)
 }
 
 fn parse_replay_serve(args: Vec<String>) -> Result<ReplayServeConfig, String> {
@@ -112,7 +150,6 @@ fn parse_selfplay(args: Vec<String>) -> Result<SelfplayConfig, String> {
             "--reference" => config.reference = value.parse()?,
             "--root-mode" => config.root_mode = value.parse()?,
             "--reference-ema-decay" => config.reference_ema_decay = parse_f32(flag, value)?,
-            "--reference-gamma" => config.reference_gamma = parse_f32(flag, value)?,
             "--evaluator" => config.evaluator = value.parse()?,
             "--python-dir" => config.python_dir = Some(PathBuf::from(value)),
             "--checkpoint-dir" => config.checkpoint_dir = Some(PathBuf::from(value)),
@@ -138,6 +175,7 @@ fn parse_selfplay(args: Vec<String>) -> Result<SelfplayConfig, String> {
             "--mask-stop" => config.mask_stop = parse_bool(flag, value)?,
             "--length-tiebreak" => config.length_tiebreak = parse_bool(flag, value)?,
             "--eval-processes" => config.eval_processes = parse_usize(flag, value)?,
+            "--admission-stagger-ms" => config.admission_stagger_ms = parse_u64(flag, value)?,
             _ => return Err(format!("unknown flag: {flag}\n{}", usage())),
         }
     }
@@ -174,5 +212,5 @@ fn parse_bool(flag: &str, value: &str) -> Result<bool, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: graphzero selfplay --replay-dir PATH [--episodes N; 0 = unbounded] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|self-average|policy|gated-policy|none] [--root-mode generated|fixed] [--reference-ema-decay D] [--reference-gamma G] [--evaluator random|stub|process-stub|torch] [--python-dir PATH] [--checkpoint-dir DIR] [--eval-device DEV] [--eval-poll-interval SECS] [--seed S] [--max-steps M] [--simulations K] [--max-considered M] [--gumbel-scale G] [--gumbel-noise-overlap V; negative disables] [--tree-reuse true|false] [--max-candidates N] [--max-batch B] [--serve-socket PATH] [--serve-max-batch B] [--replay-backlog ROWS] [--replay-retain ROWS] [--position-features true|false] [--no-backtrack true|false] [--mask-stop true|false] [--length-tiebreak true|false] [--eval-processes N]\n       graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B"
+    "usage: graphzero selfplay --replay-dir PATH [--episodes N; 0 = unbounded] [--lanes L] [--workers-per-lane W] [--reference root|greedy|beam|random|self-average|policy|gated-policy|none] [--root-mode generated|fixed] [--reference-ema-decay D] [--evaluator random|stub|process-stub|torch] [--python-dir PATH] [--checkpoint-dir DIR] [--eval-device DEV] [--eval-poll-interval SECS] [--seed S] [--max-steps M] [--simulations K] [--max-considered M] [--gumbel-scale G] [--gumbel-noise-overlap V; negative disables] [--tree-reuse true|false] [--max-candidates N] [--max-batch B] [--serve-socket PATH] [--serve-max-batch B] [--replay-backlog ROWS] [--replay-retain ROWS] [--position-features true|false] [--no-backtrack true|false] [--mask-stop true|false] [--length-tiebreak true|false] [--eval-processes N] [--admission-stagger-ms MS]\n       graphzero replay-init --replay-dir PATH [--max-candidates N]\n       graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B"
 }

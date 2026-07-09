@@ -203,6 +203,7 @@ fn threaded_orchestrator_releases_each_completed_episode() {
             workers_per_lane: NonZeroUsize::new(1).unwrap(),
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
+            admission_stagger: Duration::ZERO,
         },
     );
 

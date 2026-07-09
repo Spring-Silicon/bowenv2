@@ -32,7 +32,6 @@ startup_timeout = 600.0
 reconnect_limit = 5
 log_interval = 10
 step_sleep = 0.0
-bootstrap_episodes = 128
 
 [selfplay]
 lanes = 32
