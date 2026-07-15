@@ -1,0 +1,21 @@
+[queue]
+name = "policy-neutral-graphzero-2026-07-12"
+results_dir = "runs/ablation-policy-neutral-graphzero-2026-07-12"
+poll_seconds = 5.0
+min_free_gb = 40.0
+continue_on_failure = true
+
+[[runs]]
+name = "model42"
+config = "03-model42.toml"
+timeout_seconds = 2400
+
+[[runs]]
+name = "model5"
+config = "01-model5.toml"
+timeout_seconds = 2400
+
+[[runs]]
+name = "model17"
+config = "02-model17.toml"
+timeout_seconds = 2400

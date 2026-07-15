@@ -12,7 +12,7 @@ const NO_NODE: u32 = u32::MAX;
 const AND_IDEMPOTENT_ROW_FINGERPRINT: &str =
     "202e4d6b7a63bd84134531456fedcd3aed03a320c128490936cf26e67f451416";
 const AND_IDEMPOTENT_BATCH_FINGERPRINT: &str =
-    "16f2ca9a2f49ca93300f4c09e4aaf66a4c0cae5b8cd2038e21a4f176b206185f";
+    "d005841a81eaeaf42e4aa0e54ef88b417490e14852cb929e34aa036c87fe863c";
 
 fn and_idempotent_artifact() -> Vec<u8> {
     wav1(1, 16, 2, &[(0, 0, NO_NODE), (2, 0, 0), (5, 1, NO_NODE)])

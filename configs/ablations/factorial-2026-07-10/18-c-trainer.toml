@@ -1,0 +1,25 @@
+extends = "../../bases/benchmark-throughput-r8-screen.toml"
+
+# C: WhittleZero optimizer and sampling semantics on the generic model/search.
+[trainer]
+optimizer = "muon_mixed"
+lr = 0.0002
+adamw_lr = 0.0002
+momentum = 0.95
+nesterov = true
+ns_steps = 5
+lr_schedule = "cosine"
+lr_decay_steps = 800
+min_lr_ratio = 0.1
+batch = 512
+value_batch = 256
+value_window_rows = 5000
+grad_clip = 3.0
+seed = 5
+startup_timeout = 3600.0
+
+[wandb]
+run_name = "ablate-f1-18-c-trainer"
+
+[paths]
+run_dir = "runs/ablate-f1-18-c-trainer"

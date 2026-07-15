@@ -209,21 +209,31 @@ struct CandidateKey([u32; 11]);
 struct Builder {
     include_reverse_constant_folding: bool,
     remaining_capacity: i32,
+    limit: Option<usize>,
     items: Vec<RawCandidate>,
     seen: HashSet<CandidateKey>,
 }
 
 impl Builder {
-    fn new(graph: &GraphBody, include_reverse_constant_folding: bool) -> Self {
+    fn new(
+        graph: &GraphBody,
+        include_reverse_constant_folding: bool,
+        limit: Option<usize>,
+    ) -> Self {
+        let initial_capacity = limit.unwrap_or(1024).min(1024);
         Self {
             include_reverse_constant_folding,
             remaining_capacity: i32::from(graph.capacity) - graph.op.len() as i32,
-            items: Vec::with_capacity(1024),
-            seen: HashSet::with_capacity(2048),
+            limit,
+            items: Vec::with_capacity(initial_capacity),
+            seen: HashSet::with_capacity(initial_capacity.saturating_mul(2)),
         }
     }
 
     fn add(&mut self, rule: RuleId, root: u32, rest: &[u32]) -> Result<(), RuleError> {
+        if self.is_full() {
+            return Ok(());
+        }
         if !self.include_reverse_constant_folding && reverse_constant_folding_rule(rule) {
             return Ok(());
         }
@@ -252,6 +262,10 @@ impl Builder {
         }
 
         Ok(())
+    }
+
+    fn is_full(&self) -> bool {
+        self.limit.is_some_and(|limit| self.items.len() >= limit)
     }
 }
 
@@ -407,7 +421,15 @@ pub(crate) fn enumerate_graph(
     graph: &GraphBody,
     include_reverse_constant_folding: bool,
 ) -> Result<Vec<RawCandidate>, RuleError> {
-    let mut out = Builder::new(graph, include_reverse_constant_folding);
+    enumerate_graph_limited(graph, include_reverse_constant_folding, None)
+}
+
+pub(crate) fn enumerate_graph_limited(
+    graph: &GraphBody,
+    include_reverse_constant_folding: bool,
+    limit: Option<usize>,
+) -> Result<Vec<RawCandidate>, RuleError> {
+    let mut out = Builder::new(graph, include_reverse_constant_folding, limit);
     let n = graph.op.len();
     let ops = &graph.op;
     let arg0 = &graph.arg0;
@@ -482,6 +504,9 @@ pub(crate) fn enumerate_graph(
     };
 
     for root in 0..n as u32 {
+        if out.is_full() {
+            break;
+        }
         let op = ops[root as usize];
         let left = arg0[root as usize];
         let right = arg1[root as usize];
@@ -815,6 +840,9 @@ pub(crate) fn enumerate_graph(
     }
 
     for root in 0..n as u32 {
+        if out.is_full() {
+            break;
+        }
         let op = ops[root as usize];
         if op == OpCode::Output {
             continue;
@@ -848,6 +876,9 @@ pub(crate) fn enumerate_graph(
             }
 
             for witness in 0..n as u32 {
+                if out.is_full() {
+                    break;
+                }
                 let inner = not_signals[witness as usize];
                 if inner < 0 {
                     continue;

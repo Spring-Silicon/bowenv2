@@ -1,7 +1,7 @@
 mod common;
 
 use common::{episode_with_feature_rows, episode_with_rows, feature_schema_config, measure};
-use gz_replay::{ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig};
+use gz_replay::{ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 
 #[test]
@@ -14,6 +14,143 @@ fn append_then_read_back_episode() {
 
     assert_eq!(id, ReplayEpisodeId::new(0));
     assert_eq!(store.episode(id).unwrap(), Some(record));
+}
+
+#[test]
+fn competitive_pair_is_atomic_and_counts_as_one_game() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let (primary_record, primary_rows) = episode_with_rows(2);
+    let (secondary_record, secondary_rows) = episode_with_rows(3);
+
+    let ids = store
+        .append_episode_pair(
+            (&primary_record, &primary_rows),
+            (&secondary_record, &secondary_rows),
+        )
+        .unwrap();
+
+    assert_eq!(ids, (ReplayEpisodeId::new(0), ReplayEpisodeId::new(1)));
+    assert_eq!(store.episode_counters(), (1, 0));
+    assert_eq!(store.counters().produced_rows, 5);
+    assert_eq!(store.episode(ids.0).unwrap(), Some(primary_record));
+    assert_eq!(store.episode(ids.1).unwrap(), Some(secondary_record));
+
+    drop(store);
+    let reopened = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.episode_counters(), (1, 0));
+    assert_eq!(reopened.outcome_emas().unwrap().0, -5.0);
+    assert_eq!(reopened.best_cost(), Some(-5.0));
+}
+
+#[test]
+fn rejected_competitive_pair_writes_neither_record() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let (primary_record, primary_rows) = episode_with_rows(1);
+    let (mut secondary_record, secondary_rows) = episode_with_rows(1);
+    secondary_record.row_count = 2;
+
+    assert_eq!(
+        store
+            .append_episode_pair(
+                (&primary_record, &primary_rows),
+                (&secondary_record, &secondary_rows),
+            )
+            .unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+    assert_eq!(store.episode_counters(), (0, 0));
+    assert_eq!(store.counters().produced_rows, 0);
+    assert_eq!(store.episode(ReplayEpisodeId::new(0)).unwrap(), None);
+}
+
+#[test]
+fn replay_data_mode_prevents_standard_and_sampled_tree_mixing() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store.ensure_data_mode(ReplayDataMode::SampledTree).unwrap();
+    store.ensure_data_mode(ReplayDataMode::SampledTree).unwrap();
+    assert_eq!(
+        store
+            .ensure_data_mode(ReplayDataMode::Standard)
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
+    drop(store);
+    let reopened = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened
+            .ensure_data_mode(ReplayDataMode::Standard)
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
+
+    let legacy_dir = common::temp_dir();
+    let legacy = ReplayStore::open(legacy_dir.path()).unwrap();
+    let (record, rows) = episode_with_rows(1);
+    legacy.append_episode(&record, &rows).unwrap();
+    assert_eq!(
+        legacy
+            .ensure_data_mode(ReplayDataMode::SampledTree)
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
+    legacy.ensure_data_mode(ReplayDataMode::Standard).unwrap();
+}
+
+#[test]
+fn graded_data_mode_accepts_fractional_targets_and_isolates_reward_scale() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let mode = ReplayDataMode::graded(false, 0.1).unwrap();
+    store.ensure_data_mode(mode).unwrap();
+    let (mut record, mut rows) = episode_with_rows(1);
+    record.outcome.value_target = Some(0.5);
+    rows[0].value_target = Some(0.5);
+
+    store.append_episode(&record, &rows).unwrap();
+    assert_eq!(
+        store
+            .ensure_data_mode(ReplayDataMode::graded(false, 0.2).unwrap())
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
+    assert_eq!(
+        store
+            .ensure_data_mode(ReplayDataMode::graded(true, 0.1).unwrap())
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
+    drop(store);
+
+    let reopened = ReplayStore::open(dir.path()).unwrap();
+    reopened.ensure_data_mode(mode).unwrap();
+    assert_eq!(
+        reopened
+            .ensure_data_mode(ReplayDataMode::Standard)
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
+}
+
+#[test]
+fn graded_data_mode_rejects_non_finite_out_of_range_and_wrong_sign_targets() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store
+        .ensure_data_mode(ReplayDataMode::graded(false, 0.1).unwrap())
+        .unwrap();
+
+    for target in [f32::NAN, f32::INFINITY, -1.1, 1.1, -0.5] {
+        let (mut record, mut rows) = episode_with_rows(1);
+        record.outcome.value_target = Some(target);
+        rows[0].value_target = Some(target);
+        assert_eq!(
+            store.append_episode(&record, &rows).unwrap_err(),
+            ReplayError::InvalidRecord
+        );
+    }
 }
 
 #[test]
@@ -405,6 +542,39 @@ fn outcome_emas_track_recent_episodes() {
         (cost2 - cost).abs() < 1e-9,
         "same outcome keeps the EMA fixed"
     );
+}
+
+#[test]
+fn terminal_cost_telemetry_survives_reopen() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let (record, rows) = episode_with_rows(2);
+    store.append_episode(&record, &rows).unwrap();
+    let expected_cost = f64::from(-record.outcome.learner_reward);
+    assert_eq!(store.outcome_emas().unwrap().0, expected_cost);
+    assert_eq!(store.best_cost(), Some(expected_cost));
+
+    drop(store);
+    let reopened = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.outcome_emas().unwrap().0, expected_cost);
+    assert_eq!(reopened.best_cost(), Some(expected_cost));
+
+    let (mut next_record, mut next_rows) = episode_with_rows(2);
+    let next_measure = measure(Some(7.0), true, true);
+    next_record.final_measure = next_measure.clone();
+    next_record.outcome.learner_reward = 7.0;
+    for row in &mut next_rows {
+        row.final_measure = next_measure.clone();
+        row.reward_target = Some(7.0);
+    }
+    reopened.append_episode(&next_record, &next_rows).unwrap();
+    assert!((reopened.outcome_emas().unwrap().0 - -5.02).abs() < 1e-9);
+    assert_eq!(reopened.best_cost(), Some(-7.0));
+
+    drop(reopened);
+    let reopened = ReplayStore::open(dir.path()).unwrap();
+    assert!((reopened.outcome_emas().unwrap().0 - -5.02).abs() < 1e-9);
+    assert_eq!(reopened.best_cost(), Some(-7.0));
 }
 
 #[test]

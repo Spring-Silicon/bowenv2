@@ -5,9 +5,10 @@ use common::{TestEngine, measure_options};
 use gz_engine::{CandidateOptions, GraphEngine, ModelVersion};
 use gz_eval::EvalOutput;
 use gz_search::{
-    EngineIdentity, EvalWork, ExpandResult, ExpandedCandidate, GumbelEpisodeContext,
-    GumbelEpisodeTask, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext, GumbelRootTask,
-    GumbelSearchContext, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
+    CategoricalPolicyEpisodeTask, EngineIdentity, EvalWork, ExpandResult, ExpandedCandidate,
+    GumbelEpisodeContext, GumbelEpisodeTask, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext,
+    GumbelRootTask, GumbelSearchContext, SearchAction, SearchPoll, SearchWork, SearchWorkResult,
+    WorkToken,
 };
 use std::num::NonZeroUsize;
 
@@ -119,6 +120,75 @@ fn root_task_first_emits_expand_then_eval() {
     assert_eq!(eval.graph, 0);
     assert_eq!(eval.candidates, vec![1, 2]);
     assert_eq!(eval.request.action_count(), 3);
+}
+
+#[test]
+fn categorical_policy_task_ranks_once_and_skips_rejected_actions() {
+    let mut engine = TestEngine::new()
+        .candidates(0, [1, 2])
+        .rejected(0, 1)
+        .apply(0, 2, 2)
+        .reward(2, 7.0);
+    let mut rollout_config = config(1);
+    rollout_config.no_backtrack = true;
+    let search = GumbelMcts::new(rollout_config).categorical_policy_rollout();
+    let mut task = CategoricalPolicyEpisodeTask::new(
+        &search,
+        EngineIdentity::from_engine(&engine),
+        0,
+        GumbelEpisodeContext {
+            noise_seed: 19,
+            opponent: None,
+        },
+    );
+
+    let expand = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Expand(work)) => work,
+        other => panic!("expected expand, got {other:?}"),
+    };
+    task.resume(
+        expand.token,
+        SearchWorkResult::Expand(expand_result(&mut engine, expand.graph, expand.options)),
+    )
+    .unwrap();
+    let eval = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Eval(work)) => work,
+        other => panic!("expected eval, got {other:?}"),
+    };
+    task.resume(
+        eval.token,
+        SearchWorkResult::Eval(output_with_logits(vec![100.0, 0.0, -100.0], 0.25)),
+    )
+    .unwrap();
+
+    for expected_candidate in [1, 2] {
+        let apply = match task.poll().unwrap() {
+            SearchPoll::Work(SearchWork::Apply(work)) => work,
+            other => panic!("expected apply, got {other:?}"),
+        };
+        assert_eq!(apply.candidate, expected_candidate);
+        let result = GraphEngine::apply(&mut engine, apply.graph, apply.candidate).unwrap();
+        task.resume(apply.token, SearchWorkResult::Apply(result))
+            .unwrap();
+    }
+    assert_eq!(task.take_releasable().graphs, vec![0]);
+
+    let measure = match task.poll().unwrap() {
+        SearchPoll::Work(SearchWork::Measure(work)) => work,
+        other => panic!("expected measure, got {other:?}"),
+    };
+    let result = engine.measure(measure.graph, measure.options).unwrap();
+    task.resume(measure.token, SearchWorkResult::Measure(result))
+        .unwrap();
+    let episode = match task.poll().unwrap() {
+        SearchPoll::Done(episode) => episode,
+        other => panic!("expected done, got {other:?}"),
+    };
+
+    assert_eq!(engine.apply_calls, vec![(0, 1), (0, 2)]);
+    assert_eq!(episode.steps.len(), 1);
+    assert_eq!(episode.steps[0].action, SearchAction::Candidate(2));
+    assert_eq!(episode.final_measure.scalar_reward, Some(7.0));
 }
 
 #[test]

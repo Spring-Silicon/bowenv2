@@ -1,0 +1,16 @@
+extends = "../../bases/gated-pool32-s42-throughput.toml"
+
+[trainer]
+policy_init = "neutral"
+model_seed = 17
+data_seed = 42
+lr_schedule = "cosine"
+lr_decay_steps = 800
+min_lr_ratio = 0.1
+total_steps = 1000
+
+[wandb]
+run_name = "uniform-gz-i3-cosine-s17-1"
+
+[paths]
+run_dir = "runs/uniform-gz-i3-cosine-s17-1"

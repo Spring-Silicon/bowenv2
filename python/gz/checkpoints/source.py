@@ -22,19 +22,21 @@ class CheckpointSource(ABC):
 
 
 class DirectorySource(CheckpointSource):
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, pointer: str | Path = "latest.json") -> None:
         self.root = Path(root)
+        pointer_path = Path(pointer)
+        self.pointer = pointer_path if pointer_path.is_absolute() else self.root / pointer_path
 
     def resolve_latest(self) -> ResolvedCheckpoint:
-        latest_path = self.root / "latest.json"
+        latest_path = self.pointer
         try:
             latest = json.loads(latest_path.read_text(encoding="utf-8"))
         except FileNotFoundError as error:
-            raise ManifestError("missing latest.json") from error
+            raise ManifestError(f"missing {latest_path.name}") from error
         except json.JSONDecodeError as error:
-            raise ManifestError("invalid latest.json") from error
+            raise ManifestError(f"invalid {latest_path.name}") from error
         if not isinstance(latest, dict) or set(latest) != {"version_dir", "model_version"}:
-            raise ManifestError("latest fields mismatch")
+            raise ManifestError("checkpoint pointer fields mismatch")
         version_dir = latest["version_dir"]
         model_version_hex = latest["model_version"]
         if not isinstance(version_dir, str) or "/" in version_dir or not version_dir:
@@ -43,7 +45,7 @@ class DirectorySource(CheckpointSource):
             raise ManifestError("bad latest model_version")
         resolved = self.resolve_version(version_dir)
         if resolved.manifest.model_version.hex() != model_version_hex:
-            raise ManifestError("latest model_version mismatch")
+            raise ManifestError("checkpoint pointer model_version mismatch")
         return resolved
 
     def resolve_version(self, version_dir: str) -> ResolvedCheckpoint:

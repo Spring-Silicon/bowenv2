@@ -1,0 +1,16 @@
+extends = "../../bases/distill-generated-reducing-uniform-gz.toml"
+
+[arch]
+dim = 256
+layers = 5
+heads = 8
+ffn_dim = 896
+
+[trainer]
+total_steps = 1280
+
+[wandb]
+run_name = "distill-generated-reducing-uniform-10m-1280-1"
+
+[paths]
+run_dir = "runs/distill-generated-reducing-uniform-10m-1280-1"

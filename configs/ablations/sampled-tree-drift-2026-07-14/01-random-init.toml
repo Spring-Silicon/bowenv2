@@ -1,0 +1,18 @@
+extends = "../../bases/whittle-generated-exphormer-v2-sampled-tree.toml"
+
+[arch]
+value_head = "scalar"
+
+[trainer]
+init_checkpoint = ""
+init_checkpoint_scope = "all"
+
+[selfplay]
+value_reward = "sign"
+
+[wandb]
+run_name = "whittle-generated-exphormer-v2-sampled-tree-2-c8-sign-random-init"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-v2-sampled-tree-2-c8-sign-random-init"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/whittle-generated-exphormer-v2-sampled-tree-2-c8-sign-random-init"

@@ -1,0 +1,15 @@
+[queue]
+name = "pool32-causal-stage11-2026-07-10"
+results_dir = "runs/ablation-pool32-causal-stage11-2026-07-10"
+poll_seconds = 5.0
+min_free_gb = 100.0
+continue_on_failure = false
+
+[[runs]]
+name = "minimal-trainer-graphzero-sage"
+config = "11-minimal-trainer-graphzero-sage.toml"
+timeout_seconds = 7200
+early_stop = [
+  { step = 1000, window = 5, terminal_cost_mean_gt = 130.0, policy_loss_gt = 6.55 },
+  { step = 1500, window = 5, terminal_cost_mean_gt = 110.0 },
+]

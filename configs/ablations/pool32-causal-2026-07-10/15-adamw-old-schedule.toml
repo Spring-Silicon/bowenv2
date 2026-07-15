@@ -1,0 +1,19 @@
+extends = "../../bases/gated-pool32-legacy-screen.toml"
+
+# Optimizer/schedule 2x2: AdamW with the historical LR schedule.
+[trainer]
+optimizer = "adamw"
+lr = 0.0002
+adamw_lr = 0.0002
+lr_schedule = "cosine"
+lr_decay_steps = 800
+min_lr_ratio = 0.1
+seed = 5
+batch = 512
+total_steps = 1500
+
+[wandb]
+run_name = "pool32-causal-adamw-old-schedule-1"
+
+[paths]
+run_dir = "runs/pool32-causal-adamw-old-schedule-1"

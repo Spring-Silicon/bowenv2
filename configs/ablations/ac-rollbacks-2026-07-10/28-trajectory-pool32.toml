@@ -1,0 +1,20 @@
+extends = "../../bases/benchmark-ac-r8-screen.toml"
+
+# Episode-level approximation of policy-based self-competition's sampled
+# opponent: the greedy rollout still gates checkpoints, while learner episodes
+# draw one complete stochastic trajectory from the accepted policy's pool.
+[trainer]
+value_batch = 0
+value_window_rows = 0
+total_steps = 10000
+resume = true
+
+[selfplay]
+reference_trajectory_pool = 32
+
+[wandb]
+run_name = "ablate-r1-28-ac-trajectory-pool32"
+run_id = "anl0npc5"
+
+[paths]
+run_dir = "runs/ablate-r1-28-ac-trajectory-pool32"

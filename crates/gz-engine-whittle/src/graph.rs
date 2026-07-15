@@ -170,7 +170,6 @@ pub struct WhittleGraph {
     pub op: Box<[OpCode]>,
     pub arg0: Box<[u32]>,
     pub arg1: Box<[u32]>,
-    pub canonical: Box<[u8]>,
     pub hash: GraphHash,
 }
 
@@ -406,17 +405,46 @@ fn push_children(graph: &GraphBody, node: u32, out: &mut Vec<u32>) -> Result<(),
 }
 
 pub(crate) fn serialize_wav1(graph: &GraphBody) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16 + graph.op.len() * 9);
-    out.extend_from_slice(b"WAV1");
-    out.extend_from_slice(&graph.arity.to_le_bytes());
-    out.extend_from_slice(&graph.capacity.to_le_bytes());
-    out.extend_from_slice(&(graph.op.len() as u32).to_le_bytes());
-    out.extend_from_slice(&graph.output_node.to_le_bytes());
+    serialize_wav1_parts(
+        graph.arity,
+        graph.capacity,
+        graph.output_node,
+        &graph.op,
+        &graph.arg0,
+        &graph.arg1,
+    )
+}
 
-    for i in 0..graph.op.len() {
-        out.push(graph.op[i].as_i8() as u8);
-        out.extend_from_slice(&graph.arg0[i].to_le_bytes());
-        out.extend_from_slice(&graph.arg1[i].to_le_bytes());
+pub(crate) fn serialize_whittle_graph_wav1(graph: &WhittleGraph) -> Vec<u8> {
+    serialize_wav1_parts(
+        graph.arity,
+        graph.capacity,
+        graph.output_node,
+        &graph.op,
+        &graph.arg0,
+        &graph.arg1,
+    )
+}
+
+fn serialize_wav1_parts(
+    arity: u16,
+    capacity: u16,
+    output_node: u32,
+    op: &[OpCode],
+    arg0: &[u32],
+    arg1: &[u32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + op.len() * 9);
+    out.extend_from_slice(b"WAV1");
+    out.extend_from_slice(&arity.to_le_bytes());
+    out.extend_from_slice(&capacity.to_le_bytes());
+    out.extend_from_slice(&(op.len() as u32).to_le_bytes());
+    out.extend_from_slice(&output_node.to_le_bytes());
+
+    for i in 0..op.len() {
+        out.push(op[i].as_i8() as u8);
+        out.extend_from_slice(&arg0[i].to_le_bytes());
+        out.extend_from_slice(&arg1[i].to_le_bytes());
     }
 
     out

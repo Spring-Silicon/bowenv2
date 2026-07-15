@@ -6,8 +6,8 @@ use gz_engine::{
 };
 use gz_eval::{EvalOutput, EvalRequest, EvalResult, Evaluator};
 use gz_orchestrator::{
-    CountedRoots, SerialGumbelOrchestrator, ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig,
-    WorkerId,
+    CountedRoots, RootSource, SerialGumbelOrchestrator, ThreadedGumbelOrchestrator,
+    ThreadedOrchestratorConfig, WorkerId,
 };
 use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
 use std::num::NonZeroUsize;
@@ -153,6 +153,24 @@ impl GraphEngine for ReleaseEngine {
 #[derive(Clone, Copy)]
 struct PickCandidate;
 
+struct OwnedRoot {
+    remaining: bool,
+}
+
+impl RootSource<ReleaseEngine> for OwnedRoot {
+    fn next_root(&mut self, engine: &mut ReleaseEngine) -> EngineResult<Option<u8>> {
+        if !self.remaining {
+            return Ok(None);
+        }
+        self.remaining = false;
+        Ok(Some(engine.root()))
+    }
+
+    fn episode_roots_are_owned(&self) -> bool {
+        true
+    }
+}
+
 impl Evaluator for PickCandidate {
     fn evaluate_batch(
         &mut self,
@@ -204,6 +222,7 @@ fn threaded_orchestrator_releases_each_completed_episode() {
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
             admission_stagger: Duration::ZERO,
+            admission_smoothing: None,
         },
     );
 
@@ -226,6 +245,34 @@ fn threaded_orchestrator_releases_each_completed_episode() {
             (vec![1], vec![])
         ]
     );
+}
+
+#[test]
+fn threaded_orchestrator_releases_owned_episode_root() {
+    let log = ReleaseLog::default();
+    let engine = ReleaseEngine::new(log.clone());
+    let orchestrator = ThreadedGumbelOrchestrator::new(
+        vec![engine],
+        PickCandidate,
+        search(),
+        ThreadedOrchestratorConfig {
+            workers_per_lane: NonZeroUsize::new(1).unwrap(),
+            max_batch: NonZeroUsize::new(1).unwrap(),
+            flush_after: Duration::from_millis(1),
+            admission_stagger: Duration::ZERO,
+            admission_smoothing: None,
+        },
+    );
+
+    let run = orchestrator
+        .run(
+            vec![OwnedRoot { remaining: true }],
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(run.lanes[0].episodes[0].episode.created_graphs, vec![0, 1]);
+    assert_eq!(log.entries(), vec![(vec![], vec![1]), (vec![0, 1], vec![])]);
 }
 
 fn search() -> GumbelMcts {

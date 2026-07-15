@@ -19,6 +19,7 @@ pub struct SerialGumbelOrchestrator<E, V> {
 pub struct OrchestratedEpisode<G, C> {
     pub worker_id: WorkerId,
     pub episode_id: EpisodeId,
+    pub evaluations: u64,
     pub episode: GumbelEpisode<G, C>,
 }
 
@@ -58,6 +59,7 @@ where
             ..context
         };
         let mut task = GumbelEpisodeTask::new(&self.search, identity, root, context);
+        let mut evaluations = 0;
 
         loop {
             let poll = match task.poll() {
@@ -70,6 +72,7 @@ where
             match poll {
                 SearchPoll::Work(work) => {
                     self.release_handles(task.take_releasable())?;
+                    evaluations += u64::from(matches!(&work, gz_search::SearchWork::Eval(_)));
                     let token = work.token();
                     let result = match service_work(&mut self.engine, &mut self.evaluator, work) {
                         Ok(result) => result,
@@ -96,6 +99,7 @@ where
                     return Ok(OrchestratedEpisode {
                         worker_id: self.worker_id,
                         episode_id,
+                        evaluations,
                         episode,
                     });
                 }

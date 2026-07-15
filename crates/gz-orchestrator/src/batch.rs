@@ -54,6 +54,8 @@ where
                     search: &self.search,
                     identity,
                     context,
+                    sampled_tree: false,
+                    pressure_reserved: false,
                     next_episode_id: &mut next_episode_id,
                 };
                 roots_exhausted = pool.admit(

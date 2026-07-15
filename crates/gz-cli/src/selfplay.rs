@@ -8,25 +8,29 @@ use gz_eval_service::{
     EvaluatorProcess, EvaluatorProcessConfig, Hello, STUB_MODEL_VERSION, StubBackend,
 };
 use gz_features::{FeatureExtractor, FeatureSchemaHash, PositionFeatures};
-use gz_measurer::{MeasureLedgerSnapshot, ReferenceRegistry};
+use gz_measurer::{ArenaGateRegistry, MeasureLedgerSnapshot, ReferenceRegistry, ValueTargetConfig};
 use gz_orchestrator::reference::{
-    BeamReferenceProvider, GreedyReferenceProvider, PolicyReferenceProvider,
-    RandomReferenceProvider, Reference, ReferenceProvider, RolloutOutcome, RootBaselineProvider,
-    SelfAverageProvider,
+    ArenaRolloutClaim, BeamReferenceProvider, EpisodeRolloutClaim, GreedyReferenceProvider,
+    PolicyReferenceProvider, RandomReferenceProvider, Reference, ReferenceProvider, RolloutOutcome,
+    RootBaselineProvider, SelfAverageProvider,
 };
 use gz_orchestrator::{
-    FeaturizedRuntime, ReplayBackpressure, ReplayRuntime, RootSource, ThreadedGumbelOrchestrator,
-    ThreadedOrchestratorConfig,
+    AdmissionSmoothingConfig, FeaturizedRuntime, ReplayBackpressure, ReplayRuntime, RootSource,
+    ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig,
 };
-use gz_replay::{ReplayCounters, ReplayEpisodeId, ReplayRootInfo, ReplayStore};
+use gz_replay::{ReplayCounters, ReplayDataMode, ReplayEpisodeId, ReplayRootInfo, ReplayStore};
 use gz_search::{
     BeamSearch, BeamSearchConfig, GreedySearch, GreedySearchConfig, GumbelEpisodeContext,
     GumbelMcts, GumbelMctsConfig, RandomSearch, RandomSearchConfig,
 };
-use std::num::NonZeroUsize;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 const WHITTLE_FEATURE_MAX_ENGINE_CANDIDATES: usize = 255;
@@ -40,17 +44,45 @@ pub struct SelfplayConfig {
     pub reference: ReferenceMode,
     pub root_mode: RootMode,
     pub reference_ema_decay: f32,
+    /// Fraction of admitted references drawn from the latest measured
+    /// challenger instead of the gated best. Gated-policy only.
+    pub reference_gamma: f32,
+    /// Number of stochastic trajectories retained for the accepted policy.
+    /// Learner episodes sample one complete trajectory from this pool; zero
+    /// preserves the deterministic greedy reference.
+    pub reference_trajectory_pool: usize,
+    /// Fixed generated-root arena used to gate the historical opponent.
+    /// Zero keeps the legacy fixed-root gate.
+    pub reference_arena_size: usize,
+    pub reference_arena_seed: u64,
+    /// Checkpoint pointer followed by the frozen incumbent evaluator.
+    pub reference_checkpoint_pointer: Option<PathBuf>,
+    /// Checkpoint pointer followed by the pinned arena challenger evaluator.
+    pub reference_challenger_checkpoint_pointer: Option<PathBuf>,
+    /// How a policy checkpoint supplies the opponent. None preserves the
+    /// legacy trajectory/pool behavior for old configs.
+    pub policy_opponent_mode: Option<PolicyOpponentMode>,
+    /// Optional STOP-masking override for the policy reference rollout.
+    /// None inherits the learner's mask_stop setting.
+    pub reference_mask_stop: Option<bool>,
     pub seed: u64,
     pub max_steps: usize,
     pub simulations: usize,
     pub max_considered: usize,
     pub gumbel_scale: f32,
+    pub c_visit: f32,
+    pub c_scale: f32,
     /// Auto-temper root noise to the policy's sharpness (whittlezero's
     /// overlap); negative disables and the fixed gumbel_scale applies.
     pub gumbel_noise_overlap: f32,
     pub tree_reuse: bool,
     pub max_candidates: usize,
     pub max_batch: usize,
+    /// Incumbent evaluator batch capacity. None inherits max_batch.
+    pub reference_max_batch: Option<usize>,
+    /// Arena challenger evaluator batch capacity. None inherits the
+    /// incumbent evaluator capacity.
+    pub challenger_max_batch: Option<usize>,
     pub evaluator: EvaluatorMode,
     pub python_dir: Option<PathBuf>,
     pub checkpoint_dir: Option<PathBuf>,
@@ -69,19 +101,25 @@ pub struct SelfplayConfig {
     pub no_backtrack: bool,
     /// Mask STOP out of the learner's search wherever a rewrite exists
     /// (STOP-only nodes keep it); episodes then run to the step budget.
-    /// Reference rollouts always mask STOP regardless.
+    /// Policy rollouts inherit `mask_stop` from the learner configuration.
     pub mask_stop: bool,
     /// Break equal-reward games by episode length (shorter wins) before
     /// the coin flip: whittlezero's duration tiebreak, discrete form.
     pub length_tiebreak: bool,
+    /// Pair-outcome target: hard win/loss signs or WhittleZero's graded
+    /// root-normalized reward margin.
+    pub value_reward: ValueReward,
+    pub value_reward_scale: f32,
     /// Evaluator processes to spawn and stripe lanes across (featurized
     /// evaluators only). Each process parallelizes per-batch host work
     /// on its own interpreter and keeps the GPU kernel queue dense.
     pub eval_processes: usize,
-    /// Minimum wall-clock spacing between new root episodes admitted
-    /// within a lane. Nonzero startup-ramp values spread worker cohorts
-    /// instead of launching every lane slot at once.
+    /// Wall-clock spacing between learner-root admissions on each lane.
+    /// Lane phase offsets spread admissions globally and are reapplied
+    /// after a closed gate; zero disables pacing.
     pub admission_stagger_ms: u64,
+    /// Pace learner-root admissions at measured evaluator capacity.
+    pub admission_smoothing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,15 +166,27 @@ impl Default for SelfplayConfig {
             reference: ReferenceMode::Root,
             root_mode: RootMode::Generated,
             reference_ema_decay: 0.99,
+            reference_gamma: 0.0,
+            reference_trajectory_pool: 0,
+            reference_arena_size: 0,
+            reference_arena_seed: 910_000_001,
+            reference_checkpoint_pointer: None,
+            reference_challenger_checkpoint_pointer: None,
+            policy_opponent_mode: None,
+            reference_mask_stop: None,
             seed: 0,
             max_steps: 8,
             simulations: 8,
             max_considered: 16,
             gumbel_scale: 0.0,
+            c_visit: 50.0,
+            c_scale: 1.0,
             gumbel_noise_overlap: -1.0,
             tree_reuse: true,
             max_candidates: WHITTLE_FEATURE_MAX_ENGINE_CANDIDATES,
             max_batch: 16,
+            reference_max_batch: None,
+            challenger_max_batch: None,
             evaluator: EvaluatorMode::Random,
             python_dir: None,
             checkpoint_dir: None,
@@ -150,8 +200,11 @@ impl Default for SelfplayConfig {
             no_backtrack: false,
             mask_stop: false,
             length_tiebreak: false,
+            value_reward: ValueReward::Sign,
+            value_reward_scale: 0.1,
             eval_processes: 1,
             admission_stagger_ms: 0,
+            admission_smoothing: false,
         }
     }
 }
@@ -170,11 +223,23 @@ impl SelfplayConfig {
         if self.max_steps == 0 {
             return Err("--max-steps must be greater than zero".to_owned());
         }
+        if !self.c_visit.is_finite() || self.c_visit < 0.0 {
+            return Err("--c-visit must be finite and non-negative".to_owned());
+        }
+        if !self.c_scale.is_finite() || self.c_scale < 0.0 {
+            return Err("--c-scale must be finite and non-negative".to_owned());
+        }
         if self.simulations == 0 {
             return Err("--simulations must be greater than zero".to_owned());
         }
         if self.max_batch == 0 {
             return Err("--max-batch must be greater than zero".to_owned());
+        }
+        if self.reference_max_batch == Some(0) {
+            return Err("--reference-max-batch must be greater than zero".to_owned());
+        }
+        if self.challenger_max_batch == Some(0) {
+            return Err("--challenger-max-batch must be greater than zero".to_owned());
         }
         if self.max_candidates == 0 {
             return Err("--max-candidates must be greater than zero".to_owned());
@@ -200,6 +265,179 @@ impl SelfplayConfig {
                 "--reference self-average requires --reference-ema-decay in (0, 1)".to_owned(),
             );
         }
+        if !self.reference_gamma.is_finite()
+            || self.reference_gamma < 0.0
+            || self.reference_gamma >= 1.0
+        {
+            return Err("--reference-gamma must be in [0, 1)".to_owned());
+        }
+        if let Some(mode) = self.policy_opponent_mode {
+            match mode {
+                PolicyOpponentMode::SampledTrajectory
+                    if self.reference != ReferenceMode::Policy =>
+                {
+                    return Err(
+                        "--policy-opponent-mode sampled-trajectory requires --reference policy"
+                            .to_owned(),
+                    );
+                }
+                PolicyOpponentMode::GreedyTrajectory | PolicyOpponentMode::SampledTree
+                    if self.reference != ReferenceMode::GatedPolicy =>
+                {
+                    return Err(
+                        "--policy-opponent-mode requires --reference gated-policy".to_owned()
+                    );
+                }
+                _ => {}
+            }
+            let generated_arena = matches!(
+                mode,
+                PolicyOpponentMode::GreedyTrajectory | PolicyOpponentMode::SampledTree
+            ) && self.root_mode == RootMode::Generated
+                && self.reference_arena_size > 0;
+            if self.root_mode != RootMode::Fixed && !generated_arena {
+                return Err(
+                    "--policy-opponent-mode requires --root-mode fixed or a generated-root arena"
+                        .to_owned(),
+                );
+            }
+            if self.reference_trajectory_pool > 0 {
+                return Err(
+                    "--policy-opponent-mode cannot be combined with --reference-trajectory-pool"
+                        .to_owned(),
+                );
+            }
+            if mode == PolicyOpponentMode::SampledTrajectory
+                && self.evaluator == EvaluatorMode::Random
+            {
+                return Err(
+                    "--policy-opponent-mode sampled-trajectory requires a featurized evaluator"
+                        .to_owned(),
+                );
+            }
+            if mode == PolicyOpponentMode::SampledTrajectory && self.reference_gamma != 0.0 {
+                return Err(
+                    "--policy-opponent-mode sampled-trajectory requires --reference-gamma 0; active-policy rollouts do not select a historical reference"
+                        .to_owned(),
+                );
+            }
+            if mode == PolicyOpponentMode::SampledTree {
+                if self.reference_gamma != 0.0 {
+                    return Err(
+                        "--policy-opponent-mode sampled-tree requires --reference-gamma 0"
+                            .to_owned(),
+                    );
+                }
+                if self.tree_reuse {
+                    return Err(
+                        "--policy-opponent-mode sampled-tree requires --tree-reuse false"
+                            .to_owned(),
+                    );
+                }
+                if self.evaluator != EvaluatorMode::Torch {
+                    return Err(
+                        "--policy-opponent-mode sampled-tree requires --evaluator torch".to_owned(),
+                    );
+                }
+                if self.eval_processes != 1 {
+                    return Err(
+                        "--policy-opponent-mode sampled-tree requires --eval-processes 1"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        if self.reference_gamma > 0.0 && self.reference != ReferenceMode::GatedPolicy {
+            return Err("--reference-gamma requires --reference gated-policy".to_owned());
+        }
+        if self.reference_trajectory_pool > 0 && self.reference != ReferenceMode::GatedPolicy {
+            return Err("--reference-trajectory-pool requires --reference gated-policy".to_owned());
+        }
+        if self.reference_trajectory_pool > 0 {
+            if !matches!(
+                self.evaluator,
+                EvaluatorMode::ProcessStub | EvaluatorMode::Torch
+            ) {
+                return Err(
+                    "--reference-trajectory-pool requires --evaluator process-stub|torch"
+                        .to_owned(),
+                );
+            }
+            if self.eval_processes != 1 {
+                return Err(
+                    "--reference-trajectory-pool requires --eval-processes 1; opaque model versions cannot order staggered process swaps"
+                        .to_owned(),
+                );
+            }
+        }
+        if self.reference_arena_size > 0
+            && !(self.reference == ReferenceMode::GatedPolicy
+                && self.root_mode == RootMode::Generated
+                && matches!(
+                    self.policy_opponent_mode,
+                    Some(PolicyOpponentMode::GreedyTrajectory | PolicyOpponentMode::SampledTree)
+                ))
+        {
+            return Err(
+                "--reference-arena-size requires generated-root gated-policy greedy-trajectory|sampled-tree"
+                    .to_owned(),
+            );
+        }
+        if self.reference_arena_size > 0 {
+            if self.reference_trajectory_pool > 0 {
+                return Err(
+                    "--reference-arena-size cannot be combined with --reference-trajectory-pool"
+                        .to_owned(),
+                );
+            }
+            if self.evaluator != EvaluatorMode::Torch {
+                return Err("generated-root arena gating requires --evaluator torch".to_owned());
+            }
+            if self.eval_processes != 1 {
+                return Err(
+                    "generated-root arena gating requires --eval-processes 1; opaque model versions cannot order staggered process swaps"
+                        .to_owned(),
+                );
+            }
+        }
+        let sampled_tree = self.policy_opponent_mode == Some(PolicyOpponentMode::SampledTree);
+        let historical_incumbent =
+            self.reference_arena_size > 0 || self.reference_trajectory_pool > 0 || sampled_tree;
+        if historical_incumbent && self.reference_checkpoint_pointer.is_none() {
+            return Err(
+                "historical incumbent evaluation requires --reference-checkpoint-pointer"
+                    .to_owned(),
+            );
+        }
+        if self.reference_checkpoint_pointer.is_some() && !historical_incumbent {
+            return Err(
+                "--reference-checkpoint-pointer requires --reference-arena-size, --reference-trajectory-pool, or sampled-tree"
+                    .to_owned(),
+            );
+        }
+        if self.reference_arena_size > 0 && self.reference_challenger_checkpoint_pointer.is_none() {
+            return Err(
+                "generated-root arena evaluation requires --reference-challenger-checkpoint-pointer"
+                    .to_owned(),
+            );
+        }
+        if self.reference_challenger_checkpoint_pointer.is_some() && self.reference_arena_size == 0
+        {
+            return Err(
+                "--reference-challenger-checkpoint-pointer requires --reference-arena-size"
+                    .to_owned(),
+            );
+        }
+        if self.reference_mask_stop.is_some()
+            && !matches!(
+                self.reference,
+                ReferenceMode::Policy | ReferenceMode::GatedPolicy
+            )
+        {
+            return Err(
+                "--reference-mask-stop requires --reference policy|gated-policy".to_owned(),
+            );
+        }
         if self.serve_socket.is_some() {
             if self.episodes != 0 {
                 return Err("--serve-socket requires --episodes 0 (unbounded)".to_owned());
@@ -215,6 +453,7 @@ impl SelfplayConfig {
             self.reference,
             ReferenceMode::Policy | ReferenceMode::GatedPolicy
         ) && self.root_mode != RootMode::Fixed
+            && self.reference_arena_size == 0
         {
             return Err("--reference policy|gated-policy requires --root-mode fixed".to_owned());
         }
@@ -236,6 +475,11 @@ impl SelfplayConfig {
             && (!interval.is_finite() || interval < 0.0)
         {
             return Err("--eval-poll-interval must be zero (disabled) or positive".to_owned());
+        }
+        if self.reference_arena_size > 0 && self.eval_poll_interval == Some(0.0) {
+            return Err(
+                "generated-root arena gating requires a positive --eval-poll-interval".to_owned(),
+            );
         }
         if self.episodes == 0 && self.serve_socket.is_none() {
             return Err("--episodes 0 (unbounded) requires --serve-socket".to_owned());
@@ -260,11 +504,20 @@ impl SelfplayConfig {
         if self.admission_stagger_ms > u64::MAX / 1_000_000 {
             return Err("--admission-stagger-ms is too large".to_owned());
         }
+        if self.admission_smoothing && self.admission_stagger_ms != 0 {
+            return Err(
+                "--admission-smoothing and --admission-stagger-ms are mutually exclusive"
+                    .to_owned(),
+            );
+        }
         if self.replay_backlog == Some(0) {
             return Err("--replay-backlog must be greater than zero".to_owned());
         }
         if self.replay_retain == Some(0) {
             return Err("--replay-retain must be greater than zero".to_owned());
+        }
+        if !self.value_reward_scale.is_finite() || self.value_reward_scale <= 0.0 {
+            return Err("--value-reward-scale must be finite and positive".to_owned());
         }
 
         Ok(())
@@ -296,12 +549,54 @@ impl SelfplayConfig {
             }
         }
     }
+
+    pub fn reference_evaluator_extra_args(&self) -> Vec<String> {
+        let mut args = self.evaluator_extra_args();
+        if self.evaluator == EvaluatorMode::Torch {
+            args.push("--policy-only".to_owned());
+        }
+        if let Some(pointer) = &self.reference_checkpoint_pointer {
+            args.push("--checkpoint-pointer".to_owned());
+            args.push(pointer.display().to_string());
+        }
+        args
+    }
+
+    pub fn challenger_evaluator_extra_args(&self) -> Vec<String> {
+        let mut args = self.evaluator_extra_args();
+        if self.evaluator == EvaluatorMode::Torch {
+            args.push("--policy-only".to_owned());
+        }
+        if let Some(pointer) = &self.reference_challenger_checkpoint_pointer {
+            args.push("--checkpoint-pointer".to_owned());
+            args.push(pointer.display().to_string());
+        }
+        args
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootMode {
     Generated,
     Fixed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueReward {
+    Sign,
+    Graded,
+}
+
+impl FromStr for ValueReward {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "sign" => Ok(Self::Sign),
+            "graded" => Ok(Self::Graded),
+            _ => Err(format!("unknown value reward: {value}")),
+        }
+    }
 }
 
 impl FromStr for RootMode {
@@ -326,6 +621,26 @@ pub enum ReferenceMode {
     SelfAverage,
     Policy,
     GatedPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyOpponentMode {
+    GreedyTrajectory,
+    SampledTrajectory,
+    SampledTree,
+}
+
+impl FromStr for PolicyOpponentMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "greedy-trajectory" => Ok(Self::GreedyTrajectory),
+            "sampled-trajectory" => Ok(Self::SampledTrajectory),
+            "sampled-tree" => Ok(Self::SampledTree),
+            _ => Err(format!("unknown policy opponent mode: {value}")),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,17 +752,46 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         ReplayStore::open_with_retention(replay_dir, config.replay_retain)
             .map_err(|error| error.to_string())?,
     );
+    store
+        .ensure_data_mode(replay_data_mode(&config)?)
+        .map_err(|error| error.to_string())?;
     let engines = (0..config.lanes)
         .map(|_| WhittleEngine::new(whittle_engine_config()).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let search = search(&engines[0], &config)?;
     let roots = root_sources(&config);
-    let registry = (config.reference == ReferenceMode::GatedPolicy)
-        .then(|| Arc::new(ReferenceRegistry::new()));
+    let arena_registry = (config.reference_arena_size > 0).then(|| {
+        Arc::new(ArenaGateRegistry::new(
+            config.reference_arena_size,
+            config.reference_gamma,
+            config.reference_arena_seed,
+        ))
+    });
+    let registry = match (config.reference, config.policy_opponent_mode) {
+        (ReferenceMode::GatedPolicy, _) if arena_registry.is_none() => {
+            Some(Arc::new(ReferenceRegistry::with_gamma_and_trajectory_pool(
+                config.reference_gamma,
+                config.seed,
+                config.reference_trajectory_pool,
+            )))
+        }
+        (ReferenceMode::Policy, Some(PolicyOpponentMode::SampledTrajectory)) => {
+            Some(Arc::new(ReferenceRegistry::new()))
+        }
+        _ => None,
+    };
     let providers = engines
         .iter()
         .enumerate()
-        .map(|(lane, engine)| provider(engine, &config, lane, registry.as_ref()))
+        .map(|(lane, engine)| {
+            provider(
+                engine,
+                &config,
+                lane,
+                registry.as_ref(),
+                arena_registry.as_ref(),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     if config.root_mode == RootMode::Fixed {
@@ -476,9 +820,32 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
     match config.evaluator {
         EvaluatorMode::Random => run_random(config, store, engines, search, roots, providers),
         EvaluatorMode::Stub => run_stub(config, store, engines, search, roots, providers),
-        EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {
-            run_process(config, store, engines, search, roots, providers)
-        }
+        EvaluatorMode::ProcessStub | EvaluatorMode::Torch => run_process(
+            config,
+            store,
+            engines,
+            search,
+            roots,
+            providers,
+            arena_registry,
+        ),
+    }
+}
+
+fn value_target_config(config: &SelfplayConfig) -> ValueTargetConfig {
+    match config.value_reward {
+        ValueReward::Sign => ValueTargetConfig::Sign,
+        ValueReward::Graded => ValueTargetConfig::graded(config.value_reward_scale),
+    }
+}
+
+fn replay_data_mode(config: &SelfplayConfig) -> Result<ReplayDataMode, String> {
+    let sampled_tree = config.policy_opponent_mode == Some(PolicyOpponentMode::SampledTree);
+    match config.value_reward {
+        ValueReward::Sign if sampled_tree => Ok(ReplayDataMode::SampledTree),
+        ValueReward::Sign => Ok(ReplayDataMode::Standard),
+        ValueReward::Graded => ReplayDataMode::graded(sampled_tree, config.value_reward_scale)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -503,6 +870,7 @@ fn run_random(
             workers_per_lane: nonzero(config.workers_per_lane, "workers_per_lane")?,
             max_batch: nonzero(config.max_batch, "max_batch")?,
             admission_stagger: Duration::from_millis(config.admission_stagger_ms),
+            admission_smoothing: admission_smoothing(&config)?,
             // 3ms: at ~10ms model forwards a 1ms lull shipped partial
             // batches (historical fill averaged 29/128); the deeper
             // in-flight pool refills within this window.
@@ -518,6 +886,7 @@ fn run_random(
                 providers,
                 backpressure: replay_backpressure(&config),
                 length_tiebreak: config.length_tiebreak,
+                value_target: value_target_config(&config),
             },
         )
         .map_err(|error| error.to_string())?;
@@ -550,17 +919,96 @@ fn run_stub(
             FeaturizedRuntime {
                 extractors,
                 backends: vec![StubBackend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
             },
             ReplayRuntime {
                 store: &store,
                 providers,
                 backpressure: replay_backpressure(&config),
                 length_tiebreak: config.length_tiebreak,
+                value_target: value_target_config(&config),
             },
         )
         .map_err(|error| error.to_string())?;
 
     summarize(&store, run, EvaluatorMode::Stub, Some(STUB_MODEL_VERSION))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointPointer {
+    version_dir: String,
+    model_version: String,
+}
+
+struct ArenaPointerWatcher {
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ArenaPointerWatcher {
+    fn start(
+        path: PathBuf,
+        registry: Arc<ArenaGateRegistry>,
+        poll_interval: Duration,
+    ) -> Result<Self, String> {
+        let initial = read_checkpoint_pointer(&path)?;
+        registry.observe_challenger(initial);
+        let (stop, stopped) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut observed = initial;
+            let mut last_error = None;
+            loop {
+                match stopped.recv_timeout(poll_interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                match read_checkpoint_pointer(&path) {
+                    Ok(version) => {
+                        last_error = None;
+                        if version != observed {
+                            observed = version;
+                            registry.observe_challenger(version);
+                            eprintln!("event=arena_pointer_observed model_version={version}");
+                        }
+                    }
+                    Err(error) => {
+                        if last_error.as_deref() != Some(error.as_str()) {
+                            eprintln!("event=arena_pointer_rejected error={error}");
+                            last_error = Some(error);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for ArenaPointerWatcher {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn read_checkpoint_pointer(path: &PathBuf) -> Result<ModelVersion, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let pointer: CheckpointPointer = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if pointer.version_dir.is_empty() || pointer.version_dir.contains('/') {
+        return Err(format!("invalid version_dir in {}", path.display()));
+    }
+    ModelVersion::try_from_hex(&pointer.model_version)
+        .map_err(|error| format!("invalid model_version in {}: {error}", path.display()))
 }
 
 fn run_process(
@@ -570,6 +1018,7 @@ fn run_process(
     search: GumbelMcts,
     roots: Vec<CliRoots>,
     providers: Vec<CliReferenceProvider>,
+    arena_registry: Option<Arc<ArenaGateRegistry>>,
 ) -> Result<SelfplaySummary, String> {
     let extractors = engines
         .iter()
@@ -606,11 +1055,95 @@ fn run_process(
         engines[0].engine_version(),
         engines[0].action_set_hash(),
     );
+    let reference_hello = Hello {
+        batch_capacity: config.reference_max_batch.unwrap_or(config.max_batch) as u32,
+        ..hello
+    };
+    let challenger_hello = Hello {
+        batch_capacity: config
+            .challenger_max_batch
+            .unwrap_or(reference_hello.batch_capacity as usize) as u32,
+        ..hello
+    };
     let mut backends = Vec::with_capacity(processes.len());
     for process in &mut processes {
         backends.push(process.connect(&hello).map_err(|error| error.to_string())?);
     }
     let model_version = backends[0].model_version();
+    let mut reference_processes = Vec::new();
+    let mut reference_backends = Vec::new();
+    if config.reference_checkpoint_pointer.is_some() {
+        reference_processes.reserve(config.eval_processes);
+        for index in 0..config.eval_processes {
+            reference_processes.push(
+                EvaluatorProcess::spawn(EvaluatorProcessConfig {
+                    working_dir: config
+                        .python_dir
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("python")),
+                    socket_path: reference_process_socket_path(index),
+                    ready_timeout: Duration::from_secs(10),
+                    io_timeout: Duration::from_secs(300),
+                    extra_args: config.reference_evaluator_extra_args(),
+                    ..EvaluatorProcessConfig::default()
+                })
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        for process in &mut reference_processes {
+            reference_backends.push(
+                process
+                    .connect(&reference_hello)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    let mut challenger_processes = Vec::new();
+    let mut challenger_backends = Vec::new();
+    if config.reference_challenger_checkpoint_pointer.is_some() {
+        challenger_processes.reserve(config.eval_processes);
+        for index in 0..config.eval_processes {
+            challenger_processes.push(
+                EvaluatorProcess::spawn(EvaluatorProcessConfig {
+                    working_dir: config
+                        .python_dir
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("python")),
+                    socket_path: challenger_process_socket_path(index),
+                    ready_timeout: Duration::from_secs(10),
+                    io_timeout: Duration::from_secs(300),
+                    extra_args: config.challenger_evaluator_extra_args(),
+                    ..EvaluatorProcessConfig::default()
+                })
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        for process in &mut challenger_processes {
+            challenger_backends.push(
+                process
+                    .connect(&challenger_hello)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    if let Some(registry) = &arena_registry {
+        let incumbent_version = reference_backends[0].model_version();
+        let challenger_version = challenger_backends[0].model_version();
+        if !registry.initialize(incumbent_version, model_version, challenger_version) {
+            return Err("arena registry initialization mismatch".to_owned());
+        }
+    }
+    let _arena_pointer_watcher = match (
+        config.reference_challenger_checkpoint_pointer.clone(),
+        arena_registry.as_ref(),
+    ) {
+        (Some(pointer), Some(registry)) => Some(ArenaPointerWatcher::start(
+            pointer,
+            Arc::clone(registry),
+            Duration::from_secs_f32(config.eval_poll_interval.unwrap_or(10.0)),
+        )?),
+        _ => None,
+    };
     let orchestrator = ThreadedGumbelOrchestrator::new(
         engines,
         random_placeholder(&config)?,
@@ -624,16 +1157,25 @@ fn run_process(
             FeaturizedRuntime {
                 extractors,
                 backends,
+                reference_backends,
+                challenger_backends,
             },
             ReplayRuntime {
                 store: &store,
                 providers,
                 backpressure: replay_backpressure(&config),
                 length_tiebreak: config.length_tiebreak,
+                value_target: value_target_config(&config),
             },
         )
         .map_err(|error| error.to_string())?;
     for process in &mut processes {
+        wait_for_process_exit(process)?;
+    }
+    for process in &mut reference_processes {
+        wait_for_process_exit(process)?;
+    }
+    for process in &mut challenger_processes {
         wait_for_process_exit(process)?;
     }
 
@@ -686,11 +1228,35 @@ fn threaded_config(config: &SelfplayConfig) -> Result<ThreadedOrchestratorConfig
         workers_per_lane: nonzero(config.workers_per_lane, "workers_per_lane")?,
         max_batch: nonzero(config.max_batch, "max_batch")?,
         admission_stagger: Duration::from_millis(config.admission_stagger_ms),
+        admission_smoothing: admission_smoothing(config)?,
         // 3ms: at ~10ms model forwards a 1ms lull shipped partial
         // batches (historical fill averaged 29/128); the deeper
         // in-flight pool refills within this window.
         flush_after: Duration::from_millis(3),
     })
+}
+
+fn admission_smoothing(
+    config: &SelfplayConfig,
+) -> Result<Option<AdmissionSmoothingConfig>, String> {
+    if !config.admission_smoothing {
+        return Ok(None);
+    }
+    let max_steps = u64::try_from(config.max_steps)
+        .map_err(|_| "max_steps exceeds admission work range".to_owned())?;
+    let simulations = u64::try_from(config.simulations)
+        .map_err(|_| "simulations exceeds admission work range".to_owned())?;
+    let initial_episode_eval_work = max_steps
+        .checked_mul(
+            simulations
+                .checked_add(1)
+                .ok_or_else(|| "admission work estimate overflow".to_owned())?,
+        )
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| "admission work estimate overflow".to_owned())?;
+    Ok(Some(AdmissionSmoothingConfig {
+        initial_episode_eval_work,
+    }))
 }
 
 fn random_placeholder(config: &SelfplayConfig) -> Result<RandomValueEvaluator, String> {
@@ -704,6 +1270,20 @@ fn random_placeholder(config: &SelfplayConfig) -> Result<RandomValueEvaluator, S
 fn process_socket_path(index: usize) -> PathBuf {
     std::env::temp_dir().join(format!(
         "gz-process-stub-{}-{index}.sock",
+        std::process::id()
+    ))
+}
+
+fn reference_process_socket_path(index: usize) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "gz-process-reference-{}-{index}.sock",
+        std::process::id()
+    ))
+}
+
+fn challenger_process_socket_path(index: usize) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "gz-process-challenger-{}-{index}.sock",
         std::process::id()
     ))
 }
@@ -723,15 +1303,15 @@ fn wait_for_process_exit(process: &mut EvaluatorProcess) -> Result<(), String> {
 }
 
 fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts, String> {
-    Ok(GumbelMcts::new(GumbelMctsConfig {
+    let search = GumbelMcts::new(GumbelMctsConfig {
         max_steps: config.max_steps,
         simulations: nonzero(config.simulations, "simulations")?,
         max_considered_actions: nonzero(config.max_considered, "max_considered")?,
         seed: config.seed,
         gumbel_scale: config.gumbel_scale,
         gumbel_noise_overlap: config.gumbel_noise_overlap,
-        c_visit: 50.0,
-        c_scale: 1.0,
+        c_visit: config.c_visit,
+        c_scale: config.c_scale,
         temperature_moves: 0,
         tree_reuse: config.tree_reuse,
         export_position: config.position_features,
@@ -744,7 +1324,11 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
             }
         },
         measure_options: engine.measure_options(),
-    }))
+    });
+    Ok(match config.reference_mask_stop {
+        Some(mask_stop) => search.with_policy_rollout_mask_stop(mask_stop),
+        None => search,
+    })
 }
 
 fn feature_candidate_options(config: &SelfplayConfig) -> CandidateOptions {
@@ -778,6 +1362,7 @@ fn provider(
     config: &SelfplayConfig,
     lane: usize,
     registry: Option<&Arc<ReferenceRegistry>>,
+    arena_registry: Option<&Arc<ArenaGateRegistry>>,
 ) -> Result<CliReferenceProvider, String> {
     let measure_options = engine.measure_options();
     let provider = match config.reference {
@@ -811,11 +1396,40 @@ fn provider(
         ReferenceMode::SelfAverage => {
             CliReferenceProvider::SelfAverage(SelfAverageProvider::new(config.reference_ema_decay))
         }
-        ReferenceMode::Policy => CliReferenceProvider::Policy(PolicyReferenceProvider::new()),
+        ReferenceMode::Policy => {
+            let provider =
+                if config.policy_opponent_mode == Some(PolicyOpponentMode::SampledTrajectory) {
+                    PolicyReferenceProvider::sampled_trajectory_with_registry(Arc::clone(
+                        registry.expect("sampled-trajectory registry exists"),
+                    ))
+                } else {
+                    PolicyReferenceProvider::new()
+                };
+            CliReferenceProvider::Policy(CliPolicyProvider::new(provider))
+        }
         ReferenceMode::GatedPolicy => {
-            CliReferenceProvider::Policy(PolicyReferenceProvider::gated_with_registry(Arc::clone(
-                registry.expect("gated-policy registry exists"),
-            )))
+            let provider = match arena_registry {
+                Some(registry)
+                    if config.policy_opponent_mode == Some(PolicyOpponentMode::SampledTree) =>
+                {
+                    PolicyReferenceProvider::arena_sampled_tree(Arc::clone(registry))
+                }
+                Some(registry) => PolicyReferenceProvider::arena_gated(Arc::clone(registry)),
+                None if config.policy_opponent_mode == Some(PolicyOpponentMode::SampledTree) => {
+                    PolicyReferenceProvider::sampled_tree_with_registry(Arc::clone(
+                        registry.expect("gated-policy registry exists"),
+                    ))
+                }
+                None => PolicyReferenceProvider::gated_with_registry(Arc::clone(
+                    registry.expect("gated-policy registry exists"),
+                )),
+            };
+            let arena = arena_registry.map(|_| CliArenaRoots {
+                size: config.reference_arena_size,
+                seed: config.reference_arena_seed,
+                roots: HashMap::new(),
+            });
+            CliReferenceProvider::Policy(CliPolicyProvider { provider, arena })
         }
     };
 
@@ -829,9 +1443,8 @@ fn probe_fixed_root(store: &ReplayStore, config: &SelfplayConfig) -> Result<(), 
     let mut engine = WhittleEngine::new(whittle_engine_config()).map_err(|e| e.to_string())?;
     let mut generator = WhittleGraphGenerator::from_seed(whittle_generator_config(), config.seed);
     let root = generator
-        .sample_into(&mut engine)
-        .map_err(|e| e.to_string())?
-        .graph;
+        .sample_root_into(&mut engine)
+        .map_err(|e| e.to_string())?;
     let mut candidates = Vec::new();
     engine
         .candidates(root, feature_candidate_options(config), &mut candidates)
@@ -979,19 +1592,20 @@ impl RootSource<WhittleEngine> for CliRoots {
         }
 
         match self {
-            Self::Generated(source) => source
-                .generator
-                .sample_into(engine)
-                .map(|generated| Some(generated.graph)),
+            Self::Generated(source) => source.generator.sample_root_into(engine).map(Some),
             Self::Fixed {
                 generator, root, ..
             } => {
                 if root.is_none() {
-                    *root = Some(generator.sample_into(engine)?.graph);
+                    *root = Some(generator.sample_root_into(engine)?);
                 }
                 Ok(*root)
             }
         }
+    }
+
+    fn episode_roots_are_owned(&self) -> bool {
+        matches!(self, Self::Generated(_))
     }
 
     /// Opponent rollouts replay the shared root without consuming the
@@ -1004,7 +1618,7 @@ impl RootSource<WhittleEngine> for CliRoots {
                 generator, root, ..
             } => {
                 if root.is_none() {
-                    *root = Some(generator.sample_into(engine)?.graph);
+                    *root = Some(generator.sample_root_into(engine)?);
                 }
                 Ok(*root)
             }
@@ -1014,6 +1628,186 @@ impl RootSource<WhittleEngine> for CliRoots {
 
 // One instance per lane; the policy variant's rollout bookkeeping
 // outweighs the others and boxing it buys nothing at this count.
+struct CliPolicyProvider {
+    provider: PolicyReferenceProvider,
+    arena: Option<CliArenaRoots>,
+}
+
+impl CliPolicyProvider {
+    const fn new(provider: PolicyReferenceProvider) -> Self {
+        Self {
+            provider,
+            arena: None,
+        }
+    }
+}
+
+struct CliArenaRoots {
+    size: usize,
+    seed: u64,
+    roots: HashMap<usize, WhittleGraphId>,
+}
+
+impl ReferenceProvider<WhittleEngine> for CliPolicyProvider {
+    fn reference(
+        &mut self,
+        engine: &mut WhittleEngine,
+        root: WhittleGraphId,
+    ) -> EngineResult<Option<Reference>> {
+        self.provider.reference(engine, root)
+    }
+
+    fn reference_with_features<X>(
+        &mut self,
+        engine: &mut WhittleEngine,
+        root: WhittleGraphId,
+        extractor: &mut X,
+        candidate_options: CandidateOptions,
+        export_position: bool,
+    ) -> EngineResult<Option<Reference>>
+    where
+        X: FeatureExtractor<WhittleEngine>,
+    {
+        self.provider.reference_with_features(
+            engine,
+            root,
+            extractor,
+            candidate_options,
+            export_position,
+        )
+    }
+
+    fn rollout_due(&self, latest: Option<ModelVersion>) -> bool {
+        ReferenceProvider::<WhittleEngine>::rollout_due(&self.provider, latest)
+    }
+
+    fn claim_rollout(&mut self, latest: Option<ModelVersion>) -> bool {
+        ReferenceProvider::<WhittleEngine>::claim_rollout(&mut self.provider, latest)
+    }
+
+    fn begin_rollout(&mut self, version: Option<ModelVersion>) {
+        ReferenceProvider::<WhittleEngine>::begin_rollout(&mut self.provider, version);
+    }
+
+    fn finish_rollout(&mut self, outcome: Option<RolloutOutcome>) {
+        ReferenceProvider::<WhittleEngine>::finish_rollout(&mut self.provider, outcome);
+    }
+
+    fn claim_sample_rollout(&mut self, latest: Option<ModelVersion>) -> Option<ModelVersion> {
+        ReferenceProvider::<WhittleEngine>::claim_sample_rollout(&mut self.provider, latest)
+    }
+
+    fn finish_sample_rollout(&mut self, version: ModelVersion, outcome: Option<RolloutOutcome>) {
+        ReferenceProvider::<WhittleEngine>::finish_sample_rollout(
+            &mut self.provider,
+            version,
+            outcome,
+        );
+    }
+
+    fn sampled_trajectory_mode(&self) -> bool {
+        ReferenceProvider::<WhittleEngine>::sampled_trajectory_mode(&self.provider)
+    }
+
+    fn sampled_tree_mode(&self) -> bool {
+        ReferenceProvider::<WhittleEngine>::sampled_tree_mode(&self.provider)
+    }
+
+    fn arena_parallelism(&self) -> usize {
+        self.arena.as_ref().map_or(0, |arena| arena.size)
+    }
+
+    fn finish_sampled_trajectory(&mut self, outcome: Option<RolloutOutcome>) -> Option<Reference> {
+        ReferenceProvider::<WhittleEngine>::finish_sampled_trajectory(&mut self.provider, outcome)
+    }
+
+    fn claim_arena_rollout(
+        &mut self,
+        latest: Option<ModelVersion>,
+        lane: usize,
+        lanes: usize,
+    ) -> Option<ArenaRolloutClaim> {
+        ReferenceProvider::<WhittleEngine>::claim_arena_rollout(
+            &mut self.provider,
+            latest,
+            lane,
+            lanes,
+        )
+    }
+
+    fn arena_root(
+        &mut self,
+        engine: &mut WhittleEngine,
+        index: usize,
+    ) -> EngineResult<Option<WhittleGraphId>> {
+        let Some(arena) = &mut self.arena else {
+            return Ok(None);
+        };
+        if index >= arena.size {
+            return Ok(None);
+        }
+        if let Some(root) = arena.roots.get(&index) {
+            return Ok(Some(*root));
+        }
+        let mut generator = WhittleGraphGenerator::from_seed(
+            whittle_generator_config(),
+            arena_graph_seed(arena.seed, index),
+        );
+        let root = generator.sample_root_into(engine)?;
+        arena.roots.insert(index, root);
+        Ok(Some(root))
+    }
+
+    fn finish_arena_rollout(
+        &mut self,
+        claim: ArenaRolloutClaim,
+        score: Option<f32>,
+        outcome: Option<RolloutOutcome>,
+    ) {
+        ReferenceProvider::<WhittleEngine>::finish_arena_rollout(
+            &mut self.provider,
+            claim,
+            score,
+            outcome,
+        );
+    }
+
+    fn per_root_policy_mode(&self) -> bool {
+        ReferenceProvider::<WhittleEngine>::per_root_policy_mode(&self.provider)
+    }
+
+    fn claim_per_root_policy(
+        &mut self,
+        latest: Option<ModelVersion>,
+    ) -> Option<EpisodeRolloutClaim> {
+        ReferenceProvider::<WhittleEngine>::claim_per_root_policy(&mut self.provider, latest)
+    }
+
+    fn finish_per_root_policy(
+        &mut self,
+        claim: EpisodeRolloutClaim,
+        outcome: Option<RolloutOutcome>,
+    ) -> Option<Reference> {
+        ReferenceProvider::<WhittleEngine>::finish_per_root_policy(
+            &mut self.provider,
+            claim,
+            outcome,
+        )
+    }
+
+    fn admission_ready(&self) -> bool {
+        ReferenceProvider::<WhittleEngine>::admission_ready(&self.provider)
+    }
+}
+
+fn arena_graph_seed(seed: u64, index: usize) -> u64 {
+    let mut value =
+        seed ^ 0x6172_656e_615f_6772 ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 #[allow(clippy::large_enum_variant)]
 enum CliReferenceProvider {
     None,
@@ -1022,7 +1816,7 @@ enum CliReferenceProvider {
     Beam(BeamReferenceProvider),
     Random(RandomReferenceProvider),
     SelfAverage(SelfAverageProvider),
-    Policy(PolicyReferenceProvider),
+    Policy(CliPolicyProvider),
 }
 
 impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
@@ -1153,6 +1947,126 @@ impl ReferenceProvider<WhittleEngine> for CliReferenceProvider {
     fn finish_rollout(&mut self, outcome: Option<RolloutOutcome>) {
         if let Self::Policy(provider) = self {
             ReferenceProvider::<WhittleEngine>::finish_rollout(provider, outcome);
+        }
+    }
+
+    fn claim_sample_rollout(
+        &mut self,
+        latest: Option<gz_engine::ModelVersion>,
+    ) -> Option<gz_engine::ModelVersion> {
+        match self {
+            Self::Policy(provider) => {
+                ReferenceProvider::<WhittleEngine>::claim_sample_rollout(provider, latest)
+            }
+            _ => None,
+        }
+    }
+
+    fn finish_sample_rollout(
+        &mut self,
+        version: gz_engine::ModelVersion,
+        outcome: Option<RolloutOutcome>,
+    ) {
+        if let Self::Policy(provider) = self {
+            ReferenceProvider::<WhittleEngine>::finish_sample_rollout(provider, version, outcome);
+        }
+    }
+
+    fn sampled_trajectory_mode(&self) -> bool {
+        match self {
+            Self::Policy(provider) => {
+                ReferenceProvider::<WhittleEngine>::sampled_trajectory_mode(provider)
+            }
+            _ => false,
+        }
+    }
+
+    fn sampled_tree_mode(&self) -> bool {
+        match self {
+            Self::Policy(provider) => {
+                ReferenceProvider::<WhittleEngine>::sampled_tree_mode(provider)
+            }
+            _ => false,
+        }
+    }
+
+    fn arena_parallelism(&self) -> usize {
+        match self {
+            Self::Policy(provider) => {
+                ReferenceProvider::<WhittleEngine>::arena_parallelism(provider)
+            }
+            _ => 0,
+        }
+    }
+
+    fn finish_sampled_trajectory(&mut self, outcome: Option<RolloutOutcome>) -> Option<Reference> {
+        match self {
+            Self::Policy(provider) => {
+                ReferenceProvider::<WhittleEngine>::finish_sampled_trajectory(provider, outcome)
+            }
+            _ => None,
+        }
+    }
+
+    fn claim_arena_rollout(
+        &mut self,
+        latest: Option<ModelVersion>,
+        lane: usize,
+        lanes: usize,
+    ) -> Option<ArenaRolloutClaim> {
+        match self {
+            Self::Policy(provider) => provider.claim_arena_rollout(latest, lane, lanes),
+            _ => None,
+        }
+    }
+
+    fn arena_root(
+        &mut self,
+        engine: &mut WhittleEngine,
+        index: usize,
+    ) -> EngineResult<Option<WhittleGraphId>> {
+        match self {
+            Self::Policy(provider) => provider.arena_root(engine, index),
+            _ => Ok(None),
+        }
+    }
+
+    fn finish_arena_rollout(
+        &mut self,
+        claim: ArenaRolloutClaim,
+        score: Option<f32>,
+        outcome: Option<RolloutOutcome>,
+    ) {
+        if let Self::Policy(provider) = self {
+            provider.finish_arena_rollout(claim, score, outcome);
+        }
+    }
+
+    fn per_root_policy_mode(&self) -> bool {
+        match self {
+            Self::Policy(provider) => provider.per_root_policy_mode(),
+            _ => false,
+        }
+    }
+
+    fn claim_per_root_policy(
+        &mut self,
+        latest: Option<ModelVersion>,
+    ) -> Option<EpisodeRolloutClaim> {
+        match self {
+            Self::Policy(provider) => provider.claim_per_root_policy(latest),
+            _ => None,
+        }
+    }
+
+    fn finish_per_root_policy(
+        &mut self,
+        claim: EpisodeRolloutClaim,
+        outcome: Option<RolloutOutcome>,
+    ) -> Option<Reference> {
+        match self {
+            Self::Policy(provider) => provider.finish_per_root_policy(claim, outcome),
+            _ => None,
         }
     }
 

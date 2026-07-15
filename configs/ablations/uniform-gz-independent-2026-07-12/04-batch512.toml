@@ -1,0 +1,14 @@
+extends = "../../bases/gated-pool32-s42-throughput.toml"
+
+[trainer]
+policy_init = "neutral"
+model_seed = 17
+data_seed = 42
+batch = 512
+total_steps = 1000
+
+[wandb]
+run_name = "uniform-gz-i4-batch512-s17-1"
+
+[paths]
+run_dir = "runs/uniform-gz-i4-batch512-s17-1"

@@ -91,6 +91,8 @@ def count_batch(node_counts: list[int], action_counts: list[int], row_count: int
         capacity * 2,
         capacity,
         capacity,
+        capacity * 8,
+        capacity * 4,
         capacity * 4,
         capacity * max_nodes * 2,
         0,

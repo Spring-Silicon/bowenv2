@@ -1,0 +1,29 @@
+extends = "../../bases/benchmark-throughput-r8-screen.toml"
+
+# A+B: exact WhittleZero model/search with the generic trainer.
+[arch]
+layers = 3
+trunk = "sage"
+subject_encoding = "match"
+position_encoding = "policy_budget"
+action_encoding = "candidate_only"
+profile = "whittlezero"
+value_hidden = 256
+
+[selfplay]
+simulations = 64
+max_considered = 16
+c_scale = 0.3
+max_steps = 104
+max_candidates = 2303
+position_features = true
+length_tiebreak = false
+
+[trainer]
+startup_timeout = 3600.0
+
+[wandb]
+run_name = "ablate-f1-19-ab-arch-search"
+
+[paths]
+run_dir = "runs/ablate-f1-19-ab-arch-search"

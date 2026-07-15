@@ -64,6 +64,7 @@ fn config() -> ThreadedOrchestratorConfig {
         max_batch: NonZeroUsize::new(8).unwrap(),
         flush_after: Duration::from_millis(20),
         admission_stagger: Duration::ZERO,
+        admission_smoothing: None,
     }
 }
 
@@ -111,6 +112,8 @@ where
             FeaturizedRuntime {
                 extractors,
                 backends: vec![backend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
             },
         )
         .unwrap()

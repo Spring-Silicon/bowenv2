@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import argparse
+import subprocess
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+from gz.model.exphormer import build_model, initialize_policy, initialize_value
+from gz.trainer.data import TrainingStager
+from gz.trainer.driver import (
+    MetricsWriter,
+    PerfWindow,
+    RunConfig,
+    SamplePrefetcher,
+    WandbRun,
+    _dataclass_from_dict,
+    _load_config_table,
+    _resolved_trainer_seeds,
+    _seed_model,
+    check_child,
+    check_memory,
+    load_config,
+    spawn_replay_serve,
+    stop_child,
+    trainer_loop_config,
+)
+from gz.trainer.loop import TrainerLoop
+from gz.trainer.publish import EmaWeights, publish_ema
+from gz.trainer.sampler import SampleClient, step_seed
+
+
+@dataclass(frozen=True, slots=True)
+class DistillConfig:
+    states: int = 100_000
+    workers: int = 32
+    max_attempts: int = 0
+    teacher: str = "reducing-uniform"
+    seed: int = 42
+    max_steps: int = 64
+    position_features: bool = True
+
+
+def load_distill_config(path: str | Path) -> tuple[RunConfig, DistillConfig]:
+    path = Path(path)
+    data = _load_config_table(path)
+    run_config = load_config(path)
+    distill = _dataclass_from_dict(DistillConfig, data.get("distill", {}))
+    if distill.states < 1:
+        raise ValueError("distill.states must be positive")
+    if distill.workers < 1:
+        raise ValueError("distill.workers must be positive")
+    if distill.max_attempts and distill.max_attempts < distill.states:
+        raise ValueError("distill.max_attempts must be zero or at least distill.states")
+    if distill.teacher != "reducing-uniform":
+        raise ValueError(f"unknown distillation teacher: {distill.teacher}")
+    if not 0 <= distill.seed < 2**64:
+        raise ValueError("distill.seed must fit an unsigned 64-bit integer")
+    if distill.max_steps < 0:
+        raise ValueError("distill.max_steps must be non-negative")
+    trainer = run_config.trainer
+    if trainer.value_weight != 0.0 or trainer.value_batch != 0:
+        raise ValueError("policy distillation requires value_weight = 0 and value_batch = 0")
+    if trainer.resume or trainer.init_checkpoint:
+        raise ValueError("distillation starts from an initializer, not a training checkpoint")
+    if trainer.max_reuse != 0.0 or trainer.reuse_gate_episodes != 0:
+        raise ValueError("static distillation replay cannot use production gates")
+    if trainer.publish_lag_blocks != 0:
+        raise ValueError("static distillation cannot delay checkpoint publication")
+    return run_config, distill
+
+
+def generate_dataset(config: RunConfig, distill: DistillConfig) -> None:
+    subprocess.run(
+        [
+            config.paths.graphzero_bin,
+            "distill-generate",
+            "--replay-dir",
+            str(config.paths.replay_dir),
+            "--states",
+            str(distill.states),
+            "--workers",
+            str(distill.workers),
+            "--max-attempts",
+            str(distill.max_attempts),
+            "--teacher",
+            distill.teacher,
+            "--seed",
+            str(distill.seed),
+            "--max-candidates",
+            str(config.selfplay.max_candidates),
+            "--max-steps",
+            str(distill.max_steps),
+            "--position-features",
+            "true" if distill.position_features else "false",
+        ],
+        check=True,
+    )
+
+
+def run(config_path: str | Path, *, generate_first: bool = False) -> None:
+    config, distill = load_distill_config(config_path)
+    if generate_first:
+        generate_dataset(config, distill)
+    for path in (config.paths.checkpoint_dir, config.paths.run_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    metrics = MetricsWriter(
+        config.paths.run_dir / "metrics.jsonl",
+        WandbRun.start(config, {"distill": asdict(distill)}),
+    )
+    serve = spawn_replay_serve(config)
+    sampler = None
+    prefetcher = None
+    clean = False
+    try:
+        sampler = SampleClient(
+            config.paths.sample_socket,
+            startup_timeout=config.trainer.startup_timeout,
+            reconnect_limit=config.trainer.reconnect_limit,
+        )
+        ack = sampler.wait_until_ready(
+            distill.states,
+            alive_check=lambda: check_child(serve, "replay-serve"),
+            policy_rows=True,
+        )
+        if ack.produced_rows != distill.states or ack.produced_policy_rows != distill.states:
+            raise RuntimeError(
+                "distillation replay row count does not match distill.states: "
+                f"rows={ack.produced_rows} policy_rows={ack.produced_policy_rows}"
+            )
+
+        model_seed, data_seed = _resolved_trainer_seeds(config.trainer)
+        _seed_model(model_seed)
+        model = build_model(sampler.feature_schema, config.arch)
+        initialize_policy(model, config.trainer.policy_init)
+        initialize_value(model, "zero")
+        model = model.to(config.trainer.device)
+        ema = EmaWeights(model, config.trainer.ema_decay)
+        first = publish_ema(
+            config.paths.checkpoint_dir,
+            ema,
+            schema=sampler.feature_schema,
+            schema_hash=sampler.feature_schema_hash,
+            arch=config.arch,
+            training_step=0,
+            run_id=config.paths.run_dir.name,
+        )
+        param_norm, _ = ema.norms(None)
+        published_snapshot = ema.state_dict()
+        metrics.write(
+            {
+                "event": "publish",
+                "training_step": 0,
+                "model_version": first.model_version.hex(),
+                "param_norm": param_norm,
+                "update_norm": 0.0,
+            }
+        )
+
+        stager = TrainingStager(
+            sampler.feature_schema,
+            sampler.max_batch,
+            config.trainer.device,
+        )
+        loop = TrainerLoop(model, trainer_loop_config(config.trainer, data_seed))
+        window = PerfWindow()
+        if config.trainer.prefetch:
+            prefetcher = SamplePrefetcher(
+                sampler,
+                config.trainer.batch,
+                config.trainer.window_rows,
+                0,
+                config.trainer.window_rows,
+                data_seed,
+                config.trainer.total_steps,
+                0.0,
+                1,
+                0,
+            )
+            prefetcher.start()
+
+        def publish(training_step: int) -> None:
+            nonlocal published_snapshot
+            manifest = publish_ema(
+                config.paths.checkpoint_dir,
+                ema,
+                schema=sampler.feature_schema,
+                schema_hash=sampler.feature_schema_hash,
+                arch=config.arch,
+                training_step=training_step,
+                run_id=config.paths.run_dir.name,
+            )
+            param_norm, update_norm = ema.norms(published_snapshot)
+            published_snapshot = ema.state_dict()
+            metrics.write(
+                {
+                    "event": "publish",
+                    "training_step": training_step,
+                    "model_version": manifest.model_version.hex(),
+                    "param_norm": param_norm,
+                    "update_norm": update_norm,
+                }
+            )
+
+        for step in range(config.trainer.total_steps):
+            check_memory(config.trainer.min_available_gb)
+            sample_started = time.perf_counter()
+            if prefetcher is not None:
+                samples = prefetcher.next().policy
+            else:
+                samples = sampler.sample(
+                    config.trainer.batch,
+                    min(config.trainer.window_rows, distill.states),
+                    step_seed(data_seed, step),
+                    kind="policy",
+                )
+            train_started = time.perf_counter()
+            training_batch = stager.copy(samples.batch, samples.targets)
+            with_metrics = step % config.trainer.log_interval == 0
+            step_metrics = loop.train_step(training_batch, with_metrics=with_metrics)
+            ema.update(model)
+            window.record(sample_started, train_started, time.perf_counter())
+            if with_metrics:
+                assert step_metrics is not None
+                record = {
+                    "event": "step",
+                    "timestamp": time.time(),
+                    "step": step_metrics.step,
+                    "policy_loss": step_metrics.policy_loss,
+                    "value_loss": step_metrics.value_loss,
+                    "loss": step_metrics.loss,
+                    "grad_norm": step_metrics.grad_norm,
+                    "lr": step_metrics.lr,
+                    "value_accuracy": step_metrics.value_accuracy,
+                    "fraction_valid": step_metrics.fraction_valid,
+                    "label_mean": step_metrics.label_mean,
+                    "learner_win_rate": step_metrics.learner_win_rate,
+                    "produced_rows": distill.states,
+                    "samples_per_row": (step + 1)
+                    * config.trainer.batch
+                    / distill.states,
+                    **window.drain(distill.states, distill.states),
+                }
+                metrics.write(record)
+            if (step + 1) % config.trainer.publish_interval == 0:
+                publish(step + 1)
+            if config.trainer.step_sleep:
+                time.sleep(config.trainer.step_sleep)
+
+        if prefetcher is not None:
+            prefetcher.stop()
+            prefetcher = None
+        if config.trainer.total_steps % config.trainer.publish_interval != 0:
+            publish(config.trainer.total_steps)
+        clean = True
+    finally:
+        if prefetcher is not None:
+            prefetcher.stop()
+        if sampler is not None:
+            sampler.close()
+        stop_child(serve)
+        if clean:
+            metrics.finish()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config")
+    parser.add_argument("--generate", action="store_true")
+    args = parser.parse_args()
+    run(args.config, generate_first=args.generate)
+
+
+if __name__ == "__main__":
+    main()

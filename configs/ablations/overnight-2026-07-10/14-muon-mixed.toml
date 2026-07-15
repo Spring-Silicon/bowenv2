@@ -1,0 +1,11 @@
+extends = "../../bases/benchmark-throughput-r8-screen.toml"
+
+[trainer]
+optimizer = "muon_mixed"
+adamw_lr = 0.0003
+
+[wandb]
+run_name = "ablate-o1-14-muon-mixed"
+
+[paths]
+run_dir = "runs/ablate-o1-14-muon-mixed"

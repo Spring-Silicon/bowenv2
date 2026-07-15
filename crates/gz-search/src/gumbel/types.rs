@@ -36,10 +36,8 @@ pub struct GumbelMctsConfig {
     /// part of the search config hash.
     pub export_position: bool,
     /// Mask STOP out of node priors/logits wherever a rewrite exists
-    /// (STOP-only nodes keep it). Set by policy_rollout(): an argmax
-    /// reference that can stop converges to stop-at-root, freezing the
-    /// bar at root cost (whittlezero's rollouts exclude STOP the same
-    /// way). Part of the search config hash.
+    /// (STOP-only nodes keep it). Policy rollouts preserve the caller's
+    /// setting. Part of the search config hash.
     pub mask_stop: bool,
     /// Mask any action whose applied child is the current root or a
     /// prior root of this episode (whittlezero's no_backtrack): the
@@ -154,6 +152,35 @@ pub struct GumbelEpisode<G, C> {
     pub final_measure: MeasureResult<G>,
     pub stop_reason: GumbelStopReason,
     pub search_config_hash: SearchConfigHash,
+    pub competitive: Option<Box<GumbelCompetitiveTrace<G, C>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GumbelPlayer {
+    One,
+    Two,
+}
+
+impl GumbelPlayer {
+    #[must_use]
+    pub const fn opponent(self) -> Self {
+        match self {
+            Self::One => Self::Two,
+            Self::Two => Self::One,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GumbelCompetitiveTrace<G, C> {
+    pub learner_player: GumbelPlayer,
+    pub opponent_root: G,
+    pub opponent_final_graph: G,
+    pub opponent_root_context: ReplayGraphContext,
+    pub opponent_final_context: ReplayGraphContext,
+    pub opponent_steps: Vec<GumbelStep<G, C>>,
+    pub opponent_final_measure: MeasureResult<G>,
+    pub opponent_stop_reason: GumbelStopReason,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,7 +205,7 @@ impl<G, C> GumbelHandleBatch<G, C> {
     }
 }
 
-impl<G, C> PartialEq for GumbelEpisode<G, C> {
+impl<G: PartialEq, C: PartialEq> PartialEq for GumbelEpisode<G, C> {
     fn eq(&self, other: &Self) -> bool {
         self.root_context == other.root_context
             && self.final_context == other.final_context
@@ -187,6 +214,31 @@ impl<G, C> PartialEq for GumbelEpisode<G, C> {
             && measure_result_eq(&self.final_measure, &other.final_measure)
             && self.stop_reason == other.stop_reason
             && self.search_config_hash == other.search_config_hash
+            && competitive_trace_eq(self.competitive.as_deref(), other.competitive.as_deref())
+    }
+}
+
+fn competitive_trace_eq<G, C>(
+    left: Option<&GumbelCompetitiveTrace<G, C>>,
+    right: Option<&GumbelCompetitiveTrace<G, C>>,
+) -> bool
+where
+    G: PartialEq,
+    C: PartialEq,
+{
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.learner_player == right.learner_player
+                && left.opponent_root == right.opponent_root
+                && left.opponent_final_graph == right.opponent_final_graph
+                && left.opponent_root_context == right.opponent_root_context
+                && left.opponent_final_context == right.opponent_final_context
+                && left.opponent_steps == right.opponent_steps
+                && measure_result_eq(&left.opponent_final_measure, &right.opponent_final_measure)
+                && left.opponent_stop_reason == right.opponent_stop_reason
+        }
+        _ => false,
     }
 }
 

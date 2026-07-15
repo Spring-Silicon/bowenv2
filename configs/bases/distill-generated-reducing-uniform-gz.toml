@@ -1,0 +1,80 @@
+# Static policy distillation on normal generated Whittle roots. The [selfplay]
+# table supplies shared schema knobs only; no selfplay process is launched.
+
+[arch]
+name = "gz-graph-v1"
+dim = 128
+layers = 4
+heads = 4
+ffn_dim = 512
+dropout = 0.1
+activation = "gelu"
+aggregation = "attention"
+global_tokens = 1
+trunk = "exphormer"
+sage_layers = 3
+policy_head = "pointer"
+value_input = "pair"
+value_activation = "tanh"
+subject_encoding = "mean"
+position_encoding = "shared"
+action_encoding = "kind_prior"
+profile = "graphzero"
+value_hidden = 0
+
+[trainer]
+optimizer = "adamw"
+lr = 0.0003
+lr_schedule = "constant"
+warmup_steps = 0
+min_lr_ratio = 0.0
+policy_init = "neutral"
+batch = 512
+value_batch = 0
+window_rows = 100000
+total_steps = 5000
+publish_interval = 256
+publish_lag_blocks = 0
+value_weight = 0.0
+weight_decay = 0.0001
+ema_decay = 0.0
+grad_clip = 1.0
+min_startup_rows = 1
+seed = 42
+model_seed = 5
+data_seed = 42
+device = "cuda:1"
+startup_timeout = 600.0
+reconnect_limit = 5
+log_interval = 10
+step_sleep = 0.0
+min_available_gb = 40.0
+prefetch = true
+max_reuse = 0.0
+reuse_gate_interval = 1
+reuse_gate_episodes = 0
+value_mirror = false
+resume = false
+init_checkpoint = ""
+
+[selfplay]
+max_candidates = 1023
+position_features = true
+
+[distill]
+states = 100000
+workers = 32
+max_attempts = 1000000
+teacher = "reducing-uniform"
+seed = 42
+max_steps = 64
+position_features = true
+
+[wandb]
+project = "graphzero"
+run_name = "distill-generated-reducing-uniform-gz-base-do-not-run"
+
+[paths]
+run_dir = "runs/distill-generated-reducing-uniform-gz-base-do-not-run"
+replay_dir = "runs/datasets/generated-reducing-uniform-100k-v1/replay"
+graphzero_bin = "target/release/graphzero"

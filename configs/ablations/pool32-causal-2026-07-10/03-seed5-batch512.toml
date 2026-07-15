@@ -1,0 +1,12 @@
+extends = "../../bases/gated-pool32-legacy-screen.toml"
+
+# Seed 5 alone and seed 5 plus clip 3 failed; test batch interaction.
+[trainer]
+seed = 5
+batch = 512
+
+[wandb]
+run_name = "pool32-causal-seed5-batch512-1"
+
+[paths]
+run_dir = "runs/pool32-causal-seed5-batch512-1"

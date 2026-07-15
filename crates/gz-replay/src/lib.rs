@@ -13,5 +13,5 @@ pub use records::{
     ReplayEpisodeId, ReplayEpisodeRecord, ReplayOutcome, ReplayReference, ReplayReferenceKind,
     ReplayRootInfo, ReplayRow,
 };
-pub use sample::SampleConfig;
-pub use store::{ReplayCounters, ReplayStore};
+pub use sample::{SampleConfig, SampleKind};
+pub use store::{ReplayCounters, ReplayDataMode, ReplayStore};

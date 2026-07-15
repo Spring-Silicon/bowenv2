@@ -6,6 +6,7 @@ use crate::{
 use gz_engine::ModelVersion;
 use gz_features::{decode_outputs, validate_batch_action_counts};
 use std::io::ErrorKind;
+use std::num::NonZeroUsize;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -152,6 +153,7 @@ pub struct ProcessBackend {
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     batch_id: u64,
+    batch_capacity: NonZeroUsize,
     model_version: ModelVersion,
 }
 
@@ -161,6 +163,8 @@ impl ProcessBackend {
         hello: &Hello,
         io_timeout: Duration,
     ) -> ServiceResult<Self> {
+        let batch_capacity = NonZeroUsize::new(hello.batch_capacity as usize)
+            .ok_or_else(|| ServiceError::handshake("batch capacity must be greater than zero"))?;
         stream
             .set_read_timeout(Some(io_timeout))
             .map_err(|error| ServiceError::io(error.to_string()))?;
@@ -185,6 +189,7 @@ impl ProcessBackend {
                     read_buf,
                     write_buf,
                     batch_id: 0,
+                    batch_capacity,
                     model_version: ack.model_version,
                 })
             }
@@ -230,6 +235,14 @@ impl ProcessBackend {
 }
 
 impl FeatureEvalBackend for ProcessBackend {
+    fn batch_capacity(&self) -> Option<NonZeroUsize> {
+        Some(self.batch_capacity)
+    }
+
+    fn capacity_work(&self, _actual_rows: usize, max_batch: usize) -> usize {
+        max_batch
+    }
+
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
         let pending = self.submit(batch_bytes, action_counts)?;
         self.receive(pending)

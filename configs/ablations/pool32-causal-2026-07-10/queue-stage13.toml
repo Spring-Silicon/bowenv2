@@ -1,0 +1,22 @@
+[queue]
+name = "pool32-causal-stage13-2026-07-10"
+results_dir = "runs/ablation-pool32-causal-stage13-2026-07-10"
+poll_seconds = 5.0
+min_free_gb = 100.0
+continue_on_failure = true
+
+[[runs]]
+name = "model5-data42"
+config = "13-model5-data42.toml"
+timeout_seconds = 7200
+early_stop = [
+  { step = 1000, window = 5, terminal_cost_mean_gt = 130.0, policy_loss_gt = 6.55 },
+]
+
+[[runs]]
+name = "model42-data5"
+config = "14-model42-data5.toml"
+timeout_seconds = 7200
+early_stop = [
+  { step = 1000, window = 5, terminal_cost_mean_gt = 130.0, policy_loss_gt = 6.55 },
+]

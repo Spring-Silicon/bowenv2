@@ -2,14 +2,14 @@ use gz_features::{
     ENCODING_VERSION, FeatureCollator, FeatureRow, FeatureSchema, RowTargets, decode_feature_row,
     encode_feature_schema_config, encode_training_targets, validate_feature_row_header,
 };
-use gz_replay::{ReplayError, ReplayStore, SampleConfig};
+use gz_replay::{ReplayError, ReplayStore, SampleConfig, SampleKind};
 use std::io::{ErrorKind, Read, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const SAMPLE_PROTOCOL_VERSION: u32 = 6;
+pub const SAMPLE_PROTOCOL_VERSION: u32 = 7;
 
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const FRAME_HELLO: u8 = 1;
@@ -47,12 +47,10 @@ impl ReplayServeConfig {
 }
 
 pub fn run(config: ReplayServeConfig) -> Result<(), String> {
-    let mut server = ReplaySampleServer::bind(config)?;
+    let server = ReplaySampleServer::bind(config)?;
     loop {
-        // A connection error (client vanished, socket timeout on an idle
-        // trainer) ends that connection, never the service.
-        if let Err(error) = server.accept_one() {
-            eprintln!("replay sample connection ended: {error}");
+        if let Err(error) = server.accept_concurrent() {
+            eprintln!("replay sample accept failed: {error}");
         }
     }
 }
@@ -62,26 +60,30 @@ pub fn run_one(config: ReplayServeConfig) -> Result<(), String> {
 }
 
 /// Serve loop over a store shared with a live producer (the in-process
-/// sample service of `graphzero selfplay --serve-socket`). Append and
-/// sample are `&self` and internally serialized, so one process owning
-/// the store dissolves the RocksDB single-writer constraint.
+/// sample service of `graphzero selfplay --serve-socket`). Appends are
+/// serialized inside the store while committed rows remain concurrently
+/// sampleable, so one process still owns the RocksDB writer.
 pub fn run_shared(
     store: std::sync::Arc<ReplayStore>,
     socket: PathBuf,
     max_batch: usize,
 ) -> Result<(), String> {
-    let mut server = ReplaySampleServer::bind_shared(store, socket, max_batch)?;
+    let server = ReplaySampleServer::bind_shared(store, socket, max_batch)?;
     loop {
-        // Same rule as `run`: a per-connection error must never take down
-        // the producing selfplay process wrapped around this loop.
-        if let Err(error) = server.accept_one() {
-            eprintln!("replay sample connection ended: {error}");
+        if let Err(error) = server.accept_concurrent() {
+            eprintln!("replay sample accept failed: {error}");
         }
     }
 }
 
 struct ReplaySampleServer {
     listener: UnixListener,
+    store: std::sync::Arc<ReplayStore>,
+    schema: FeatureSchema,
+    max_batch: NonZeroUsize,
+}
+
+struct ReplaySampleSession {
     store: std::sync::Arc<ReplayStore>,
     collator: FeatureCollator,
     max_batch: NonZeroUsize,
@@ -106,7 +108,6 @@ impl ReplaySampleServer {
         let schema = FeatureSchema::new(schema_config).map_err(|error| error.to_string())?;
         let max_batch = NonZeroUsize::new(max_batch)
             .ok_or_else(|| "--max-batch must be greater than zero".to_owned())?;
-        let collator = FeatureCollator::new(schema, max_batch);
 
         if socket.exists() {
             std::fs::remove_file(&socket).map_err(|error| error.to_string())?;
@@ -116,22 +117,53 @@ impl ReplaySampleServer {
         Ok(Self {
             listener,
             store,
-            collator,
+            schema,
             max_batch,
         })
     }
 
-    fn accept_one(&mut self) -> Result<(), String> {
-        let (mut stream, _) = self.listener.accept().map_err(|error| error.to_string())?;
+    fn accept_stream(&self) -> Result<UnixStream, String> {
+        let (stream, _) = self.listener.accept().map_err(|error| error.to_string())?;
         stream
             .set_read_timeout(Some(Duration::from_secs(300)))
             .map_err(|error| error.to_string())?;
         stream
             .set_write_timeout(Some(Duration::from_secs(300)))
             .map_err(|error| error.to_string())?;
-        self.handle_client(&mut stream)
+        Ok(stream)
     }
 
+    fn session(&self) -> ReplaySampleSession {
+        ReplaySampleSession {
+            store: std::sync::Arc::clone(&self.store),
+            collator: FeatureCollator::new(self.schema.clone(), self.max_batch),
+            max_batch: self.max_batch,
+        }
+    }
+
+    fn accept_one(&self) -> Result<(), String> {
+        let mut stream = self.accept_stream()?;
+        self.session().handle_client(&mut stream)
+    }
+
+    fn accept_concurrent(&self) -> Result<(), String> {
+        let mut stream = self.accept_stream()?;
+        let mut session = self.session();
+        std::thread::Builder::new()
+            .name("replay-sample-client".to_owned())
+            .spawn(move || {
+                if let Err(error) = session.handle_client(&mut stream) {
+                    // A client disappearing or timing out ends only its own
+                    // session; the listener keeps accepting other trainers.
+                    eprintln!("replay sample connection ended: {error}");
+                }
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl ReplaySampleSession {
     fn handle_client(&mut self, stream: &mut UnixStream) -> Result<(), String> {
         let mut read_buf = Vec::new();
         let mut write_buf = Vec::new();
@@ -221,11 +253,12 @@ impl ReplaySampleServer {
             .store
             .root_info()
             .map_err(|_| (ERROR_ENCODING, "corrupt root info"))?;
-        let mut payload = Vec::with_capacity(108 + schema_config.len());
+        let counters = self.store.counters();
+        let mut payload = Vec::with_capacity(116 + schema_config.len());
         payload.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
         payload.extend_from_slice(self.collator.schema().hash().as_bytes());
         payload.extend_from_slice(&(self.max_batch.get() as u32).to_le_bytes());
-        payload.extend_from_slice(&self.store.counters().produced_rows.to_le_bytes());
+        payload.extend_from_slice(&counters.produced_rows.to_le_bytes());
         payload.extend_from_slice(&episodes.to_le_bytes());
         payload.extend_from_slice(&episodes_stopped.to_le_bytes());
         payload.extend_from_slice(&(cost_ema as f32).to_le_bytes());
@@ -245,6 +278,7 @@ impl ReplaySampleServer {
         payload.extend_from_slice(&root.node_count.to_le_bytes());
         payload.extend_from_slice(&root.edge_count.to_le_bytes());
         payload.extend_from_slice(&root.candidate_count.to_le_bytes());
+        payload.extend_from_slice(&counters.produced_policy_rows.to_le_bytes());
         payload.extend_from_slice(&schema_config);
         write_frame(stream, write_buf, FRAME_HELLO_ACK, &[&payload])
             .map_err(|_| (ERROR_PROTOCOL, "failed to write HELLO_ACK"))
@@ -256,23 +290,32 @@ impl ReplaySampleServer {
         batch_buf: &mut Vec<u8>,
         target_buf: &mut Vec<u8>,
     ) -> Result<(), (u32, &'static str)> {
-        if payload.len() != 20 {
+        if payload.len() != 24 {
             return Err((ERROR_PROTOCOL, "bad SAMPLE length"));
         }
         let batch = u32::from_le_bytes(payload[0..4].try_into().expect("len checked")) as usize;
-        let window = u64::from_le_bytes(payload[4..12].try_into().expect("len checked"));
-        let seed = u64::from_le_bytes(payload[12..20].try_into().expect("len checked"));
+        let kind = match u32::from_le_bytes(payload[4..8].try_into().expect("len checked")) {
+            0 => SampleKind::Any,
+            1 => SampleKind::Policy,
+            2 => SampleKind::Value,
+            _ => return Err((ERROR_BAD_REQUEST, "invalid SAMPLE kind")),
+        };
+        let window = u64::from_le_bytes(payload[8..16].try_into().expect("len checked"));
+        let seed = u64::from_le_bytes(payload[16..24].try_into().expect("len checked"));
         if batch == 0 || batch > self.max_batch.get() || window == 0 {
             return Err((ERROR_BAD_REQUEST, "invalid SAMPLE request"));
         }
 
         let rows = self
             .store
-            .sample_rows(SampleConfig {
-                batch: NonZeroUsize::new(batch).expect("batch checked"),
-                window_rows: NonZeroU64::new(window).expect("window checked"),
-                seed,
-            })
+            .sample_rows_kind(
+                SampleConfig {
+                    batch: NonZeroUsize::new(batch).expect("batch checked"),
+                    window_rows: NonZeroU64::new(window).expect("window checked"),
+                    seed,
+                },
+                kind,
+            )
             .map_err(sample_error)?;
         let mut feature_rows = Vec::<FeatureRow>::with_capacity(rows.len());
         let mut targets = Vec::<RowTargets>::with_capacity(rows.len());
@@ -315,6 +358,7 @@ impl ReplaySampleServer {
 fn sample_error(error: ReplayError) -> (u32, &'static str) {
     match error {
         ReplayError::Empty => (ERROR_EMPTY_STORE, "replay store is empty"),
+        ReplayError::DataModeMismatch => (ERROR_BAD_REQUEST, "replay data mode mismatch"),
         _ => (ERROR_BAD_REQUEST, "sampling failed"),
     }
 }

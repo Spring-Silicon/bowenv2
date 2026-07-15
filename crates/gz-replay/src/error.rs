@@ -7,6 +7,7 @@ pub enum ReplayError {
     NotMeasured,
     InvalidRecord,
     SchemaMismatch,
+    DataModeMismatch,
     Empty,
     Storage(String),
 }
@@ -30,6 +31,7 @@ impl fmt::Display for ReplayError {
             Self::NotMeasured => write!(f, "episode final graph was not measured"),
             Self::InvalidRecord => write!(f, "invalid replay record"),
             Self::SchemaMismatch => write!(f, "replay schema version mismatch"),
+            Self::DataModeMismatch => write!(f, "replay data mode mismatch"),
             Self::Empty => write!(f, "replay store is empty"),
             Self::Storage(message) => write!(f, "replay storage error: {message}"),
         }

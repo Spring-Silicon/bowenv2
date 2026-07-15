@@ -17,7 +17,7 @@ from gz.proto import (
     write_frame,
 )
 
-SAMPLE_PROTOCOL_VERSION = 6
+SAMPLE_PROTOCOL_VERSION = 7
 
 FRAME_HELLO = 1
 FRAME_HELLO_ACK = 2
@@ -42,6 +42,7 @@ class SampleAck:
     feature_schema_hash: FeatureSchemaHash
     max_batch: int
     produced_rows: int
+    produced_policy_rows: int
     episodes: int
     episodes_stopped: int
     episode_cost_ema: float
@@ -100,6 +101,15 @@ class SampleClient:
             self.sock.close()
             self.sock = None
 
+    def fork(self) -> SampleClient:
+        """Return an independent connection with the same retry policy."""
+        return SampleClient(
+            self.socket_path,
+            startup_timeout=self.startup_timeout,
+            reconnect_limit=self.reconnect_limit,
+            backoff=self.backoff,
+        )
+
     def connect(self) -> SampleAck:
         self.close()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -115,14 +125,21 @@ class SampleClient:
         self.ack = decode_ack(payload)
         return self.ack
 
-    def wait_until_ready(self, min_startup_rows: int, alive_check: object = None) -> SampleAck:
+    def wait_until_ready(
+        self,
+        min_startup_rows: int,
+        alive_check: object = None,
+        *,
+        policy_rows: bool = False,
+    ) -> SampleAck:
         deadline = time.monotonic() + self.startup_timeout
         while True:
             if alive_check is not None:
                 alive_check()
             try:
                 ack = self.connect()
-                if ack.produced_rows >= min_startup_rows:
+                available = ack.produced_policy_rows if policy_rows else ack.produced_rows
+                if available >= min_startup_rows:
                     return ack
             except (OSError, ProtocolError, SampleError):
                 self.close()
@@ -130,8 +147,12 @@ class SampleClient:
                 raise TimeoutError("timed out waiting for replay sample service")
             time.sleep(self.backoff)
 
-    def sample(self, batch: int, window: int, seed: int) -> SampleResult:
-        return self._with_reconnect(lambda: self._sample_connected(batch, window, seed))
+    def sample(
+        self, batch: int, window: int, seed: int, *, kind: str = "any"
+    ) -> SampleResult:
+        return self._with_reconnect(
+            lambda: self._sample_connected(batch, window, seed, kind)
+        )
 
     def refresh(self) -> SampleAck:
         """Re-acks on the live connection for fresh produced_rows."""
@@ -163,13 +184,23 @@ class SampleClient:
         self.ack = decode_ack(payload)
         return self.ack
 
-    def _sample_connected(self, batch: int, window: int, seed: int) -> SampleResult:
+    def _sample_connected(
+        self, batch: int, window: int, seed: int, kind: str
+    ) -> SampleResult:
         if self.sock is None:
             self.connect()
         if batch <= 0 or window <= 0:
             raise ValueError("batch and window must be positive")
+        try:
+            sample_kind = {"any": 0, "policy": 1, "value": 2}[kind]
+        except KeyError as error:
+            raise ValueError(f"unknown sample kind: {kind}") from error
         assert self.sock is not None
-        write_frame(self.sock, FRAME_SAMPLE, struct.pack("<IQQ", batch, window, seed))
+        write_frame(
+            self.sock,
+            FRAME_SAMPLE,
+            struct.pack("<IIQQ", batch, sample_kind, window, seed),
+        )
         frame_type, payload = read_frame(self.sock, self.read_buf)
         if frame_type == FRAME_ERROR:
             code, message = decode_error(payload)
@@ -191,6 +222,11 @@ class SampleClient:
             raise SampleError("sample batch/target row count mismatch")
         if batch_view.max_actions != targets.max_actions:
             raise SampleError("sample batch/target action width mismatch")
+        # BatchView and TargetsView are zero-copy views into read_buf. Hand the
+        # backing allocation to this result before another request reuses the
+        # client, otherwise a prefetched value sample overwrites the policy
+        # sample that precedes it.
+        self.read_buf = bytearray()
         return SampleResult(batch=batch_view, targets=targets, produced_rows=self.produced_rows)
 
     def _ack(self) -> SampleAck:
@@ -200,7 +236,7 @@ class SampleClient:
 
 
 def decode_ack(payload: memoryview) -> SampleAck:
-    if len(payload) < 108:
+    if len(payload) < 116:
         raise SampleError("sample HELLO_ACK truncated")
     protocol_version = struct.unpack_from("<I", payload, 0)[0]
     if protocol_version != SAMPLE_PROTOCOL_VERSION:
@@ -216,6 +252,7 @@ def decode_ack(payload: memoryview) -> SampleAck:
     root_present = struct.unpack_from("<I", payload, 88)[0]
     root_cost = struct.unpack_from("<f", payload, 92)[0]
     root_nodes, root_edges, root_candidates = struct.unpack_from("<III", payload, 96)
+    produced_policy_rows = struct.unpack_from("<Q", payload, 108)[0]
     root = (
         RootInfo(
             cost=root_cost,
@@ -230,6 +267,7 @@ def decode_ack(payload: memoryview) -> SampleAck:
         feature_schema_hash=FeatureSchemaHash.from_bytes(payload[4:36]),
         max_batch=max_batch,
         produced_rows=produced_rows,
+        produced_policy_rows=produced_policy_rows,
         episodes=episodes,
         episodes_stopped=episodes_stopped,
         episode_cost_ema=cost_ema,
@@ -241,13 +279,16 @@ def decode_ack(payload: memoryview) -> SampleAck:
         episode_latency_ema=latency_ema,
         best_cost=best_cost,
         root=root,
-        feature_schema=FeatureSchemaConfig.decode(payload[108:]),
+        feature_schema=FeatureSchemaConfig.decode(payload[116:]),
     )
 
 
-def step_seed(run_seed: int, step: int) -> int:
+def step_seed(run_seed: int, step: int, stream: str = "") -> int:
     hasher = hashlib.blake2b(digest_size=8)
     hasher.update(b"gz-trainer-step-seed-v1")
     hasher.update(run_seed.to_bytes(8, "little", signed=False))
     hasher.update(step.to_bytes(8, "little", signed=False))
+    if stream:
+        hasher.update(b"\0")
+        hasher.update(stream.encode("ascii"))
     return int.from_bytes(hasher.digest(), "little")

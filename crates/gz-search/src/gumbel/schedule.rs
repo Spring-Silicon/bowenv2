@@ -323,7 +323,7 @@ impl GumbelRng {
         Self { state: seed }
     }
 
-    fn unit(&mut self) -> f32 {
+    pub(super) fn unit(&mut self) -> f32 {
         let value = self.next_u64() >> 40;
         let unit = (value as f32 + 0.5) / (1_u32 << 24) as f32;
         unit.clamp(1.0e-7, 1.0 - 1.0e-7)

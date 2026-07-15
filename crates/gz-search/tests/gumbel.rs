@@ -179,36 +179,110 @@ fn stop_is_selected_through_eval_policy_and_never_applied() {
 }
 
 #[test]
-fn policy_rollout_masks_stop_wherever_a_rewrite_exists() {
-    let mut engine = TestEngine::new()
-        .candidates(0, [1])
-        .candidates(20, [])
-        .apply(0, 1, 20)
-        .reward(20, 20.0);
-    let mut evaluator = RecordedEvaluator::default()
-        .row(0, [-10.0, 10.0], 0.0)
-        .row(20, [0.0], 0.0);
-    let search = GumbelMcts::new(config(3)).policy_rollout();
+fn policy_rollout_preserves_base_stop_mask_setting() {
+    for mask_stop in [false, true] {
+        let mut engine = TestEngine::new()
+            .candidates(0, [1])
+            .candidates(20, [])
+            .apply(0, 1, 20)
+            .reward(20, 20.0);
+        let mut evaluator =
+            RecordedEvaluator::default()
+                .row(0, [-10.0, 10.0], 0.0)
+                .row(20, [0.0], 0.0);
+        let mut base_config = config(3);
+        base_config.mask_stop = mask_stop;
+        let search = GumbelMcts::new(base_config).policy_rollout();
 
-    let episode = search
-        .run(
-            &mut engine,
-            &mut evaluator,
-            0,
-            GumbelEpisodeContext::default(),
-        )
-        .unwrap();
+        assert_eq!(search.config().mask_stop, mask_stop);
 
-    // STOP dominates the eval policy at graph 0, but the rollout masks it
-    // wherever a rewrite exists -- the argmax reference must play. Graph 20
-    // is STOP-only, so STOP stays selectable there.
-    assert!(matches!(
-        episode.steps[0].action,
-        SearchAction::Candidate(1)
-    ));
-    assert_eq!(engine.apply_calls, vec![(0, 1)]);
-    assert_eq!(episode.final_graph, 20);
-    assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
+        let episode = search
+            .run(
+                &mut engine,
+                &mut evaluator,
+                0,
+                GumbelEpisodeContext::default(),
+            )
+            .unwrap();
+
+        if mask_stop {
+            assert!(matches!(
+                episode.steps[0].action,
+                SearchAction::Candidate(1)
+            ));
+            assert_eq!(engine.apply_calls, vec![(0, 1)]);
+            assert_eq!(episode.final_graph, 20);
+        } else {
+            assert!(matches!(episode.steps[0].action, SearchAction::Stop));
+            assert!(engine.apply_calls.is_empty());
+            assert_eq!(episode.final_graph, 0);
+        }
+        assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
+    }
+}
+
+#[test]
+fn policy_rollout_can_override_base_stop_mask_setting() {
+    let mut base_config = config(3);
+    base_config.mask_stop = false;
+    let search = GumbelMcts::new(base_config)
+        .with_policy_rollout_mask_stop(true)
+        .policy_rollout();
+
+    assert!(search.config().mask_stop);
+}
+
+#[test]
+fn policy_sample_rollout_is_categorical_top_one_without_tree_reuse() {
+    let mut base_config = config(7);
+    base_config.mask_stop = true;
+    base_config.no_backtrack = true;
+    base_config.tree_reuse = true;
+    let search = GumbelMcts::new(base_config).policy_sample_rollout();
+    let sampled = search.config();
+
+    assert_eq!(sampled.simulations, NonZeroUsize::MIN);
+    assert_eq!(sampled.max_considered_actions, NonZeroUsize::MIN);
+    assert_eq!(sampled.gumbel_scale, 1.0);
+    assert_eq!(sampled.gumbel_noise_overlap, -1.0);
+    assert!(!sampled.tree_reuse);
+    assert!(!sampled.no_backtrack);
+    assert!(sampled.mask_stop);
+}
+
+#[test]
+fn policy_sample_rollout_noise_seeds_produce_distinct_policy_actions() {
+    let search = GumbelMcts::new(config(1)).policy_sample_rollout();
+    let mut selected = std::collections::HashSet::new();
+
+    for noise_seed in 1..=32 {
+        let mut engine = TestEngine::new()
+            .candidates(0, [1, 2])
+            .candidates(20, [])
+            .candidates(30, [])
+            .apply(0, 1, 20)
+            .apply(0, 2, 30)
+            .reward(20, 20.0)
+            .reward(30, 30.0);
+        let mut evaluator = RecordedEvaluator::default()
+            .row(0, [0.0, 0.0, -100.0], 0.0)
+            .row(20, [0.0], 0.0)
+            .row(30, [0.0], 0.0);
+        let episode = search
+            .run(
+                &mut engine,
+                &mut evaluator,
+                0,
+                GumbelEpisodeContext {
+                    noise_seed,
+                    opponent: None,
+                },
+            )
+            .unwrap();
+        selected.insert(episode.steps[0].selected_action);
+    }
+
+    assert_eq!(selected.len(), 2);
 }
 
 #[test]

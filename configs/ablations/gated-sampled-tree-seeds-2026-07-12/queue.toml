@@ -1,0 +1,16 @@
+[queue]
+name = "gated-sampled-tree-seeds-2026-07-12"
+results_dir = "runs/ablation-gated-sampled-tree-seeds-2026-07-12"
+poll_seconds = 5.0
+min_free_gb = 40.0
+continue_on_failure = true
+
+[[runs]]
+name = "sampled-tree-model17"
+config = "01-model17.toml"
+timeout_seconds = 86400
+
+[[runs]]
+name = "sampled-tree-model42"
+config = "02-model42.toml"
+timeout_seconds = 86400

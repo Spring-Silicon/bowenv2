@@ -1,16 +1,17 @@
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::{
-    CF_EPISODES, CF_META, CF_ROW_INDEX, CF_ROWS, META_CONSUMED_ROWS, META_DELETED_FLOOR,
-    META_EPISODES_STOPPED, META_FEATURE_SCHEMA, META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS,
-    META_RETAINED_FLOOR, META_ROOT_INFO, META_SCHEMA_VERSION, SCHEMA_VERSION,
-    decode_episode_from_row_key, decode_step_from_row_key, decode_u32, decode_u64, decode_u64_key,
-    encode_u32, encode_u64, episode_key, row_index_key, row_key,
+    CF_EPISODES, CF_META, CF_ROW_INDEX, CF_ROWS, META_COMPLETED_GAMES, META_CONSUMED_ROWS,
+    META_DATA_MODE, META_DELETED_FLOOR, META_EPISODES_STOPPED, META_FEATURE_SCHEMA,
+    META_NEXT_EPISODE_SEQ, META_PRODUCED_POLICY_ROWS, META_PRODUCED_ROWS, META_RETAINED_FLOOR,
+    META_ROOT_INFO, META_SCHEMA_VERSION, META_TERMINAL_COST_BEST, META_TERMINAL_COST_EMA,
+    SCHEMA_VERSION, decode_episode_from_row_key, decode_step_from_row_key, decode_u32, decode_u64,
+    decode_u64_key, encode_u32, encode_u64, episode_key, row_index_key, row_key,
 };
 use crate::records::{
     ReplayEpisodeId, ReplayEpisodeRecord, ReplayRootInfo, ReplayRow, StoredReplayRow,
     validate_episode,
 };
-use crate::sample::{ReplayRng, SampleConfig};
+use crate::sample::{ReplayRng, SampleConfig, SampleKind};
 use gz_features::{FeatureSchema, FeatureSchemaConfig};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options,
@@ -23,15 +24,19 @@ use std::sync::{Arc, Mutex};
 pub struct ReplayStore {
     db: Arc<DB>,
     write_lock: Mutex<()>,
+    consumed_lock: Mutex<()>,
+    data_mode: Mutex<Option<ReplayDataMode>>,
     next_episode_seq: AtomicU64,
+    completed_games: AtomicU64,
     episodes_stopped: AtomicU64,
     produced_rows: AtomicU64,
+    produced_policy_rows: AtomicU64,
     consumed_rows: AtomicU64,
     /// Rows below this sequence may be gone; sampling clamps to it.
     retained_floor: AtomicU64,
     retain_rows: Option<u64>,
     /// Episode-weighted EMAs over recent appends (decay 0.99), stored as
-    /// f64 bits; zero bits = unseeded. Telemetry only: not persisted.
+    /// f64 bits; zero bits = unseeded. Terminal cost persists across reopen.
     cost_ema_bits: AtomicU64,
     len_ema_bits: AtomicU64,
     stop_ema_bits: AtomicU64,
@@ -46,10 +51,104 @@ pub struct ReplayStore {
 
 const OUTCOME_EMA_DECAY: f64 = 0.99;
 
+fn next_ema_bits(previous: u64, value: f64) -> u64 {
+    let next = if previous == 0 {
+        value
+    } else {
+        OUTCOME_EMA_DECAY * f64::from_bits(previous) + (1.0 - OUTCOME_EMA_DECAY) * value
+    };
+    next.to_bits()
+}
+
+fn next_best_cost_bits(previous: u64, cost: f64) -> u64 {
+    if previous == 0 || cost < f64::from_bits(previous) {
+        cost.to_bits()
+    } else {
+        previous
+    }
+}
+
+fn sample_kind_matches(kind: SampleKind, row: &ReplayRow) -> bool {
+    match kind {
+        SampleKind::Any => true,
+        SampleKind::Policy => row.policy_target.iter().any(|target| *target > 0.0),
+        SampleKind::Value => row.value_target.is_some(),
+    }
+}
+
+fn policy_row_count(rows: &[ReplayRow]) -> ReplayResult<u64> {
+    u64::try_from(
+        rows.iter()
+            .filter(|row| sample_kind_matches(SampleKind::Policy, row))
+            .count(),
+    )
+    .map_err(|_| ReplayError::InvalidRecord)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplayCounters {
     pub produced_rows: u64,
+    pub produced_policy_rows: u64,
     pub consumed_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayDataMode {
+    Standard,
+    SampledTree,
+    Graded {
+        sampled_tree: bool,
+        reward_scale_bits: u32,
+    },
+}
+
+impl ReplayDataMode {
+    pub fn graded(sampled_tree: bool, reward_scale: f32) -> ReplayResult<Self> {
+        if !reward_scale.is_finite() || reward_scale <= 0.0 {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(Self::Graded {
+            sampled_tree,
+            reward_scale_bits: reward_scale.to_bits(),
+        })
+    }
+
+    #[must_use]
+    pub const fn is_graded(self) -> bool {
+        matches!(self, Self::Graded { .. })
+    }
+
+    fn bytes(self) -> Vec<u8> {
+        match self {
+            Self::Standard => b"standard-v1".to_vec(),
+            Self::SampledTree => b"sampled-tree-v1".to_vec(),
+            Self::Graded {
+                sampled_tree,
+                reward_scale_bits,
+            } => {
+                let mut bytes = b"graded-v1".to_vec();
+                bytes.push(u8::from(sampled_tree));
+                bytes.extend_from_slice(&reward_scale_bits.to_le_bytes());
+                bytes
+            }
+        }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            b"standard-v1" => Some(Self::Standard),
+            b"sampled-tree-v1" => Some(Self::SampledTree),
+            _ if bytes.len() == 14 && bytes.starts_with(b"graded-v1") && bytes[9] <= 1 => {
+                let reward_scale_bits = u32::from_le_bytes(bytes[10..14].try_into().ok()?);
+                let reward_scale = f32::from_bits(reward_scale_bits);
+                (reward_scale.is_finite() && reward_scale > 0.0).then_some(Self::Graded {
+                    sampled_tree: bytes[9] != 0,
+                    reward_scale_bits,
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 impl ReplayStore {
@@ -66,27 +165,39 @@ impl ReplayStore {
 
         let next_episode_seq = recover_next_episode_seq(&db)?;
         let produced_rows = recover_next_row_seq(&db)?;
+        let produced_policy_rows =
+            read_meta_u64(&db, META_PRODUCED_POLICY_ROWS)?.unwrap_or(produced_rows);
         let consumed_rows = read_meta_u64(&db, META_CONSUMED_ROWS)?.unwrap_or(0);
+        let completed_games = read_meta_u64(&db, META_COMPLETED_GAMES)?.unwrap_or(next_episode_seq);
         let episodes_stopped = read_meta_u64(&db, META_EPISODES_STOPPED)?.unwrap_or(0);
         let retained_floor = read_meta_u64(&db, META_RETAINED_FLOOR)?.unwrap_or(0);
+        let cost_ema_bits = read_meta_u64(&db, META_TERMINAL_COST_EMA)?.unwrap_or(0);
+        let best_cost_bits = read_meta_u64(&db, META_TERMINAL_COST_BEST)?.unwrap_or(0);
+        let data_mode = read_data_mode(&db)?;
         write_meta_u64(&db, META_NEXT_EPISODE_SEQ, next_episode_seq)?;
         write_meta_u64(&db, META_PRODUCED_ROWS, produced_rows)?;
+        write_meta_u64(&db, META_PRODUCED_POLICY_ROWS, produced_policy_rows)?;
+        write_meta_u64(&db, META_COMPLETED_GAMES, completed_games)?;
 
         Ok(Self {
             db,
             write_lock: Mutex::new(()),
+            consumed_lock: Mutex::new(()),
+            data_mode: Mutex::new(data_mode),
             next_episode_seq: AtomicU64::new(next_episode_seq),
+            completed_games: AtomicU64::new(completed_games),
             episodes_stopped: AtomicU64::new(episodes_stopped),
             produced_rows: AtomicU64::new(produced_rows),
+            produced_policy_rows: AtomicU64::new(produced_policy_rows),
             consumed_rows: AtomicU64::new(consumed_rows),
             retained_floor: AtomicU64::new(retained_floor),
             retain_rows,
-            cost_ema_bits: AtomicU64::new(0),
+            cost_ema_bits: AtomicU64::new(cost_ema_bits),
             win_ema_bits: AtomicU64::new(0),
             latency_ema_bits: AtomicU64::new(0),
             len_ema_bits: AtomicU64::new(0),
             stop_ema_bits: AtomicU64::new(0),
-            best_cost_bits: AtomicU64::new(0),
+            best_cost_bits: AtomicU64::new(best_cost_bits),
         })
     }
 
@@ -102,7 +213,7 @@ impl ReplayStore {
             .map(|config| FeatureSchema::new(config.clone()).map(|schema| schema.hash()))
             .transpose()
             .map_err(|_| ReplayError::InvalidRecord)?;
-        validate_episode(record, rows, feature_schema_hash)?;
+        validate_episode(record, rows, feature_schema_hash, self.data_mode()?)?;
 
         let episode_seq = self.next_episode_seq.load(Ordering::Acquire);
         let row_seq = self.produced_rows.load(Ordering::Acquire);
@@ -112,7 +223,20 @@ impl ReplayStore {
         let produced_rows = row_seq
             .checked_add(rows.len() as u64)
             .ok_or(ReplayError::InvalidRecord)?;
+        let produced_policy_rows = self
+            .produced_policy_rows
+            .load(Ordering::Acquire)
+            .checked_add(policy_row_count(rows)?)
+            .ok_or(ReplayError::InvalidRecord)?;
         let id = ReplayEpisodeId::new(episode_seq);
+        let completed_games = self
+            .completed_games
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or_else(|| ReplayError::storage("completed game counter overflow"))?;
+        let cost = f64::from(-record.outcome.learner_reward);
+        let cost_ema_bits = next_ema_bits(self.cost_ema_bits.load(Ordering::Acquire), cost);
+        let best_cost_bits = next_best_cost_bits(self.best_cost_bits.load(Ordering::Acquire), cost);
 
         let episodes = self.cf(CF_EPISODES)?;
         let row_cf = self.cf(CF_ROWS)?;
@@ -142,6 +266,14 @@ impl ReplayStore {
 
         batch.put_cf(&meta, META_NEXT_EPISODE_SEQ, encode_u64(next_episode_seq));
         batch.put_cf(&meta, META_PRODUCED_ROWS, encode_u64(produced_rows));
+        batch.put_cf(
+            &meta,
+            META_PRODUCED_POLICY_ROWS,
+            encode_u64(produced_policy_rows),
+        );
+        batch.put_cf(&meta, META_COMPLETED_GAMES, encode_u64(completed_games));
+        batch.put_cf(&meta, META_TERMINAL_COST_EMA, encode_u64(cost_ema_bits));
+        batch.put_cf(&meta, META_TERMINAL_COST_BEST, encode_u64(best_cost_bits));
         let episodes_stopped =
             self.episodes_stopped.load(Ordering::Acquire) + u64::from(record.outcome.stopped);
         batch.put_cf(&meta, META_EPISODES_STOPPED, encode_u64(episodes_stopped));
@@ -150,12 +282,17 @@ impl ReplayStore {
             .store(episodes_stopped, Ordering::Release);
         self.next_episode_seq
             .store(next_episode_seq, Ordering::Release);
+        self.completed_games
+            .store(completed_games, Ordering::Release);
         self.produced_rows.store(produced_rows, Ordering::Release);
+        self.produced_policy_rows
+            .store(produced_policy_rows, Ordering::Release);
+        self.cost_ema_bits.store(cost_ema_bits, Ordering::Release);
+        self.best_cost_bits.store(best_cost_bits, Ordering::Release);
         self.enforce_retention(produced_rows)?;
-        let cost = f64::from(-record.outcome.learner_reward);
-        self.update_outcome_emas(
-            cost,
-            rows.len() as f64,
+        self.update_ema(&self.len_ema_bits, rows.len() as f64);
+        self.update_ema(
+            &self.stop_ema_bits,
             f64::from(u8::from(record.outcome.stopped)),
         );
         if let Some(value_target) = record.outcome.value_target {
@@ -166,12 +303,134 @@ impl ReplayStore {
                 f64::from(u8::from(value_target > 0.0)) + 1.0,
             );
         }
-        let best = self.best_cost_bits.load(Ordering::Acquire);
-        if best == 0 || cost < f64::from_bits(best) {
-            self.best_cost_bits.store(cost.to_bits(), Ordering::Release);
+        Ok(id)
+    }
+
+    /// Atomically appends both perspectives of one competitive game. The
+    /// primary record is the learner for episode-level telemetry; row and
+    /// storage counters include both records, while game counters advance once.
+    pub fn append_episode_pair(
+        &self,
+        primary: (&ReplayEpisodeRecord, &[ReplayRow]),
+        secondary: (&ReplayEpisodeRecord, &[ReplayRow]),
+    ) -> ReplayResult<(ReplayEpisodeId, ReplayEpisodeId)> {
+        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
+        let feature_schema = read_feature_schema(&self.db)?;
+        let feature_schema_hash = feature_schema
+            .as_ref()
+            .map(|config| FeatureSchema::new(config.clone()).map(|schema| schema.hash()))
+            .transpose()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        let data_mode = self.data_mode()?;
+        validate_episode(primary.0, primary.1, feature_schema_hash, data_mode)?;
+        validate_episode(secondary.0, secondary.1, feature_schema_hash, data_mode)?;
+
+        let first_seq = self.next_episode_seq.load(Ordering::Acquire);
+        let second_seq = first_seq
+            .checked_add(1)
+            .ok_or_else(|| ReplayError::storage("episode id overflow"))?;
+        let next_episode_seq = first_seq
+            .checked_add(2)
+            .ok_or_else(|| ReplayError::storage("episode id overflow"))?;
+        let row_seq = self.produced_rows.load(Ordering::Acquire);
+        let primary_rows =
+            u64::try_from(primary.1.len()).map_err(|_| ReplayError::InvalidRecord)?;
+        let total_rows = primary_rows
+            .checked_add(u64::try_from(secondary.1.len()).map_err(|_| ReplayError::InvalidRecord)?)
+            .ok_or(ReplayError::InvalidRecord)?;
+        let produced_rows = row_seq
+            .checked_add(total_rows)
+            .ok_or(ReplayError::InvalidRecord)?;
+        let produced_policy_rows = self
+            .produced_policy_rows
+            .load(Ordering::Acquire)
+            .checked_add(
+                policy_row_count(primary.1)?
+                    .checked_add(policy_row_count(secondary.1)?)
+                    .ok_or(ReplayError::InvalidRecord)?,
+            )
+            .ok_or(ReplayError::InvalidRecord)?;
+        let completed_games = self
+            .completed_games
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or_else(|| ReplayError::storage("completed game counter overflow"))?;
+        let cost = f64::from(-primary.0.outcome.learner_reward);
+        let cost_ema_bits = next_ema_bits(self.cost_ema_bits.load(Ordering::Acquire), cost);
+        let best_cost_bits = next_best_cost_bits(self.best_cost_bits.load(Ordering::Acquire), cost);
+
+        let episodes = self.cf(CF_EPISODES)?;
+        let row_cf = self.cf(CF_ROWS)?;
+        let row_index = self.cf(CF_ROW_INDEX)?;
+        let meta = self.cf(CF_META)?;
+        let mut batch = WriteBatch::default();
+        for (episode_seq, row_base, (record, rows)) in [
+            (first_seq, row_seq, primary),
+            (second_seq, row_seq + primary_rows, secondary),
+        ] {
+            batch.put_cf(
+                &episodes,
+                episode_key(episode_seq),
+                postcard::to_allocvec(record)?,
+            );
+            for (offset, row) in rows.iter().enumerate() {
+                let key = row_key(episode_seq, row.step_index);
+                batch.put_cf(
+                    &row_cf,
+                    key,
+                    postcard::to_allocvec(&StoredReplayRow::from_row(row)?)?,
+                );
+                batch.put_cf(
+                    &row_index,
+                    row_index_key(row_base + offset as u64),
+                    key.as_slice(),
+                );
+            }
         }
 
-        Ok(id)
+        let episodes_stopped =
+            self.episodes_stopped.load(Ordering::Acquire) + u64::from(primary.0.outcome.stopped);
+        batch.put_cf(&meta, META_NEXT_EPISODE_SEQ, encode_u64(next_episode_seq));
+        batch.put_cf(&meta, META_PRODUCED_ROWS, encode_u64(produced_rows));
+        batch.put_cf(
+            &meta,
+            META_PRODUCED_POLICY_ROWS,
+            encode_u64(produced_policy_rows),
+        );
+        batch.put_cf(&meta, META_COMPLETED_GAMES, encode_u64(completed_games));
+        batch.put_cf(&meta, META_EPISODES_STOPPED, encode_u64(episodes_stopped));
+        batch.put_cf(&meta, META_TERMINAL_COST_EMA, encode_u64(cost_ema_bits));
+        batch.put_cf(&meta, META_TERMINAL_COST_BEST, encode_u64(best_cost_bits));
+        self.db.write(batch)?;
+
+        self.next_episode_seq
+            .store(next_episode_seq, Ordering::Release);
+        self.completed_games
+            .store(completed_games, Ordering::Release);
+        self.episodes_stopped
+            .store(episodes_stopped, Ordering::Release);
+        self.produced_rows.store(produced_rows, Ordering::Release);
+        self.produced_policy_rows
+            .store(produced_policy_rows, Ordering::Release);
+        self.cost_ema_bits.store(cost_ema_bits, Ordering::Release);
+        self.best_cost_bits.store(best_cost_bits, Ordering::Release);
+        self.enforce_retention(produced_rows)?;
+
+        self.update_ema(&self.len_ema_bits, primary.1.len() as f64);
+        self.update_ema(
+            &self.stop_ema_bits,
+            f64::from(u8::from(primary.0.outcome.stopped)),
+        );
+        if let Some(value_target) = primary.0.outcome.value_target {
+            self.update_ema(
+                &self.win_ema_bits,
+                f64::from(u8::from(value_target > 0.0)) + 1.0,
+            );
+        }
+        Ok((
+            ReplayEpisodeId::new(first_seq),
+            ReplayEpisodeId::new(second_seq),
+        ))
     }
 
     /// Runs under the append write lock. Two floors make this safe against
@@ -270,6 +529,28 @@ impl ReplayStore {
         }
     }
 
+    pub fn ensure_data_mode(&self, mode: ReplayDataMode) -> ReplayResult<()> {
+        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
+        let meta = self.cf(CF_META)?;
+        let encoded = mode.bytes();
+        match self.db.get_cf(&meta, META_DATA_MODE)? {
+            Some(stored) if stored.as_slice() == encoded => {}
+            Some(_) => return Err(ReplayError::DataModeMismatch),
+            None => {
+                if self.next_episode_seq.load(Ordering::Acquire) > 0
+                    && mode != ReplayDataMode::Standard
+                {
+                    return Err(ReplayError::DataModeMismatch);
+                }
+                self.db
+                    .put_cf(&meta, META_DATA_MODE, encoded)
+                    .map_err(ReplayError::from)?;
+            }
+        }
+        *self.data_mode.lock().map_err(ReplayError::storage)? = Some(mode);
+        Ok(())
+    }
+
     pub fn feature_schema(&self) -> ReplayResult<Option<FeatureSchemaConfig>> {
         read_feature_schema(&self.db)
     }
@@ -286,6 +567,14 @@ impl ReplayStore {
         &self,
         config: SampleConfig,
     ) -> ReplayResult<Vec<(ReplayEpisodeId, ReplayRow)>> {
+        self.sample_rows_kind(config, SampleKind::Any)
+    }
+
+    pub fn sample_rows_kind(
+        &self,
+        config: SampleConfig,
+        kind: SampleKind,
+    ) -> ReplayResult<Vec<(ReplayEpisodeId, ReplayRow)>> {
         // Lock-free against producers: appends commit their WriteBatch before
         // publishing produced_rows, so every sampled row_seq is fully visible.
         let produced = self.produced_rows.load(Ordering::Acquire);
@@ -298,20 +587,89 @@ impl ReplayStore {
         let window = config.window_rows.get().min(produced - floor);
         let start = produced - window;
         let mut rng = ReplayRng::new(config.seed);
-        let row_index = self.cf(CF_ROW_INDEX)?;
-        let rows = self.cf(CF_ROWS)?;
         let batch = config.batch.get();
+
+        if kind != SampleKind::Any {
+            let mut out = Vec::with_capacity(batch);
+            for _ in 0..16 {
+                if out.len() >= batch {
+                    break;
+                }
+                let remaining = batch - out.len();
+                let draw_count = remaining.saturating_mul(2).max(16);
+                let sequences = (0..draw_count)
+                    .map(|_| start + rng.next_bounded(window))
+                    .collect::<Vec<_>>();
+                out.extend(
+                    self.read_row_sequences(&sequences)?
+                        .into_iter()
+                        .filter(|(_, row)| sample_kind_matches(kind, row))
+                        .take(remaining),
+                );
+            }
+
+            if out.len() < batch {
+                // The normal rejection path stays lock-free. A sparse stream
+                // falls back to a full-window scan, which may span multiple
+                // retention cycles, so pin appends and recompute the floor for
+                // this rare path.
+                let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
+                let produced = self.produced_rows.load(Ordering::Acquire);
+                let floor = self.retained_floor.load(Ordering::Acquire);
+                let window = config.window_rows.get().min(produced - floor);
+                let start = produced - window;
+                let mut eligible = Vec::new();
+                let mut offset = 0;
+                while offset < window {
+                    let count = (window - offset).min(512);
+                    let sequences = (0..count)
+                        .map(|index| start + offset + index)
+                        .collect::<Vec<_>>();
+                    eligible.extend(
+                        self.read_row_sequences(&sequences)?
+                            .into_iter()
+                            .filter(|(_, row)| sample_kind_matches(kind, row)),
+                    );
+                    offset += count;
+                }
+                if eligible.is_empty() {
+                    return Err(ReplayError::Empty);
+                }
+                while out.len() < batch {
+                    let index = rng.next_bounded(eligible.len() as u64) as usize;
+                    out.push(eligible[index].clone());
+                }
+            }
+
+            self.record_consumed(config.batch.get() as u64)?;
+            return Ok(out);
+        }
 
         // Two batched MultiGet phases instead of 2 x batch sequential
         // point gets: index keys resolve to row keys, row keys resolve to
         // rows. Results return in request order, so sampling stays
         // bit-identical to the sequential loop for a given seed.
-        let index_keys = (0..batch)
-            .map(|_| row_index_key(start + rng.next_bounded(window)))
+        let sequences = (0..batch)
+            .map(|_| start + rng.next_bounded(window))
             .collect::<Vec<_>>();
+        let out = self.read_row_sequences(&sequences)?;
+        self.record_consumed(config.batch.get() as u64)?;
+        Ok(out)
+    }
 
-        let mut row_keys = Vec::with_capacity(batch);
-        let mut episode_seqs = Vec::with_capacity(batch);
+    fn read_row_sequences(
+        &self,
+        sequences: &[u64],
+    ) -> ReplayResult<Vec<(ReplayEpisodeId, ReplayRow)>> {
+        let row_index = self.cf(CF_ROW_INDEX)?;
+        let rows = self.cf(CF_ROWS)?;
+        let index_keys = sequences
+            .iter()
+            .copied()
+            .map(row_index_key)
+            .collect::<Vec<_>>();
+        let mut row_keys = Vec::with_capacity(sequences.len());
+        let mut episode_seqs = Vec::with_capacity(sequences.len());
         for result in self.db.batched_multi_get_cf(&row_index, &index_keys, false) {
             let row_key = result?.ok_or_else(|| ReplayError::storage("missing row index entry"))?;
             let episode_seq = decode_episode_from_row_key(&row_key)
@@ -320,44 +678,38 @@ impl ReplayStore {
             row_keys.push(row_key);
         }
 
-        let mut out = Vec::with_capacity(batch);
-        let row_results = self.db.batched_multi_get_cf(&rows, row_keys.iter(), false);
-        for (episode_seq, result) in episode_seqs.into_iter().zip(row_results) {
+        let mut out = Vec::with_capacity(sequences.len());
+        for (episode_seq, result) in episode_seqs.into_iter().zip(self.db.batched_multi_get_cf(
+            &rows,
+            row_keys.iter(),
+            false,
+        )) {
             let row = result?.ok_or_else(|| ReplayError::storage("missing replay row"))?;
             out.push((
                 ReplayEpisodeId::new(episode_seq),
                 postcard::from_bytes::<StoredReplayRow>(&row)?.into_row(),
             ));
         }
-
-        let consumed_rows = self
-            .consumed_rows
-            .fetch_add(config.batch.get() as u64, Ordering::AcqRel)
-            .checked_add(config.batch.get() as u64)
-            .ok_or_else(|| ReplayError::storage("consumed row counter overflow"))?;
-        write_meta_u64(&self.db, META_CONSUMED_ROWS, consumed_rows)?;
-
         Ok(out)
     }
 
-    fn update_outcome_emas(&self, cost: f64, len: f64, stopped: f64) {
-        for (bits, value) in [
-            (&self.cost_ema_bits, cost),
-            (&self.len_ema_bits, len),
-            (&self.stop_ema_bits, stopped),
-        ] {
-            self.update_ema(bits, value);
-        }
+    fn record_consumed(&self, count: u64) -> ReplayResult<()> {
+        // Concurrent sample sessions may finish out of order. Serialize the
+        // metadata update so a late write cannot persist an older counter.
+        let _guard = self.consumed_lock.lock().map_err(ReplayError::storage)?;
+        let consumed_rows = self
+            .consumed_rows
+            .load(Ordering::Acquire)
+            .checked_add(count)
+            .ok_or_else(|| ReplayError::storage("consumed row counter overflow"))?;
+        write_meta_u64(&self.db, META_CONSUMED_ROWS, consumed_rows)?;
+        self.consumed_rows.store(consumed_rows, Ordering::Release);
+        Ok(())
     }
 
     fn update_ema(&self, bits: &AtomicU64, value: f64) {
         let previous = bits.load(Ordering::Acquire);
-        let next = if previous == 0 {
-            value
-        } else {
-            OUTCOME_EMA_DECAY * f64::from_bits(previous) + (1.0 - OUTCOME_EMA_DECAY) * value
-        };
-        bits.store(next.to_bits(), Ordering::Release);
+        bits.store(next_ema_bits(previous, value), Ordering::Release);
     }
 
     /// Episode-weighted EMAs over recent appends:
@@ -422,11 +774,11 @@ impl ReplayStore {
             .transpose()
     }
 
-    /// (episodes appended, episodes that ended by selecting STOP).
+    /// (completed games, primary learner episodes that selected STOP).
     #[must_use]
     pub fn episode_counters(&self) -> (u64, u64) {
         (
-            self.next_episode_seq.load(Ordering::Acquire),
+            self.completed_games.load(Ordering::Acquire),
             self.episodes_stopped.load(Ordering::Acquire),
         )
     }
@@ -435,6 +787,7 @@ impl ReplayStore {
     pub fn counters(&self) -> ReplayCounters {
         ReplayCounters {
             produced_rows: self.produced_rows.load(Ordering::Acquire),
+            produced_policy_rows: self.produced_policy_rows.load(Ordering::Acquire),
             consumed_rows: self.consumed_rows.load(Ordering::Acquire),
         }
     }
@@ -443,6 +796,14 @@ impl ReplayStore {
         self.db
             .cf_handle(name)
             .ok_or_else(|| ReplayError::storage(format!("missing column family {name}")))
+    }
+
+    fn data_mode(&self) -> ReplayResult<ReplayDataMode> {
+        Ok(self
+            .data_mode
+            .lock()
+            .map_err(ReplayError::storage)?
+            .unwrap_or(ReplayDataMode::Standard))
     }
 }
 
@@ -557,7 +918,9 @@ fn ensure_schema(db: &DB) -> ReplayResult<()> {
             let mut batch = WriteBatch::default();
             batch.put_cf(&meta, META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION));
             batch.put_cf(&meta, META_NEXT_EPISODE_SEQ, encode_u64(0));
+            batch.put_cf(&meta, META_COMPLETED_GAMES, encode_u64(0));
             batch.put_cf(&meta, META_PRODUCED_ROWS, encode_u64(0));
+            batch.put_cf(&meta, META_PRODUCED_POLICY_ROWS, encode_u64(0));
             batch.put_cf(&meta, META_CONSUMED_ROWS, encode_u64(0));
             db.write(batch).map_err(ReplayError::from)
         }
@@ -622,5 +985,15 @@ fn read_feature_schema(db: &DB) -> ReplayResult<Option<FeatureSchemaConfig>> {
                 .map(FeatureSchemaConfig::from)
                 .map_err(ReplayError::from)
         })
+        .transpose()
+}
+
+fn read_data_mode(db: &DB) -> ReplayResult<Option<ReplayDataMode>> {
+    let meta = db
+        .cf_handle(CF_META)
+        .ok_or_else(|| ReplayError::storage("missing meta column family"))?;
+
+    db.get_cf(&meta, META_DATA_MODE)?
+        .map(|bytes| ReplayDataMode::from_bytes(&bytes).ok_or(ReplayError::DataModeMismatch))
         .transpose()
 }

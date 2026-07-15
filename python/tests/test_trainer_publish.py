@@ -80,3 +80,27 @@ def test_ema_norms_report_param_and_update_magnitudes() -> None:
     param_norm, update_norm = ema.norms(snapshot)
     assert abs(param_norm - 4.0) < 1e-6  # sqrt(4 * 4)
     assert abs(update_norm - 2.0) < 1e-6  # delta 1.0 each -> sqrt(4)
+
+
+def test_publish_ema_rejects_nonfinite_weights_before_writing(tmp_path: Path) -> None:
+    schema = schema_config()
+    arch = ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0)
+    model = build_model(schema, arch)
+    ema = EmaWeights(model, decay=0.0)
+    with torch.no_grad():
+        next(model.parameters()).fill_(float("nan"))
+    ema.update(model)
+
+    with pytest.raises(RuntimeError, match="non-finite EMA tensor"):
+        publish_ema(
+            tmp_path,
+            ema,
+            schema=schema,
+            schema_hash=FeatureSchemaHash.from_bytes(b"f" * 32),
+            arch=arch,
+            training_step=1,
+            run_id="run",
+        )
+
+    assert not (tmp_path / "latest.json").exists()
+    assert not list(tmp_path.glob("version_*"))

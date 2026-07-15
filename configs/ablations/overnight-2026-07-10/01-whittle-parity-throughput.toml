@@ -1,0 +1,26 @@
+extends = "../../bases/whittle-seed42-parity.toml"
+
+# Positive control, not a causal ablation: preserve the complete working
+# Whittle semantic recipe while replacing only its actor/trainer cadence with
+# the steady-arena throughput settings.
+
+[trainer]
+total_steps = 5000
+publish_interval = 256
+publish_lag_blocks = 0
+min_startup_rows = 1000
+max_reuse = 8.0
+reuse_gate_interval = 1
+reuse_gate_episodes = 0
+
+[selfplay]
+lanes = 44
+workers_per_lane = 32
+max_batch = 256
+admission_stagger_ms = 1600
+
+[wandb]
+run_name = "ablate-o1-01-whittle-parity-throughput"
+
+[paths]
+run_dir = "runs/ablate-o1-01-whittle-parity-throughput"

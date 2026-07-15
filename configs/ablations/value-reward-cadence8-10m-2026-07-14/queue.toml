@@ -1,0 +1,35 @@
+[queue]
+name = "whittle-generated-exphormer-v2-10m-cadence8-value-reward"
+results_dir = "runs/queues/whittle-generated-exphormer-v2-10m-cadence8-value-reward"
+poll_seconds = 5.0
+min_free_gb = 5.0
+continue_on_failure = false
+wait_for_state = "runs/queues/whittle-generated-exphormer-v2-sampled-tree-2-cadence8-value-reward/state.json"
+wait_timeout_seconds = 21600.0
+wait_for_success = true
+
+[queue.environment]
+_RJEM_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+GZ_ARENA_STATS = "1"
+
+[[runs]]
+name = "distill-10m"
+kind = "distill"
+generate = true
+config = "00-distill.toml"
+timeout_seconds = 7200
+
+[[runs]]
+name = "sign-10m"
+config = "01-sign.toml"
+timeout_seconds = 36000
+
+[[runs]]
+name = "graded-tanh-10m"
+config = "02-graded-tanh.toml"
+timeout_seconds = 36000
+
+[[runs]]
+name = "graded-hl-gauss-10m"
+config = "03-graded-hl-gauss.toml"
+timeout_seconds = 36000

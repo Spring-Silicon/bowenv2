@@ -1,0 +1,14 @@
+extends = "../../bases/gated-pool32-s42-throughput.toml"
+
+[trainer]
+optimizer = "muon_mixed"
+policy_init = "neutral"
+model_seed = 17
+data_seed = 42
+total_steps = 1000
+
+[wandb]
+run_name = "uniform-gz-i1-muon-s17-1"
+
+[paths]
+run_dir = "runs/uniform-gz-i1-muon-s17-1"

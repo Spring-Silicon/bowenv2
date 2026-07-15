@@ -3,6 +3,12 @@ use gz_engine::{EngineResult, GraphEngine};
 pub trait RootSource<E: GraphEngine> {
     fn next_root(&mut self, engine: &mut E) -> EngineResult<Option<E::Graph>>;
 
+    /// Whether each graph returned by `next_root` transfers one engine
+    /// reference that must be released with the completed episode.
+    fn episode_roots_are_owned(&self) -> bool {
+        false
+    }
+
     /// The single root every episode shares, for sources that have one
     /// (fixed-root mode). Opponent rollouts replay from it without
     /// consuming the episode budget. None for per-episode roots.

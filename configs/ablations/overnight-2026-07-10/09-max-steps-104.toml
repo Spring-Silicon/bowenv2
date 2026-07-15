@@ -1,0 +1,10 @@
+extends = "../../bases/benchmark-throughput-r8-screen.toml"
+
+[selfplay]
+max_steps = 104
+
+[wandb]
+run_name = "ablate-o1-09-max-steps-104"
+
+[paths]
+run_dir = "runs/ablate-o1-09-max-steps-104"

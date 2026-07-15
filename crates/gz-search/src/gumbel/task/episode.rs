@@ -192,6 +192,7 @@ where
                     final_measure: measure,
                     stop_reason,
                     search_config_hash: self.search_config_hash,
+                    competitive: None,
                 });
                 Ok(())
             }
@@ -211,6 +212,10 @@ where
 
     pub fn take_releasable(&mut self) -> GumbelHandleBatch<G, C> {
         std::mem::take(&mut self.releasable)
+    }
+
+    pub fn track_owned_root(&mut self) {
+        self.path_graphs.push(self.root);
     }
 
     pub fn take_all_handles(&mut self) -> GumbelHandleBatch<G, C> {
@@ -254,6 +259,7 @@ where
             &GumbelMcts {
                 config: self.config,
                 search_config_hash: self.search_config_hash,
+                policy_rollout_mask_stop: None,
             },
             self.identity,
             root,

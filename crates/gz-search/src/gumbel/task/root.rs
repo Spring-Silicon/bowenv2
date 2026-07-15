@@ -215,6 +215,8 @@ where
             candidates: expansion.candidates.clone(),
             request: request.clone(),
             measure_options: self.config.measure_options,
+            model: crate::work::EvalModel::Episode,
+            opponent: None,
         };
 
         self.pending = Some(PendingRootWork::EvalNode {
@@ -251,22 +253,14 @@ where
         }
 
         let root_scores = self.tree.root_scores(0, &run.base_scores);
-        let action = loop {
-            if run.schedule_index >= run.schedule.len() {
-                return false;
-            }
-
-            let target_visits = run.schedule[run.schedule_index];
-            if let Some(action) = best_eligible(
-                &self.tree.nodes[0],
-                &run.considered,
-                &run.baseline_visits,
-                target_visits,
-                &root_scores,
-            ) {
-                break action;
-            }
-
+        let target_visits = run.schedule[run.schedule_index];
+        let Some(action) = best_eligible(
+            &self.tree.nodes[0],
+            &run.considered,
+            &run.baseline_visits,
+            target_visits,
+            &root_scores,
+        ) else {
             return false;
         };
 
@@ -310,6 +304,8 @@ where
                     candidates,
                     request: request.clone(),
                     measure_options: self.config.measure_options,
+                    model: crate::work::EvalModel::Episode,
+                    opponent: None,
                 };
                 let pending = PendingRootWork::StopEval {
                     token,

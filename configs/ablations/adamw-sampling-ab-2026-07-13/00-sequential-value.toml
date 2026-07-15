@@ -1,0 +1,38 @@
+extends = "../../bases/whittle-generated-exphormer.toml"
+
+[trainer]
+optimizer = "adamw"
+lr = 0.0002
+adamw_lr = 0.0002
+lr_schedule = "constant"
+warmup_steps = 0
+min_lr_ratio = 0.0
+batch = 512
+value_batch = 512
+window_rows = 30000
+value_window_rows = 30000
+total_steps = 10000
+publish_interval = 256
+weight_decay = 0.0001
+ema_decay = 0.0
+grad_clip = 3.0
+value_mirror = false
+compile_model = true
+matmul_precision = "high"
+max_reuse = 8.0
+parallel_value_sampling = false
+
+[selfplay]
+policy_opponent_mode = "sampled-tree"
+reference_gamma = 0.0
+length_tiebreak = false
+max_batch = 128
+reference_max_batch = 128
+replay_retain = 48000
+
+[wandb]
+run_name = "optimizer-ab-adamw-sequential-value-s42-10k-1"
+
+[paths]
+run_dir = "runs/optimizer-ab-adamw-sequential-value-s42-10k-1"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/optimizer-ab-adamw-sequential-value-s42-10k-1"

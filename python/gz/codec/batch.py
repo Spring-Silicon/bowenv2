@@ -41,6 +41,8 @@ class _Layout:
     opponent_reward: int
     opponent_present: int
     opponent_state_present: int
+    opponent_trajectory_id: int
+    opponent_row: int
     opponent_node_count: int
     opponent_node_tokens: int
     opponent_node_attrs: int
@@ -71,6 +73,8 @@ class BatchView:
     opponent_reward: np.ndarray
     opponent_present: np.ndarray
     opponent_state_present: np.ndarray
+    opponent_trajectory_id: np.ndarray
+    opponent_row: np.ndarray
     opponent_node_count: np.ndarray
     opponent_node_tokens: np.ndarray
     opponent_node_attrs: np.ndarray | None
@@ -162,6 +166,13 @@ class BatchView:
             opponent_reward=_bf16_array(view, layout.opponent_reward, (layout.b,)),
             opponent_present=_array(view, layout.opponent_present, "u1", (layout.b,)),
             opponent_state_present=_array(view, layout.opponent_state_present, "u1", (layout.b,)),
+            opponent_trajectory_id=_array(
+                view,
+                layout.opponent_trajectory_id,
+                "<u8",
+                (layout.b,),
+            ),
+            opponent_row=_array(view, layout.opponent_row, "<u4", (layout.b,)),
             opponent_node_count=_array(view, layout.opponent_node_count, "<u4", (layout.b,)),
             opponent_node_tokens=_array(view, layout.opponent_node_tokens, "<u2", (layout.b, layout.n)),
             opponent_node_attrs=opponent_node_attrs,
@@ -208,6 +219,8 @@ def _layout(b: int, n: int, e: int, a: int, s: int, d: int) -> _Layout:
     opponent_reward, cursor = _section(cursor, b * 2)
     opponent_present, cursor = _section(cursor, b)
     opponent_state_present, cursor = _section(cursor, b)
+    opponent_trajectory_id, cursor = _section(cursor, b * 8)
+    opponent_row, cursor = _section(cursor, b * 4)
     opponent_node_count, cursor = _section(cursor, b * 4)
     opponent_node_tokens, cursor = _section(cursor, b * n * 2)
     opponent_node_attrs, cursor = _section(cursor, b * n * d * 2)
@@ -239,6 +252,8 @@ def _layout(b: int, n: int, e: int, a: int, s: int, d: int) -> _Layout:
         opponent_reward=opponent_reward,
         opponent_present=opponent_present,
         opponent_state_present=opponent_state_present,
+        opponent_trajectory_id=opponent_trajectory_id,
+        opponent_row=opponent_row,
         opponent_node_count=opponent_node_count,
         opponent_node_tokens=opponent_node_tokens,
         opponent_node_attrs=opponent_node_attrs,

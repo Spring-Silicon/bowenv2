@@ -9,25 +9,34 @@ from gz.codec import FeatureSchemaConfig
 from gz.common import FeatureSchemaHash
 from gz.proto import read_frame, write_frame
 from gz.trainer.sampler import SampleClient, decode_ack, step_seed
-from python.tests.test_codec import SCHEMA_HASH, make_batch
+from python.tests.test_codec import SCHEMA_HASH, _layout, make_batch
 from python.tests.test_targets import make_targets
 
 
-def test_sample_client_handshake_and_deterministic_sample(tmp_path: Path) -> None:
+def test_sample_client_handshake_and_result_owns_frame(tmp_path: Path) -> None:
     socket_path = tmp_path / "sample.sock"
     raw_batch = make_batch(attr_dim=1)
+    changed_batch = bytearray(raw_batch)
+    struct.pack_into("<I", changed_batch, _layout(2, 3, 2, 3, 2, 1)["node_count"], 1)
     raw_targets = make_targets()
-    thread = serve_samples(socket_path, produced_rows=[2], responses=[(raw_batch, raw_targets), (raw_batch, raw_targets)])
+    thread = serve_samples(
+        socket_path,
+        produced_rows=[2],
+        responses=[(raw_batch, raw_targets), (bytes(changed_batch), raw_targets)],
+    )
     client = SampleClient(socket_path, startup_timeout=1.0, backoff=0.01)
     try:
         ack = client.wait_until_ready(1)
-        first = client.sample(1, 2, 99)
-        second = client.sample(1, 2, 99)
+        first = client.sample(1, 2, 99, kind="policy")
+        first_node_count = first.batch.node_count.copy()
+        second = client.sample(1, 2, 99, kind="value")
 
         assert ack.feature_schema == schema_config()
         assert ack.feature_schema_hash == FeatureSchemaHash.from_bytes(SCHEMA_HASH)
+        assert ack.produced_policy_rows == 2
         assert first.produced_rows == 2
-        assert first.batch.node_count.tolist() == second.batch.node_count.tolist()
+        assert first.batch.node_count.tolist() == first_node_count.tolist()
+        assert first.batch.node_count.tolist() != second.batch.node_count.tolist()
         assert first.targets.policy.tolist() == second.targets.policy.tolist()
     finally:
         client.close()
@@ -50,6 +59,8 @@ def test_sample_client_startup_wait_reconnects_until_enough_rows(tmp_path: Path)
 def test_step_seed_is_deterministic_and_step_sensitive() -> None:
     assert step_seed(7, 3) == step_seed(7, 3)
     assert step_seed(7, 3) != step_seed(7, 4)
+    assert step_seed(7, 3, "value-sample") != step_seed(7, 3)
+    assert step_seed(7, 3, "value-sample") != step_seed(7, 3, "value-orientation")
 
 
 def test_decode_ack_rejects_truncated() -> None:
@@ -91,6 +102,7 @@ def serve_samples(
                         frame_type, payload = read_frame(conn, bytearray())
                         assert frame_type == 3
                         assert struct.unpack_from("<I", payload, 0)[0] > 0
+                        assert struct.unpack_from("<I", payload, 4)[0] == response_index + 1
                         batch, targets = responses[response_index]
                         response_index += 1
                         write_frame(conn, 4, struct.pack("<I", len(batch)), batch, targets)
@@ -102,7 +114,7 @@ def serve_samples(
 
 def ack_payload(produced_rows: int) -> bytes:
     return (
-        struct.pack("<I", 6)
+        struct.pack("<I", 7)
         + SCHEMA_HASH
         + struct.pack("<I", 2)
         + struct.pack("<Q", produced_rows)
@@ -113,6 +125,7 @@ def ack_payload(produced_rows: int) -> bytes:
         + struct.pack("<I", 1)
         + struct.pack("<f", 150.0)
         + struct.pack("<III", 200, 400, 900)
+        + struct.pack("<Q", produced_rows)
         + schema_config().encode()
     )
 

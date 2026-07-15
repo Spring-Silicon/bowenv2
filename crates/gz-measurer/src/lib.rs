@@ -8,13 +8,16 @@ mod service;
 
 pub use project::{
     CompletedEpisodeArtifact, CompletedEpisodeStep, MeasurerError, ProjectedReference,
-    ProjectionMode, episode_reward, project_episode, sign_target,
+    ProjectionMode, ValueTargetConfig, episode_reward, outcome_target, project_episode,
+    project_episode_with_value_target, sign_target,
 };
 pub use registry::{
-    GateEvent, PendingChallenge, ReferenceRegistry, ReferenceSnapshot, ReferenceStep,
+    ArenaGateEvent, ArenaGateRegistry, ArenaRolloutClaim, EpisodeRolloutClaim, GateEvent,
+    PendingChallenge, PolicyModel, ReferenceRegistry, ReferenceSnapshot, ReferenceStep,
     RolloutOutcome,
 };
 pub use service::{
-    MeasureLedgerSnapshot, MeasuredEpisode, MeasurerAdmission, MeasurerAdmissionStatus,
-    MeasurerLaneSummary, MeasurerRunSummary, MeasurerStats, ReplayMeasurer,
+    MeasureLedgerSnapshot, MeasuredCompetitiveGame, MeasuredEpisode, MeasurerAdmission,
+    MeasurerAdmissionStatus, MeasurerLaneSummary, MeasurerRunSummary, MeasurerStats,
+    ReplayMeasurer,
 };

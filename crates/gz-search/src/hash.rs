@@ -43,6 +43,51 @@ pub fn random_search_config_hash(
     SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
+pub fn categorical_policy_config_hash(
+    max_steps: usize,
+    seed: u64,
+    mask_stop: bool,
+    no_backtrack: bool,
+    candidate_options: CandidateOptions,
+    measure_options: MeasureOptions,
+) -> SearchConfigHash {
+    let mut hasher = blake3::Hasher::new();
+    update_chunk(&mut hasher, b"gz-search-categorical-policy-v1");
+    update_u64(&mut hasher, max_steps as u64);
+    update_u64(&mut hasher, seed);
+    update_bool(&mut hasher, mask_stop);
+    update_bool(&mut hasher, no_backtrack);
+    update_candidate_options(&mut hasher, candidate_options);
+    update_measure_options(&mut hasher, measure_options);
+    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
+}
+
+pub fn sampled_tree_search_config_hash(
+    base: SearchConfigHash,
+    reference_mask_stop: bool,
+) -> SearchConfigHash {
+    let mut hasher = blake3::Hasher::new();
+    update_chunk(&mut hasher, b"gz-search-gumbel-sampled-tree-v1");
+    update_chunk(&mut hasher, base.as_bytes());
+    update_bool(&mut hasher, reference_mask_stop);
+    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
+}
+
+pub fn reducing_uniform_distill_config_hash(
+    max_steps: usize,
+    export_position: bool,
+    candidate_options: CandidateOptions,
+    measure_options: MeasureOptions,
+) -> SearchConfigHash {
+    let mut hasher = blake3::Hasher::new();
+    update_chunk(&mut hasher, b"gz-distill-reducing-uniform-v1");
+    update_u64(&mut hasher, max_steps as u64);
+    update_bool(&mut hasher, export_position);
+    update_candidate_options(&mut hasher, candidate_options);
+    update_measure_options(&mut hasher, measure_options);
+    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn gumbel_search_config_hash(
     max_steps: usize,

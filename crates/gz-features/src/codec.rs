@@ -366,7 +366,7 @@ pub fn encode_training_targets(
             return Err(FeatureError::InvalidEncoding("non-finite policy target"));
         }
         if let Some(value) = target.value
-            && !matches!(value, -1.0 | 0.0 | 1.0)
+            && (!value.is_finite() || !(-1.0..=1.0).contains(&value))
         {
             return Err(FeatureError::InvalidEncoding("invalid value target"));
         }

@@ -130,6 +130,8 @@ def _layout(capacity: int) -> dict[str, int]:
         ("opponent_reward", capacity * 2),
         ("opponent_present", capacity),
         ("opponent_state_present", capacity),
+        ("opponent_trajectory_id", capacity * 8),
+        ("opponent_row", capacity * 4),
         ("opponent_node_count", capacity * 4),
         ("opponent_node_tokens", capacity * NODES * 2),
         ("opponent_node_attrs", capacity * NODES * ATTR_DIM * 2),

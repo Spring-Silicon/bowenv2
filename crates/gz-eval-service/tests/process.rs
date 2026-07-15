@@ -103,6 +103,7 @@ fn scripted_server_can_drive_eval_result_decoding() {
         Duration::from_secs(1),
     )
     .unwrap();
+    assert_eq!(backend.batch_capacity().unwrap().get(), 2);
     let actual = backend.eval(&batch, &action_counts).unwrap();
 
     common::assert_outputs_equal_bits(&actual.rows, &expected.rows);

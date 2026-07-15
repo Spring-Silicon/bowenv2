@@ -73,11 +73,9 @@ def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
     read_buf = bytearray()
     write_buf = bytearray()
     # Launched-but-unfinished evals, oldest first, at most PIPELINE_DEPTH.
-    # Per EVAL frame the order is stage(new) -> launch(new) -> queue; the
-    # oldest entry is finished and its reply written when the queue is
-    # full or the client has nothing further on the wire. Backends move
-    # outputs off CUDA-graph static buffers at launch time, so multiple
-    # launches may be outstanding; replies stay FIFO.
+    # Before staging, a full queue is drained so its staging slot can be
+    # reused. Backends move outputs off CUDA-graph static buffers at launch
+    # time, so multiple launches may be outstanding; replies stay FIFO.
     pending: deque[tuple[int, object]] = deque()
     try:
         state = _handshake(conn, read_buf, write_buf, backend)
@@ -99,11 +97,11 @@ def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
                     _handle_ping(conn, write_buf, payload)
                 elif frame_type == FRAME_EVAL:
                     batch_id, view = _parse_eval(state, payload)
-                    staged = backend.stage(view)
-                    del view
+                    backend.apply_pending_swap()
                     if len(pending) >= PIPELINE_DEPTH:
                         _flush_oldest(conn, write_buf, backend, pending)
-                    backend.apply_pending_swap()
+                    staged = backend.stage(view)
+                    del view
                     pending.append((batch_id, backend.launch(staged)))
                 else:
                     raise ProtocolError(ERROR_PROTOCOL, "unexpected frame type")

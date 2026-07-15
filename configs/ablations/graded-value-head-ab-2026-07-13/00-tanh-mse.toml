@@ -1,0 +1,47 @@
+extends = "../../bases/whittle-generated-exphormer.toml"
+
+[arch]
+value_head = "scalar"
+value_activation = "tanh"
+value_bins = 101
+value_min = -1.0
+value_max = 1.0
+value_sigma_ratio = 0.75
+
+[trainer]
+optimizer = "adamw"
+lr = 0.0002
+adamw_lr = 0.0002
+lr_schedule = "constant"
+warmup_steps = 0
+min_lr_ratio = 0.0
+batch = 512
+value_batch = 512
+window_rows = 30000
+value_window_rows = 30000
+total_steps = 10000
+publish_interval = 256
+weight_decay = 0.0001
+ema_decay = 0.0
+grad_clip = 3.0
+value_mirror = false
+compile_model = true
+matmul_precision = "high"
+max_reuse = 8.0
+
+[selfplay]
+policy_opponent_mode = "sampled-tree"
+reference_gamma = 0.0
+length_tiebreak = false
+value_reward = "graded"
+value_reward_scale = 0.1
+max_batch = 128
+reference_max_batch = 128
+replay_retain = 48000
+
+[wandb]
+run_name = "graded-tanh-adamw-s42-10k-2"
+
+[paths]
+run_dir = "runs/graded-tanh-adamw-s42-10k-2"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/graded-tanh-adamw-s42-10k-2"

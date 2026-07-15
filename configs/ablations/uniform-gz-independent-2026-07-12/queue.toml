@@ -1,0 +1,36 @@
+[queue]
+name = "uniform-gz-independent-2026-07-12"
+results_dir = "runs/ablation-uniform-gz-independent-2026-07-12"
+poll_seconds = 5.0
+min_free_gb = 40.0
+continue_on_failure = true
+
+[[runs]]
+name = "muon"
+config = "01-muon.toml"
+timeout_seconds = 2400
+
+[[runs]]
+name = "match-candidate"
+config = "02-match-candidate.toml"
+timeout_seconds = 2400
+
+[[runs]]
+name = "cosine"
+config = "03-cosine.toml"
+timeout_seconds = 2400
+
+[[runs]]
+name = "batch512"
+config = "04-batch512.toml"
+timeout_seconds = 2400
+
+[[runs]]
+name = "value256"
+config = "05-value256.toml"
+timeout_seconds = 2400
+
+[[runs]]
+name = "sage"
+config = "06-sage.toml"
+timeout_seconds = 2400

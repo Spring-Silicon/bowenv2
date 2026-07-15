@@ -92,6 +92,36 @@ fn candidate_limit_never_strands_slots() {
 }
 
 #[test]
+fn released_expansions_drop_candidate_record_batches() {
+    let mut engine = and_chain_engine();
+    let root = engine.root();
+    let mut expected_count = None;
+
+    for _ in 0..8 {
+        let mut candidates = Vec::new();
+        engine
+            .candidates(root, CandidateOptions::default(), &mut candidates)
+            .unwrap();
+        let count = *expected_count.get_or_insert(candidates.len());
+        assert_eq!(candidates.len(), count);
+
+        let live = engine.candidate_storage_stats();
+        assert_eq!(live.batches_live, 1);
+        assert_eq!(live.records_live, count);
+        assert!(live.record_bytes > 0);
+        assert!(live.handle_slot_size < live.record_size);
+
+        engine.release(&[], &candidates).unwrap();
+
+        let released = engine.candidate_storage_stats();
+        assert_eq!(released.batches_live, 0);
+        assert_eq!(released.records_live, 0);
+        assert_eq!(released.record_bytes, 0);
+        assert_eq!(released.handle_slots, count);
+    }
+}
+
+#[test]
 fn limited_cache_entry_does_not_serve_larger_requests() {
     let mut engine = and_chain_engine();
     let root = engine.root();
@@ -190,6 +220,44 @@ fn release_invalidates_transition_cache_to_released_graph() {
         engine.hash(applied_again.after).unwrap(),
         applied.after_hash
     );
+}
+
+#[test]
+fn cached_transition_returns_an_owned_graph_reference() {
+    let mut engine = and_engine();
+    let root = engine.root();
+    let baseline = engine.arena_occupancy();
+    let mut root_candidates = Vec::new();
+    engine
+        .candidates(root, CandidateOptions::default(), &mut root_candidates)
+        .unwrap();
+    let first = root_candidates[0];
+
+    let applied = engine.apply(root, first).unwrap();
+    let cached = engine.apply(root, first).unwrap();
+    assert_eq!(cached.after, applied.after);
+    assert_eq!(cached.after_hash, applied.after_hash);
+    assert_eq!(engine.arena_occupancy().graph_refs, baseline.graph_refs + 2);
+
+    engine.release(&[applied.after, cached.after], &[]).unwrap();
+    assert_eq!(engine.arena_occupancy().graph_refs, baseline.graph_refs);
+    engine.release(&[], &root_candidates).unwrap();
+}
+
+#[test]
+fn candidate_batches_do_not_duplicate_portable_hashes() {
+    let mut engine = and_chain_engine();
+    let root = engine.root();
+    let mut candidates = Vec::new();
+    engine
+        .candidates(root, CandidateOptions::default(), &mut candidates)
+        .unwrap();
+
+    let storage = engine.candidate_storage_stats();
+    assert!(storage.records_live > 0);
+    assert!(storage.record_size < 64);
+
+    engine.release(&[], &candidates).unwrap();
 }
 
 #[test]

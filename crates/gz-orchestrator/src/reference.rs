@@ -3,8 +3,10 @@ use gz_engine::{
     MeasureOptions, ModelVersion, PortableGraphId, ReplayGraphContext, SearchConfigHash,
 };
 use gz_features::{FeatureExtractor, FeatureRow, OpponentStateFeatures, PositionFeatures};
-use gz_measurer::{ReferenceRegistry, ReferenceSnapshot};
-pub use gz_measurer::{ReferenceStep, RolloutOutcome};
+use gz_measurer::{ArenaGateRegistry, ReferenceRegistry, ReferenceSnapshot};
+pub use gz_measurer::{
+    ArenaRolloutClaim, EpisodeRolloutClaim, PolicyModel, ReferenceStep, RolloutOutcome,
+};
 use gz_replay::ReplayReferenceKind;
 use gz_search::{BeamSearch, GreedySearch, RandomSearch, SearchStep};
 use std::sync::Arc;
@@ -72,6 +74,87 @@ pub trait ReferenceProvider<E: GraphEngine> {
     /// will retry while the version still differs.
     fn finish_rollout(&mut self, outcome: Option<RolloutOutcome>) {
         let _ = outcome;
+    }
+
+    /// Claims one stochastic rollout for the accepted policy's trajectory
+    /// pool. The returned version is the checkpoint the rollout must use.
+    fn claim_sample_rollout(&mut self, latest: Option<ModelVersion>) -> Option<ModelVersion> {
+        let _ = latest;
+        None
+    }
+
+    /// Finishes a previously claimed stochastic trajectory rollout.
+    fn finish_sample_rollout(&mut self, version: ModelVersion, outcome: Option<RolloutOutcome>) {
+        let _ = (version, outcome);
+    }
+
+    fn sampled_trajectory_mode(&self) -> bool {
+        false
+    }
+
+    fn sampled_tree_mode(&self) -> bool {
+        false
+    }
+
+    /// Maximum arena roots driven as one coordinated evaluator wave. Zero
+    /// keeps the legacy lane-local rollout admission path.
+    fn arena_parallelism(&self) -> usize {
+        0
+    }
+
+    fn finish_sampled_trajectory(&mut self, outcome: Option<RolloutOutcome>) -> Option<Reference> {
+        let _ = outcome;
+        None
+    }
+
+    /// Claims one fixed-arena rollout. Shared arena providers use this to
+    /// distribute root indexes across lanes while collapsing duplicate work.
+    fn claim_arena_rollout(
+        &mut self,
+        latest: Option<ModelVersion>,
+        lane: usize,
+        lanes: usize,
+    ) -> Option<ArenaRolloutClaim> {
+        let _ = (latest, lane, lanes);
+        None
+    }
+
+    /// Returns this lane's engine-local handle for a fixed arena root.
+    fn arena_root(&mut self, engine: &mut E, index: usize) -> EngineResult<Option<E::Graph>> {
+        let _ = (engine, index);
+        Ok(None)
+    }
+
+    fn finish_arena_rollout(
+        &mut self,
+        claim: ArenaRolloutClaim,
+        score: Option<f32>,
+        outcome: Option<RolloutOutcome>,
+    ) {
+        let _ = (claim, score, outcome);
+    }
+
+    /// Whether every learner root first needs an opponent-policy rollout on
+    /// that same root. This is the generated-root arena-gated policy path.
+    fn per_root_policy_mode(&self) -> bool {
+        false
+    }
+
+    fn claim_per_root_policy(
+        &mut self,
+        latest: Option<ModelVersion>,
+    ) -> Option<EpisodeRolloutClaim> {
+        let _ = latest;
+        None
+    }
+
+    fn finish_per_root_policy(
+        &mut self,
+        claim: EpisodeRolloutClaim,
+        outcome: Option<RolloutOutcome>,
+    ) -> Option<Reference> {
+        let _ = (claim, outcome);
+        None
     }
 
     /// Whether episodes are expected to carry a reference once this
@@ -644,6 +727,9 @@ pub struct PolicyReferenceProvider {
     registry: Option<Arc<ReferenceRegistry>>,
     last_challenged: Option<ModelVersion>,
     pending: Option<PendingChallenge>,
+    sampled_trajectory: bool,
+    sampled_tree: bool,
+    arena_registry: Option<Arc<ArenaGateRegistry>>,
 }
 
 /// A challenger rollout in flight: versioned when the lane knew the
@@ -696,6 +782,37 @@ impl PolicyReferenceProvider {
         provider
     }
 
+    #[must_use]
+    pub fn sampled_trajectory_with_registry(registry: Arc<ReferenceRegistry>) -> Self {
+        let mut provider = Self::new();
+        provider.registry = Some(registry);
+        provider.sampled_trajectory = true;
+        provider
+    }
+
+    #[must_use]
+    pub fn sampled_tree_with_registry(registry: Arc<ReferenceRegistry>) -> Self {
+        let mut provider = Self::with_gate(PolicyGate::Best);
+        provider.registry = Some(registry);
+        provider.sampled_tree = true;
+        provider
+    }
+
+    #[must_use]
+    pub fn arena_gated(registry: Arc<ArenaGateRegistry>) -> Self {
+        let mut provider = Self::with_gate(PolicyGate::Best);
+        provider.arena_registry = Some(registry);
+        provider
+    }
+
+    #[must_use]
+    pub fn arena_sampled_tree(registry: Arc<ArenaGateRegistry>) -> Self {
+        let mut provider = Self::with_gate(PolicyGate::Best);
+        provider.arena_registry = Some(registry);
+        provider.sampled_tree = true;
+        provider
+    }
+
     const fn with_gate(gate: PolicyGate) -> Self {
         Self {
             gate,
@@ -703,6 +820,9 @@ impl PolicyReferenceProvider {
             registry: None,
             last_challenged: None,
             pending: None,
+            sampled_trajectory: false,
+            sampled_tree: false,
+            arena_registry: None,
         }
     }
 }
@@ -718,8 +838,11 @@ where
     E: GraphEngine,
 {
     fn reference(&mut self, _engine: &mut E, _root: E::Graph) -> EngineResult<Option<Reference>> {
+        if self.sampled_tree || self.arena_registry.is_some() {
+            return Ok(None);
+        }
         if let Some(registry) = &self.registry {
-            return Ok(registry.current().as_deref().map(reference_from_snapshot));
+            return Ok(registry.sampled().as_deref().map(reference_from_snapshot));
         }
         let Some(current) = self.current.as_ref() else {
             return Ok(None);
@@ -740,6 +863,9 @@ where
     }
 
     fn rollout_due(&self, latest: Option<ModelVersion>) -> bool {
+        if self.sampled_trajectory || self.arena_registry.is_some() {
+            return false;
+        }
         if let Some(registry) = &self.registry {
             return registry.rollout_due(latest);
         }
@@ -760,6 +886,9 @@ where
     }
 
     fn claim_rollout(&mut self, latest: Option<ModelVersion>) -> bool {
+        if self.sampled_trajectory || self.arena_registry.is_some() {
+            return false;
+        }
         if let Some(registry) = &self.registry {
             return registry.claim_challenge(latest);
         }
@@ -799,7 +928,10 @@ where
             return;
         };
         let version = match pending {
-            PendingChallenge::Versioned(version) => Some(version),
+            PendingChallenge::Versioned(version) if outcome.model_version == Some(version) => {
+                Some(version)
+            }
+            PendingChallenge::Versioned(_) => None,
             PendingChallenge::Seed => outcome.model_version,
         };
         // A seed rollout whose replies never named a version counts as
@@ -839,7 +971,127 @@ where
         }
     }
 
+    fn claim_sample_rollout(&mut self, latest: Option<ModelVersion>) -> Option<ModelVersion> {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.claim_sample(latest))
+    }
+
+    fn finish_sample_rollout(&mut self, version: ModelVersion, outcome: Option<RolloutOutcome>) {
+        let Some(registry) = &self.registry else {
+            return;
+        };
+        if registry.finish_sample(version, outcome) {
+            eprintln!(
+                "event=reference_trajectory_pool version={version} size={}",
+                registry.trajectory_pool_len(),
+            );
+        }
+    }
+
+    fn sampled_trajectory_mode(&self) -> bool {
+        self.sampled_trajectory
+    }
+
+    fn sampled_tree_mode(&self) -> bool {
+        self.sampled_tree
+    }
+
+    fn finish_sampled_trajectory(&mut self, outcome: Option<RolloutOutcome>) -> Option<Reference> {
+        let outcome = outcome?;
+        let ref_id = self.registry.as_ref()?.allocate_reference_id();
+        Some(Reference {
+            ref_id: Some(ref_id),
+            kind: ReplayReferenceKind::Gumbel,
+            final_reward: outcome.final_reward,
+            final_graph: Some(outcome.final_graph),
+            steps: outcome.steps.into(),
+            search_config_hash: Some(outcome.search_config_hash),
+            model_version: outcome.model_version,
+        })
+    }
+
+    fn claim_arena_rollout(
+        &mut self,
+        latest: Option<ModelVersion>,
+        lane: usize,
+        lanes: usize,
+    ) -> Option<ArenaRolloutClaim> {
+        let registry = self.arena_registry.as_ref()?;
+        if let Some(latest) = latest {
+            registry.observe_current(latest);
+        }
+        registry.claim_arena(lane, lanes)
+    }
+
+    fn finish_arena_rollout(
+        &mut self,
+        claim: ArenaRolloutClaim,
+        score: Option<f32>,
+        outcome: Option<RolloutOutcome>,
+    ) {
+        let Some(registry) = &self.arena_registry else {
+            return;
+        };
+        let actual_version = outcome.as_ref().and_then(|outcome| outcome.model_version);
+        let steps = outcome.as_ref().map_or(0, |outcome| outcome.steps.len());
+        if let Some(event) = registry.finish_arena(claim, actual_version, score, steps) {
+            eprintln!(
+                "event=arena_gate accepted={} challenger={} best={} margin={} arena_size={} steps={} version={}",
+                event.accepted,
+                event.challenger_mean,
+                event.best_mean,
+                event.margin_sum,
+                event.arena_size,
+                event.steps,
+                event.version,
+            );
+        }
+    }
+
+    fn per_root_policy_mode(&self) -> bool {
+        self.arena_registry.is_some() && !self.sampled_tree
+    }
+
+    fn claim_per_root_policy(
+        &mut self,
+        latest: Option<ModelVersion>,
+    ) -> Option<EpisodeRolloutClaim> {
+        let registry = self.arena_registry.as_ref()?;
+        if let Some(latest) = latest {
+            registry.observe_current(latest);
+        }
+        registry.claim_episode()
+    }
+
+    fn finish_per_root_policy(
+        &mut self,
+        claim: EpisodeRolloutClaim,
+        outcome: Option<RolloutOutcome>,
+    ) -> Option<Reference> {
+        let outcome = outcome?;
+        if outcome.model_version != Some(claim.version) {
+            return None;
+        }
+        let registry = self.arena_registry.as_ref()?;
+        Some(Reference {
+            ref_id: Some(registry.allocate_reference_id()),
+            kind: ReplayReferenceKind::GatedPolicy,
+            final_reward: outcome.final_reward,
+            final_graph: Some(outcome.final_graph),
+            steps: outcome.steps.into(),
+            search_config_hash: Some(outcome.search_config_hash),
+            model_version: Some(claim.version),
+        })
+    }
+
     fn admission_ready(&self) -> bool {
+        if let Some(registry) = &self.arena_registry {
+            return registry.admission_ready();
+        }
+        if self.sampled_trajectory {
+            return true;
+        }
         self.registry
             .as_ref()
             .map_or(self.current.is_some(), |registry| {

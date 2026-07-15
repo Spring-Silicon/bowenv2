@@ -1,0 +1,10 @@
+extends = "../../bases/benchmark-ac-r8-screen.toml"
+
+[trainer]
+batch = 256
+
+[wandb]
+run_name = "ablate-r1-25-ac-policy-batch256"
+
+[paths]
+run_dir = "runs/ablate-r1-25-ac-policy-batch256"

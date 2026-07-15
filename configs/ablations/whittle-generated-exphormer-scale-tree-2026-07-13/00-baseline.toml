@@ -1,0 +1,7 @@
+extends = "../../bases/whittle-generated-exphormer.toml"
+
+[wandb]
+run_name = "whittle-generated-exphormer-1-v2"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-1-v2"

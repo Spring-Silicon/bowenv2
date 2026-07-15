@@ -9,13 +9,18 @@ pub(crate) const CF_ROW_INDEX: &str = "row_index";
 
 pub(crate) const META_SCHEMA_VERSION: &[u8] = b"schema_version";
 pub(crate) const META_EPISODES_STOPPED: &[u8] = b"episodes_stopped";
+pub(crate) const META_COMPLETED_GAMES: &[u8] = b"completed_games";
 pub(crate) const META_NEXT_EPISODE_SEQ: &[u8] = b"next_episode_seq";
 pub(crate) const META_PRODUCED_ROWS: &[u8] = b"produced_rows";
+pub(crate) const META_PRODUCED_POLICY_ROWS: &[u8] = b"produced_policy_rows";
 pub(crate) const META_CONSUMED_ROWS: &[u8] = b"consumed_rows";
 pub(crate) const META_RETAINED_FLOOR: &[u8] = b"retained_floor";
 pub(crate) const META_DELETED_FLOOR: &[u8] = b"deleted_floor";
 pub(crate) const META_FEATURE_SCHEMA: &[u8] = b"feature_schema";
+pub(crate) const META_DATA_MODE: &[u8] = b"data_mode";
 pub(crate) const META_ROOT_INFO: &[u8] = b"root_info";
+pub(crate) const META_TERMINAL_COST_EMA: &[u8] = b"terminal_cost_ema";
+pub(crate) const META_TERMINAL_COST_BEST: &[u8] = b"terminal_cost_best";
 
 pub(crate) const EPISODE_KEY_LEN: usize = 8;
 pub(crate) const ROW_KEY_LEN: usize = 12;

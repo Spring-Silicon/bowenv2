@@ -1,0 +1,33 @@
+extends = "../bases/benchmark-steady-arena-r8-effective.toml"
+
+# Treatment 01: controlled actor/trainer cadence only. Model, optimizer,
+# search, feature visibility, reference behavior, and replay windows remain
+# at the recorded benchmark settings.
+
+[trainer]
+total_steps = 240
+publish_interval = 8
+publish_lag_blocks = 1
+# The episode gate owns startup; one row only establishes sample readiness.
+min_startup_rows = 1
+log_interval = 8
+max_reuse = 0.0
+reuse_gate_interval = 8
+reuse_gate_episodes = 32
+# Start from the archived benchmark's exact step-0 weights. Resume at step 0
+# creates a fresh optimizer; the run directory is preseeded with version_0.
+resume = true
+
+[selfplay]
+# Same 32-episode cohort size as the working run, with one actor per lane.
+lanes = 32
+workers_per_lane = 1
+# One pending eval per actor makes larger static capacity pure padding.
+max_batch = 32
+admission_stagger_ms = 0
+
+[wandb]
+run_name = "ablate-benchmark-cadence-01-s240"
+
+[paths]
+run_dir = "runs/ablate-benchmark-cadence-01-s240"

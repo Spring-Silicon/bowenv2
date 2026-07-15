@@ -1,0 +1,16 @@
+extends = "../../bases/gated-pool32-s42-throughput.toml"
+
+[arch]
+trunk = "sage"
+
+[trainer]
+policy_init = "neutral"
+model_seed = 17
+data_seed = 42
+total_steps = 1000
+
+[wandb]
+run_name = "uniform-gz-i6-sage-s17-1"
+
+[paths]
+run_dir = "runs/uniform-gz-i6-sage-s17-1"

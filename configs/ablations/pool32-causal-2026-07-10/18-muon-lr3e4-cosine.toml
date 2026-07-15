@@ -1,0 +1,22 @@
+extends = "../../bases/gated-pool32-legacy-screen.toml"
+
+# Muon LR/decay 2x2: modern higher LR with historical cosine decay.
+[trainer]
+optimizer = "muon_mixed"
+lr = 0.0003
+adamw_lr = 0.0003
+momentum = 0.95
+nesterov = true
+ns_steps = 5
+lr_schedule = "cosine"
+lr_decay_steps = 800
+min_lr_ratio = 0.1
+seed = 5
+batch = 512
+total_steps = 1500
+
+[wandb]
+run_name = "pool32-causal-muon-lr3e4-cosine-1"
+
+[paths]
+run_dir = "runs/pool32-causal-muon-lr3e4-cosine-1"

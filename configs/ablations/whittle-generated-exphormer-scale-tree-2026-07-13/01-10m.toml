@@ -1,0 +1,16 @@
+extends = "../../bases/whittle-generated-exphormer.toml"
+
+[arch]
+dim = 256
+layers = 5
+heads = 8
+ffn_dim = 896
+
+[trainer]
+init_checkpoint = "runs/distill-generated-reducing-uniform-10m-1280-1/checkpoints"
+
+[wandb]
+run_name = "whittle-generated-exphormer-10m-1"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-10m-1"

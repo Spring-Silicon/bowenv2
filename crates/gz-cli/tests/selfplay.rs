@@ -1,5 +1,6 @@
 use gz_cli::selfplay::{
-    EvaluatorMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig, init_replay, run,
+    EvaluatorMode, PolicyOpponentMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig,
+    ValueReward, init_replay, run,
 };
 use gz_features::FeatureSchema;
 use gz_replay::ReplayStore;
@@ -37,6 +38,32 @@ impl Drop for TestDir {
 #[test]
 fn selfplay_config_defaults_tree_reuse_on() {
     assert!(SelfplayConfig::default().tree_reuse);
+}
+
+#[test]
+fn selfplay_config_rejects_zero_reference_max_batch() {
+    let error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference_max_batch: Some(0),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+
+    assert!(error.contains("--reference-max-batch"), "{error}");
+}
+
+#[test]
+fn selfplay_config_rejects_zero_challenger_max_batch() {
+    let error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        challenger_max_batch: Some(0),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+
+    assert!(error.contains("--challenger-max-batch"), "{error}");
 }
 
 #[test]
@@ -120,6 +147,8 @@ fn selfplay_cli_accepts_tree_reuse_flag() {
             "1",
             "--tree-reuse",
             "false",
+            "--reference-gamma",
+            "0",
             "--admission-stagger-ms",
             "1",
         ])
@@ -140,15 +169,27 @@ fn selfplay_run_writes_replay_rows() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 3,
         max_steps: 2,
         simulations: 2,
         max_considered: 16,
         gumbel_scale: 0.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: false,
         max_candidates: 255,
         max_batch: 4,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
         checkpoint_dir: None,
@@ -162,8 +203,11 @@ fn selfplay_run_writes_replay_rows() {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     })
     .unwrap();
     let store = ReplayStore::open(dir.path()).unwrap();
@@ -186,15 +230,27 @@ fn selfplay_run_supports_stub_evaluator() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 4,
         max_steps: 2,
         simulations: 2,
         max_considered: 16,
         gumbel_scale: 0.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: false,
         max_candidates: 255,
         max_batch: 2,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
         checkpoint_dir: None,
@@ -208,8 +264,11 @@ fn selfplay_run_supports_stub_evaluator() {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     })
     .unwrap();
 
@@ -229,15 +288,27 @@ fn selfplay_run_supports_self_average_reference() {
         reference: ReferenceMode::SelfAverage,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.9,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 11,
         max_steps: 2,
         simulations: 2,
         max_considered: 16,
         gumbel_scale: 0.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: false,
         max_candidates: 255,
         max_batch: 1,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
         checkpoint_dir: None,
@@ -251,8 +322,11 @@ fn selfplay_run_supports_self_average_reference() {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     })
     .unwrap();
 
@@ -275,15 +349,27 @@ fn selfplay_run_supports_policy_reference() {
         reference: ReferenceMode::Policy,
         root_mode: RootMode::Fixed,
         reference_ema_decay: 0.0,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 11,
         max_steps: 2,
         simulations: 2,
         max_considered: 16,
         gumbel_scale: 0.5,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: false,
         max_candidates: 255,
         max_batch: 1,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
         checkpoint_dir: None,
@@ -297,8 +383,11 @@ fn selfplay_run_supports_policy_reference() {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     })
     .unwrap();
 
@@ -310,6 +399,98 @@ fn selfplay_run_supports_policy_reference() {
     assert_eq!(summary.episodes_dropped, 0);
     let labeled = summary.wins + summary.losses + summary.ties;
     assert_eq!(labeled, 4);
+}
+
+#[test]
+fn selfplay_run_supports_sampled_trajectory_policy_reference() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 4,
+        lanes: 2,
+        workers_per_lane: 1,
+        reference: ReferenceMode::Policy,
+        root_mode: RootMode::Fixed,
+        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
+        seed: 11,
+        max_steps: 2,
+        simulations: 2,
+        tree_reuse: false,
+        max_batch: 2,
+        evaluator: EvaluatorMode::Stub,
+        ..SelfplayConfig::default()
+    })
+    .unwrap();
+
+    assert_eq!(summary.episodes_appended, 4);
+    assert_eq!(summary.episodes_dropped, 0);
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let references = (0..summary.episodes_appended)
+        .map(|id| {
+            store
+                .episode(gz_replay::ReplayEpisodeId::new(id))
+                .unwrap()
+                .unwrap()
+                .outcome
+                .reference
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        references
+            .iter()
+            .all(|reference| reference.kind == gz_replay::ReplayReferenceKind::Gumbel)
+    );
+    let ids = references
+        .iter()
+        .map(|reference| reference.trajectory_id.unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 4);
+}
+
+#[test]
+fn gated_policy_trajectory_pool_fills_across_cold_lanes_before_admission() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 16,
+        lanes: 2,
+        workers_per_lane: 1,
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        reference_ema_decay: 0.0,
+        reference_trajectory_pool: 2,
+        policy_opponent_mode: None,
+        seed: 11,
+        max_steps: 2,
+        simulations: 2,
+        gumbel_scale: 0.5,
+        tree_reuse: false,
+        max_batch: 1,
+        evaluator: EvaluatorMode::ProcessStub,
+        python_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python")),
+        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/unused-best.json")),
+        ..SelfplayConfig::default()
+    })
+    .unwrap();
+
+    assert_eq!(summary.episodes_appended, 16);
+    assert_eq!(summary.episodes_dropped, 0);
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let ids = (0..summary.episodes_appended)
+        .map(|id| {
+            store
+                .episode(gz_replay::ReplayEpisodeId::new(id))
+                .unwrap()
+                .unwrap()
+                .outcome
+                .reference
+                .unwrap()
+                .trajectory_id
+                .unwrap()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids, std::collections::HashSet::from([2, 3]));
 }
 
 #[test]
@@ -350,6 +531,286 @@ fn selfplay_config_rejects_policy_reference_with_generated_roots() {
     assert!(error.contains("requires --root-mode fixed"), "{error}");
 }
 
+#[test]
+fn selfplay_config_validates_reference_gamma() {
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        reference_gamma: 0.5,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    let error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::Policy,
+        root_mode: RootMode::Fixed,
+        reference_gamma: 0.5,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(
+        error.contains("requires --reference gated-policy"),
+        "{error}"
+    );
+
+    let error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        reference_gamma: 1.0,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(error.contains("--reference-gamma"), "{error}");
+}
+
+#[test]
+fn selfplay_config_validates_reference_trajectory_pool() {
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        reference_trajectory_pool: 8,
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/checkpoints/best.json")),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    let missing_pointer = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        reference_trajectory_pool: 8,
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(
+        missing_pointer.contains("reference-checkpoint-pointer"),
+        "{missing_pointer}"
+    );
+
+    let error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::Policy,
+        root_mode: RootMode::Fixed,
+        reference_trajectory_pool: 8,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(error.contains("--reference-trajectory-pool"), "{error}");
+}
+
+#[test]
+fn selfplay_config_validates_policy_opponent_mode() {
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::Policy,
+        root_mode: RootMode::Fixed,
+        evaluator: EvaluatorMode::Stub,
+        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    let pool_error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::Policy,
+        root_mode: RootMode::Fixed,
+        evaluator: EvaluatorMode::Stub,
+        reference_trajectory_pool: 8,
+        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(pool_error.contains("cannot be combined"), "{pool_error}");
+
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/checkpoints/best.json")),
+        tree_reuse: false,
+        length_tiebreak: true,
+        policy_opponent_mode: Some(PolicyOpponentMode::SampledTree),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    let gamma_error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::Policy,
+        root_mode: RootMode::Fixed,
+        evaluator: EvaluatorMode::Stub,
+        reference_gamma: 0.2,
+        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(gamma_error.contains("reference-gamma 0"), "{gamma_error}");
+
+    let gated_error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        evaluator: EvaluatorMode::Stub,
+        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(gated_error.contains("--reference policy"), "{gated_error}");
+}
+
+#[test]
+fn selfplay_config_accepts_only_complete_generated_arena_policy_setup() {
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Generated,
+        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
+        reference_arena_size: 8,
+        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/best.json")),
+        reference_challenger_checkpoint_pointer: Some(PathBuf::from("/tmp/arena.json")),
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Generated,
+        policy_opponent_mode: Some(PolicyOpponentMode::SampledTree),
+        reference_arena_size: 8,
+        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/best.json")),
+        reference_challenger_checkpoint_pointer: Some(PathBuf::from("/tmp/arena.json")),
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        tree_reuse: false,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    let missing_pointer = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Generated,
+        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
+        reference_arena_size: 8,
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(
+        missing_pointer.contains("reference-checkpoint-pointer"),
+        "{missing_pointer}"
+    );
+
+    let missing_challenger_pointer = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Generated,
+        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
+        reference_arena_size: 8,
+        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/best.json")),
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(
+        missing_challenger_pointer.contains("reference-challenger-checkpoint-pointer"),
+        "{missing_challenger_pointer}"
+    );
+
+    let missing_arena = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Generated,
+        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
+        evaluator: EvaluatorMode::Torch,
+        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(
+        missing_arena.contains("generated-root arena"),
+        "{missing_arena}"
+    );
+}
+
+#[test]
+fn selfplay_config_validates_reference_stop_override() {
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::GatedPolicy,
+        root_mode: RootMode::Fixed,
+        reference_mask_stop: Some(true),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    let error = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        reference: ReferenceMode::Root,
+        reference_mask_stop: Some(true),
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(error.contains("--reference-mask-stop"), "{error}");
+}
+
+#[test]
+fn selfplay_config_validates_gumbel_scaling() {
+    SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        c_visit: 50.0,
+        c_scale: 0.3,
+        ..SelfplayConfig::default()
+    }
+    .validate()
+    .unwrap();
+
+    for (c_visit, c_scale) in [(f32::NAN, 0.3), (50.0, -0.1)] {
+        let error = SelfplayConfig {
+            replay_dir: Some(PathBuf::from("/tmp/unused")),
+            c_visit,
+            c_scale,
+            ..SelfplayConfig::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.contains("--c-"), "{error}");
+    }
+}
+
 fn serving_config(dir: &TestDir) -> SelfplayConfig {
     SelfplayConfig {
         replay_dir: Some(dir.path().to_path_buf()),
@@ -359,15 +820,27 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 3,
         max_steps: 2,
         simulations: 2,
         max_considered: 16,
         gumbel_scale: 0.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: false,
         max_candidates: 255,
         max_batch: 1,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
         checkpoint_dir: None,
@@ -381,8 +854,11 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     }
 }
 
@@ -430,6 +906,18 @@ fn selfplay_config_rejects_zero_replay_backlog() {
 }
 
 #[test]
+fn selfplay_config_separates_fixed_and_adaptive_admission_pacing() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.admission_smoothing = true;
+    config.validate().unwrap();
+
+    config.admission_stagger_ms = 1;
+    let error = config.validate().unwrap_err();
+    assert!(error.contains("mutually exclusive"), "{error}");
+}
+
+#[test]
 fn torch_evaluator_builds_the_child_command_line() {
     let dir = TestDir::new();
     let mut config = serving_config(&dir);
@@ -451,6 +939,24 @@ fn torch_evaluator_builds_the_child_command_line() {
 
     config.eval_device = Some("cuda:1".to_owned());
     assert_eq!(config.evaluator_extra_args()[5], "cuda:1");
+}
+
+#[test]
+fn historical_torch_evaluators_are_policy_only() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.evaluator = EvaluatorMode::Torch;
+    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
+    config.reference_checkpoint_pointer = Some(PathBuf::from("/ckpt/best.json"));
+    config.reference_challenger_checkpoint_pointer = Some(PathBuf::from("/ckpt/arena.json"));
+
+    let reference = config.reference_evaluator_extra_args();
+    let challenger = config.challenger_evaluator_extra_args();
+
+    assert!(reference.iter().any(|arg| arg == "--policy-only"));
+    assert!(challenger.iter().any(|arg| arg == "--policy-only"));
+    assert_eq!(reference.last().unwrap(), "/ckpt/best.json");
+    assert_eq!(challenger.last().unwrap(), "/ckpt/arena.json");
 }
 
 #[test]
@@ -547,15 +1053,27 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         reference: ReferenceMode::SelfAverage,
         root_mode: RootMode::Fixed,
         reference_ema_decay: 0.9,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 11,
         max_steps: 3,
         simulations: 4,
         max_considered: 4,
         gumbel_scale: 1.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: true,
         max_candidates: 255,
         max_batch: 2,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
         checkpoint_dir: None,
@@ -569,8 +1087,11 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     })
     .unwrap();
     // Admissions that precede a lane's first completed episode have no

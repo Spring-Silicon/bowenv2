@@ -7,9 +7,9 @@ use std::str::FromStr;
 /// only moves with a store schema bump. v4 = v3 plus optional opponent
 /// graph-state sections for paired value inputs.
 pub const ENCODING_VERSION: u32 = 4;
-/// Eval-wire batch/output encoding version. v4 = v3 plus optional opponent
-/// graph-state sections for paired value inputs.
-pub const BATCH_ENCODING_VERSION: u32 = 4;
+/// Eval-wire batch/output encoding version. v5 = v4 plus transient opponent
+/// trajectory identity and row sections used by serving-side readout caches.
+pub const BATCH_ENCODING_VERSION: u32 = 5;
 pub const STOP_ACTION_KIND_TOKEN: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]

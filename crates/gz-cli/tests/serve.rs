@@ -1,11 +1,12 @@
 use gz_cli::selfplay::{
-    EvaluatorMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig, init_replay,
-    run as run_selfplay,
+    EvaluatorMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig, ValueReward,
+    init_replay, run as run_selfplay,
 };
 use gz_cli::serve::{ReplayServeConfig, SAMPLE_PROTOCOL_VERSION, run_one};
 use gz_features::{
     ENCODING_VERSION, FeatureBatchView, TrainingTargetsView, decode_feature_schema_config,
 };
+use gz_measurer::ValueTargetConfig;
 use gz_replay::ReplayStore;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -51,15 +52,27 @@ fn replay_serve_returns_feature_batch_and_targets() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 5,
         max_steps: 2,
         simulations: 2,
         max_considered: 16,
         gumbel_scale: 0.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: false,
         max_candidates: 255,
         max_batch: 2,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Stub,
         python_dir: None,
         checkpoint_dir: None,
@@ -73,8 +86,11 @@ fn replay_serve_returns_feature_batch_and_targets() {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     })
     .unwrap();
     let expected_schema_config = ReplayStore::open(dir.path())
@@ -125,11 +141,16 @@ fn replay_serve_returns_feature_batch_and_targets() {
     assert!(best_cost.is_finite());
     let root_present = u32::from_le_bytes(ack[88..92].try_into().unwrap());
     assert!(root_present <= 1);
-    let schema_config = decode_feature_schema_config(&ack[108..]).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(ack[108..116].try_into().unwrap()),
+        summary.rows_produced
+    );
+    let schema_config = decode_feature_schema_config(&ack[116..]).unwrap();
     assert_eq!(Some(schema_config), expected_schema_config);
 
     let mut sample = Vec::new();
     sample.extend_from_slice(&1u32.to_le_bytes());
+    sample.extend_from_slice(&0u32.to_le_bytes());
     sample.extend_from_slice(&summary.rows_produced.to_le_bytes());
     sample.extend_from_slice(&123u64.to_le_bytes());
     write_frame(&mut stream, 3, &[&sample]);
@@ -181,7 +202,8 @@ fn replay_serve_acks_initialized_store_before_rows_exist() {
     assert_eq!(u64::from_le_bytes(ack[40..48].try_into().unwrap()), 0);
     assert_eq!(u64::from_le_bytes(ack[48..56].try_into().unwrap()), 0);
     assert_eq!(u64::from_le_bytes(ack[56..64].try_into().unwrap()), 0);
-    let schema_config = decode_feature_schema_config(&ack[108..]).unwrap();
+    assert_eq!(u64::from_le_bytes(ack[108..116].try_into().unwrap()), 0);
+    let schema_config = decode_feature_schema_config(&ack[116..]).unwrap();
     assert_eq!(schema_config.max_actions, 6);
 
     drop(stream);
@@ -199,15 +221,27 @@ fn replay_serve_rejects_featureless_store() {
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
+        reference_gamma: 0.0,
+        reference_trajectory_pool: 0,
+        reference_arena_size: 0,
+        reference_arena_seed: 910_000_001,
+        reference_checkpoint_pointer: None,
+        reference_challenger_checkpoint_pointer: None,
+        policy_opponent_mode: None,
+        reference_mask_stop: None,
         seed: 7,
         max_steps: 1,
         simulations: 1,
         max_considered: 16,
         gumbel_scale: 0.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
         gumbel_noise_overlap: -1.0,
         tree_reuse: false,
         max_candidates: 255,
         max_batch: 1,
+        reference_max_batch: None,
+        challenger_max_batch: None,
         evaluator: EvaluatorMode::Random,
         python_dir: None,
         checkpoint_dir: None,
@@ -221,8 +255,11 @@ fn replay_serve_rejects_featureless_store() {
         no_backtrack: false,
         mask_stop: false,
         length_tiebreak: false,
+        value_reward: ValueReward::Sign,
+        value_reward_scale: 0.1,
         eval_processes: 1,
         admission_stagger_ms: 0,
+        admission_smoothing: false,
     })
     .unwrap();
 
@@ -274,6 +311,17 @@ fn read_frame(stream: &mut UnixStream) -> (u8, Vec<u8>) {
     (body[0], body[1..].to_vec())
 }
 
+fn connect_hello(path: &Path) -> UnixStream {
+    let mut stream = connect_retry(path);
+    let mut hello = Vec::new();
+    hello.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
+    hello.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
+    write_frame(&mut stream, 1, &[&hello]);
+    let (frame_type, _) = read_frame(&mut stream);
+    assert_eq!(frame_type, 2);
+    stream
+}
+
 // ---- in-process sample service (shared store, live producer) ----
 
 use gz_cli::serve::run_shared;
@@ -292,6 +340,36 @@ use gz_search::{GumbelMcts, GumbelMctsConfig};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+#[test]
+fn shared_sample_service_accepts_a_second_live_client() {
+    let dir = TestDir::new();
+    init_replay(ReplayInitConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        max_candidates: 5,
+    })
+    .unwrap();
+    let store = Arc::new(ReplayStore::open(dir.path()).unwrap());
+    let socket = dir.path().join("concurrent.sock");
+    let serve_socket = socket.clone();
+    std::thread::spawn(move || {
+        let _ = run_shared(store, serve_socket, 8);
+    });
+
+    let first = connect_hello(&socket);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let second_socket = socket.clone();
+    std::thread::spawn(move || {
+        let second = connect_hello(&second_socket);
+        finished_tx.send(()).unwrap();
+        drop(second);
+    });
+
+    finished_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second client was blocked behind the first live connection");
+    drop(first);
+}
 
 fn live_setup(
     dir: &TestDir,
@@ -387,6 +465,7 @@ fn wait_for_rows(socket: &Path) -> UnixStream {
 fn sample_once(stream: &mut UnixStream, batch: u32, seed: u64) {
     let mut sample = Vec::new();
     sample.extend_from_slice(&batch.to_le_bytes());
+    sample.extend_from_slice(&0u32.to_le_bytes());
     sample.extend_from_slice(&u64::MAX.to_le_bytes());
     sample.extend_from_slice(&seed.to_le_bytes());
     write_frame(stream, 3, &[&sample]);
@@ -427,6 +506,7 @@ fn in_process_sample_service_serves_during_production() {
             max_batch: NonZeroUsize::new(2).unwrap(),
             flush_after: Duration::from_millis(1),
             admission_stagger: Duration::ZERO,
+            admission_smoothing: None,
         },
     );
     let run = orchestrator
@@ -436,12 +516,15 @@ fn in_process_sample_service_serves_during_production() {
             FeaturizedRuntime {
                 extractors,
                 backends: vec![StubBackend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
             },
             ReplayRuntime {
                 store: &store,
                 providers,
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();
@@ -486,6 +569,7 @@ fn live_backpressure_gates_production_until_the_consumer_drains() {
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
             admission_stagger: Duration::ZERO,
+            admission_smoothing: None,
         },
     );
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -498,6 +582,8 @@ fn live_backpressure_gates_production_until_the_consumer_drains() {
                 FeaturizedRuntime {
                     extractors,
                     backends: vec![StubBackend],
+                    reference_backends: vec![],
+                    challenger_backends: vec![],
                 },
                 ReplayRuntime {
                     store,
@@ -507,6 +593,7 @@ fn live_backpressure_gates_production_until_the_consumer_drains() {
                         gate_poll: Duration::from_millis(1),
                     }),
                     length_tiebreak: false,
+                    value_target: ValueTargetConfig::Sign,
                 },
             );
             result_tx.send(run).unwrap();
@@ -541,6 +628,7 @@ fn replay_serve_reacks_a_repeated_hello_on_a_live_connection() {
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
             admission_stagger: Duration::ZERO,
+            admission_smoothing: None,
         },
     );
     orchestrator
@@ -550,12 +638,15 @@ fn replay_serve_reacks_a_repeated_hello_on_a_live_connection() {
             FeaturizedRuntime {
                 extractors,
                 backends: vec![StubBackend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
             },
             ReplayRuntime {
                 store: &store,
                 providers,
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();
@@ -592,6 +683,7 @@ fn serve_survives_a_failed_connection_and_accepts_the_next() {
             max_batch: NonZeroUsize::new(1).unwrap(),
             flush_after: Duration::from_millis(1),
             admission_stagger: Duration::ZERO,
+            admission_smoothing: None,
         },
     );
     orchestrator
@@ -601,12 +693,15 @@ fn serve_survives_a_failed_connection_and_accepts_the_next() {
             FeaturizedRuntime {
                 extractors,
                 backends: vec![StubBackend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
             },
             ReplayRuntime {
                 store: &store,
                 providers,
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();

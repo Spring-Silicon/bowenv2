@@ -1,0 +1,10 @@
+extends = "../../bases/benchmark-throughput-r8-screen.toml"
+
+[trainer]
+batch = 512
+
+[wandb]
+run_name = "ablate-o1-12-policy-batch-512"
+
+[paths]
+run_dir = "runs/ablate-o1-12-policy-batch-512"

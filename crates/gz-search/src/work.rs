@@ -30,6 +30,9 @@ pub enum SearchPoll<G, C, R> {
 
 #[derive(Debug)]
 #[non_exhaustive]
+// Boxing Eval would allocate on every search evaluation; worker slots hold one
+// work item at a time, so the larger enum is the intentional hot-path tradeoff.
+#[allow(clippy::large_enum_variant)]
 pub enum SearchWork<G, C> {
     Expand(ExpandWork<G>),
     Apply(ApplyWork<G, C>),
@@ -77,6 +80,21 @@ pub struct EvalWork<G, C> {
     pub candidates: Vec<C>,
     pub request: EvalRequest,
     pub measure_options: MeasureOptions,
+    pub model: EvalModel,
+    pub opponent: Option<Box<EvalOpponentWork<G>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvalModel {
+    Episode,
+    Current,
+    Incumbent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EvalOpponentWork<G> {
+    pub graph: G,
+    pub position: gz_eval::EvalPositionContext,
 }
 
 #[derive(Debug)]

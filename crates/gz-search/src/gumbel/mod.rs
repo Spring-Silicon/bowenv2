@@ -1,14 +1,18 @@
+mod categorical;
+mod sampled_tree;
 mod schedule;
 mod task;
 mod tree;
 mod types;
 
+pub use categorical::CategoricalPolicyEpisodeTask;
+pub use sampled_tree::{SampledTreeEpisodeTask, SampledTreeRootTask};
 pub use schedule::considered_visit_sequence;
 pub use task::{GumbelEpisodeTask, GumbelRootTask};
 pub use types::{
-    GumbelEpisode, GumbelEpisodeContext, GumbelHandleBatch, GumbelMctsConfig,
-    GumbelOpponentContext, GumbelRootResult, GumbelRootStats, GumbelSearchContext, GumbelStep,
-    GumbelStopReason,
+    GumbelCompetitiveTrace, GumbelEpisode, GumbelEpisodeContext, GumbelHandleBatch,
+    GumbelMctsConfig, GumbelOpponentContext, GumbelPlayer, GumbelRootResult, GumbelRootStats,
+    GumbelSearchContext, GumbelStep, GumbelStopReason,
 };
 
 use crate::gumbel::schedule::budget_fraction;
@@ -25,6 +29,7 @@ use std::num::NonZeroUsize;
 pub struct GumbelMcts {
     config: GumbelMctsConfig,
     search_config_hash: SearchConfigHash,
+    policy_rollout_mask_stop: Option<bool>,
 }
 
 impl GumbelMcts {
@@ -55,7 +60,16 @@ impl GumbelMcts {
         Self {
             config,
             search_config_hash,
+            policy_rollout_mask_stop: None,
         }
+    }
+
+    /// Overrides STOP masking only for the derived greedy policy rollout.
+    /// Absent an override, the rollout inherits the learner setting.
+    #[must_use]
+    pub const fn with_policy_rollout_mask_stop(mut self, mask_stop: bool) -> Self {
+        self.policy_rollout_mask_stop = Some(mask_stop);
+        self
     }
 
     #[must_use]
@@ -65,9 +79,9 @@ impl GumbelMcts {
 
     /// The opponent-rollout search derived from this one: a single
     /// simulation over a single considered action with no noise -- a
-    /// greedy argmax-policy rollout at temperature 0, with STOP masked
-    /// so the reference must play rewrites to its step budget. Step
-    /// budget and engine options carry over unchanged.
+    /// greedy argmax-policy rollout at temperature 0, preserving the
+    /// caller's STOP masking policy. Step budget and engine options carry
+    /// over unchanged.
     #[must_use]
     pub fn policy_rollout(&self) -> Self {
         Self::new(GumbelMctsConfig {
@@ -77,12 +91,69 @@ impl GumbelMcts {
             gumbel_noise_overlap: -1.0,
             temperature_moves: 0,
             tree_reuse: false,
-            mask_stop: true,
+            mask_stop: match self.policy_rollout_mask_stop {
+                Some(mask_stop) => mask_stop,
+                None => self.config.mask_stop,
+            },
             // The reference is a plain greedy rollout (whittlezero's
             // policy_rollout has no revisit masking either).
             no_backtrack: false,
             ..self.config
         })
+    }
+
+    /// A categorical policy rollout for trajectory-pool references. Gumbel
+    /// top-1 with unit scale samples exactly from softmax(policy logits) at
+    /// each root; no tree search or overlap tempering is involved.
+    #[must_use]
+    pub fn policy_sample_rollout(&self) -> Self {
+        Self::new(GumbelMctsConfig {
+            simulations: NonZeroUsize::MIN,
+            max_considered_actions: NonZeroUsize::MIN,
+            gumbel_scale: 1.0,
+            gumbel_noise_overlap: -1.0,
+            temperature_moves: 0,
+            tree_reuse: false,
+            mask_stop: match self.policy_rollout_mask_stop {
+                Some(mask_stop) => mask_stop,
+                None => self.config.mask_stop,
+            },
+            no_backtrack: false,
+            ..self.config
+        })
+    }
+
+    /// Configuration used by the direct sampled-trajectory policy task.
+    /// Unlike the legacy trajectory pool, history masking follows the learner.
+    #[must_use]
+    pub(crate) fn categorical_policy_config(&self) -> GumbelMctsConfig {
+        GumbelMctsConfig {
+            simulations: NonZeroUsize::MIN,
+            max_considered_actions: NonZeroUsize::MIN,
+            gumbel_scale: 1.0,
+            gumbel_noise_overlap: -1.0,
+            temperature_moves: 0,
+            tree_reuse: false,
+            mask_stop: match self.policy_rollout_mask_stop {
+                Some(mask_stop) => mask_stop,
+                None => self.config.mask_stop,
+            },
+            no_backtrack: self.config.no_backtrack,
+            ..self.config
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn reference_mask_stop(&self) -> bool {
+        match self.policy_rollout_mask_stop {
+            Some(mask_stop) => mask_stop,
+            None => self.config.mask_stop,
+        }
+    }
+
+    #[must_use]
+    pub fn categorical_policy_rollout(&self) -> Self {
+        Self::new(self.categorical_policy_config())
     }
 
     #[must_use]

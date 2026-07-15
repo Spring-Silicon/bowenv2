@@ -1,0 +1,7 @@
+extends = "bases/distill-generated-reducing-uniform-gz.toml"
+
+[wandb]
+run_name = "distill-generated-reducing-uniform-100k-1"
+
+[paths]
+run_dir = "runs/distill-generated-reducing-uniform-100k-1"

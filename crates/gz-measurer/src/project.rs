@@ -61,6 +61,31 @@ pub enum MeasurerError {
     MissingReference,
     FeatureRowCountMismatch,
     StepCountOverflow,
+    InvalidValueTargetConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ValueTargetConfig {
+    #[default]
+    Sign,
+    Graded {
+        reward_scale: f32,
+    },
+}
+
+impl ValueTargetConfig {
+    #[must_use]
+    pub const fn graded(reward_scale: f32) -> Self {
+        Self::Graded { reward_scale }
+    }
+
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Sign => true,
+            Self::Graded { reward_scale } => reward_scale.is_finite() && reward_scale > 0.0,
+        }
+    }
 }
 
 pub fn project_episode(
@@ -70,6 +95,33 @@ pub fn project_episode(
     episode_id: u64,
     mode: ProjectionMode,
 ) -> Result<(ReplayEpisodeRecord, Vec<ReplayRow>), MeasurerError> {
+    project_episode_with_value_target(
+        artifact,
+        reference,
+        length_tiebreak,
+        episode_id,
+        mode,
+        0.0,
+        ValueTargetConfig::Sign,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn project_episode_with_value_target(
+    artifact: &CompletedEpisodeArtifact,
+    reference: Option<&ProjectedReference>,
+    length_tiebreak: bool,
+    episode_id: u64,
+    mode: ProjectionMode,
+    root_reward: f32,
+    value_target_config: ValueTargetConfig,
+) -> Result<(ReplayEpisodeRecord, Vec<ReplayRow>), MeasurerError> {
+    if !value_target_config.is_valid()
+        || matches!(value_target_config, ValueTargetConfig::Graded { .. })
+            && !root_reward.is_finite()
+    {
+        return Err(MeasurerError::InvalidValueTargetConfig);
+    }
     let learner_reward = episode_reward(artifact).ok_or(MeasurerError::Unmeasured)?;
     if matches!(mode, ProjectionMode::RequireReference) && reference.is_none() {
         return Err(MeasurerError::MissingReference);
@@ -83,11 +135,14 @@ pub fn project_episode(
     let value_target = reference.map(|reference| {
         let reference_len =
             (length_tiebreak && reference.step_count > 0).then(|| reference.step_count - 1);
-        sign_target(
+        outcome_target(
+            value_target_config,
             learner_reward,
             reference.final_reward,
+            root_reward,
             artifact.steps.len(),
             reference_len,
+            length_tiebreak,
             episode_id,
         )
     });
@@ -185,6 +240,36 @@ pub fn sign_target(
         1.0
     } else {
         -1.0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn outcome_target(
+    config: ValueTargetConfig,
+    learner: f32,
+    reference: f32,
+    root_reward: f32,
+    learner_len: usize,
+    reference_len: Option<usize>,
+    length_tiebreak: bool,
+    episode_id: u64,
+) -> f32 {
+    match config {
+        ValueTargetConfig::Sign => {
+            sign_target(learner, reference, learner_len, reference_len, episode_id)
+        }
+        ValueTargetConfig::Graded { reward_scale } => {
+            let denominator = root_reward.abs().max(1.0);
+            let mut margin = (learner - reference) / denominator;
+            if learner == reference
+                && length_tiebreak
+                && let Some(reference_len) = reference_len
+            {
+                margin += (reference_len as f32 - learner_len as f32) / denominator;
+            }
+            (margin / reward_scale).tanh()
+        }
     }
 }
 

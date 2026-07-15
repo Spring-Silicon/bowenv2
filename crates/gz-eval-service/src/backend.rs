@@ -1,9 +1,23 @@
 use crate::{STUB_MODEL_VERSION, ServiceError, ServiceResult, stub_row_outputs};
 use gz_engine::ModelVersion;
 use gz_features::{FeatureBatchView, RowOutput};
+use std::num::NonZeroUsize;
 
 pub trait FeatureEvalBackend {
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs>;
+
+    /// Fixed batch capacity negotiated with a remote backend. In-process
+    /// backends return None and use the orchestrator's configured capacity.
+    fn batch_capacity(&self) -> Option<NonZeroUsize> {
+        None
+    }
+
+    /// Evaluator-capacity work represented by a completed request. In-process
+    /// backends scale with the real row count by default; fixed-capacity remote
+    /// backends override this because a partial request occupies a full batch.
+    fn capacity_work(&self, actual_rows: usize, _max_batch: usize) -> usize {
+        actual_rows
+    }
 
     /// Submits a batch without waiting for its outputs; pair with
     /// `receive`. Backends that cannot overlap compute simply evaluate

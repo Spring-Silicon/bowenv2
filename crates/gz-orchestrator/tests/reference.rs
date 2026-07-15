@@ -228,6 +228,12 @@ fn rollout_outcome(reward: f32) -> RolloutOutcome {
     }
 }
 
+fn versioned_rollout_outcome(version: ModelVersion, reward: f32) -> RolloutOutcome {
+    let mut outcome = rollout_outcome(reward);
+    outcome.model_version = Some(version);
+    outcome
+}
+
 #[test]
 fn policy_provider_rollout_lifecycle() {
     let mut engine = whittle();
@@ -250,7 +256,7 @@ fn policy_provider_rollout_lifecycle() {
     assert!(provider.reference(&mut engine, root).unwrap().is_none());
 
     // The completed rollout becomes the reference scalar.
-    provider.finish_rollout(Some(rollout_outcome(-7.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v1, -7.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.kind, ReplayReferenceKind::Gumbel);
     assert_eq!(reference.final_reward, -7.0);
@@ -273,7 +279,7 @@ fn policy_provider_failed_rollout_keeps_reference_and_retries() {
     let v2 = ModelVersion::from_bytes([2; 16]);
 
     provider.begin_rollout(Some(v1));
-    provider.finish_rollout(Some(rollout_outcome(-7.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v1, -7.0)));
 
     // An unmeasured rollout keeps the old scalar and stays due.
     provider.begin_rollout(Some(v2));
@@ -284,7 +290,7 @@ fn policy_provider_failed_rollout_keeps_reference_and_retries() {
 
     // The retry replaces it.
     provider.begin_rollout(Some(v2));
-    provider.finish_rollout(Some(rollout_outcome(-3.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v2, -3.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.final_reward, -3.0);
     assert_eq!(reference.model_version, Some(v2));
@@ -348,7 +354,7 @@ fn gated_policy_accepts_only_strictly_better_challengers() {
 
     // First measured rollout seats the incumbent.
     provider.begin_rollout(Some(v1));
-    provider.finish_rollout(Some(rollout_outcome(-7.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v1, -7.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.kind, ReplayReferenceKind::GatedPolicy);
     assert_eq!(reference.final_reward, -7.0);
@@ -358,7 +364,7 @@ fn gated_policy_accepts_only_strictly_better_challengers() {
     // and its version attribution stay with the incumbent, no retry.
     assert!(provider.rollout_due(Some(v2)));
     provider.begin_rollout(Some(v2));
-    provider.finish_rollout(Some(rollout_outcome(-9.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v2, -9.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.final_reward, -7.0);
     assert_eq!(reference.model_version, Some(v1));
@@ -366,13 +372,13 @@ fn gated_policy_accepts_only_strictly_better_challengers() {
 
     // An exact tie keeps the older incumbent (strict inequality).
     provider.begin_rollout(Some(v3));
-    provider.finish_rollout(Some(rollout_outcome(-7.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v3, -7.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.model_version, Some(v1));
 
     // A strictly better challenger takes the bar; monotone increase.
     provider.begin_rollout(Some(v4));
-    provider.finish_rollout(Some(rollout_outcome(-5.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v4, -5.0)));
     let reference = provider.reference(&mut engine, root).unwrap().unwrap();
     assert_eq!(reference.final_reward, -5.0);
     assert_eq!(reference.model_version, Some(v4));
@@ -388,7 +394,7 @@ fn gated_policy_unmeasured_challenger_retries() {
     let v2 = ModelVersion::from_bytes([2; 16]);
 
     provider.begin_rollout(Some(v1));
-    provider.finish_rollout(Some(rollout_outcome(-7.0)));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v1, -7.0)));
 
     // Unmeasured: incumbent untouched, the same version stays due.
     provider.begin_rollout(Some(v2));
@@ -577,7 +583,10 @@ fn shared_gated_registry_claims_one_rollout_per_version() {
         &mut second,
         Some(v1)
     ));
-    ReferenceProvider::<WhittleEngine>::finish_rollout(&mut first, Some(rollout_outcome(-3.0)));
+    ReferenceProvider::<WhittleEngine>::finish_rollout(
+        &mut first,
+        Some(versioned_rollout_outcome(v1, -3.0)),
+    );
     assert!(ReferenceProvider::<WhittleEngine>::admission_ready(&second));
     let reference = ReferenceProvider::<WhittleEngine>::reference(&mut second, &mut engine, root)
         .unwrap()
@@ -598,7 +607,10 @@ fn shared_gated_registry_claims_one_rollout_per_version() {
         &mut first,
         Some(v2)
     ));
-    ReferenceProvider::<WhittleEngine>::finish_rollout(&mut second, Some(rollout_outcome(-9.0)));
+    ReferenceProvider::<WhittleEngine>::finish_rollout(
+        &mut second,
+        Some(versioned_rollout_outcome(v2, -9.0)),
+    );
     let reference = ReferenceProvider::<WhittleEngine>::reference(&mut first, &mut engine, root)
         .unwrap()
         .unwrap();
@@ -607,5 +619,83 @@ fn shared_gated_registry_claims_one_rollout_per_version() {
     assert!(!ReferenceProvider::<WhittleEngine>::rollout_due(
         &first,
         Some(v2)
+    ));
+}
+
+#[test]
+fn shared_gated_registry_gamma_uses_rejected_latest_snapshot() {
+    let mut engine = whittle();
+    let root = engine.root();
+    let v1 = ModelVersion::from_bytes([1; 16]);
+    let v2 = ModelVersion::from_bytes([2; 16]);
+    let registry = Arc::new(gz_measurer::ReferenceRegistry::with_gamma(0.999_999, 11));
+    let mut provider = PolicyReferenceProvider::gated_with_registry(registry.clone());
+    let provider: &mut dyn ReferenceProvider<WhittleEngine> = &mut provider;
+
+    provider.begin_rollout(Some(v1));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v1, -3.0)));
+    provider.begin_rollout(Some(v2));
+    provider.finish_rollout(Some(versioned_rollout_outcome(v2, -9.0)));
+
+    let reference = provider.reference(&mut engine, root).unwrap().unwrap();
+    assert_eq!(reference.ref_id, Some(2));
+    assert_eq!(reference.model_version, Some(v2));
+    assert_eq!(reference.final_reward, -9.0);
+    assert_eq!(registry.current().unwrap().ref_id, 1);
+    assert_eq!(registry.latest().unwrap().ref_id, 2);
+}
+
+#[test]
+fn sampled_tree_provider_gates_admission_without_materializing_a_trajectory() {
+    let mut engine = whittle();
+    let root = engine.root();
+    let version = ModelVersion::from_bytes([1; 16]);
+    let registry = Arc::new(gz_measurer::ReferenceRegistry::new());
+    let mut provider = PolicyReferenceProvider::sampled_tree_with_registry(registry);
+
+    assert!(ReferenceProvider::<WhittleEngine>::sampled_tree_mode(
+        &provider
+    ));
+    assert!(!ReferenceProvider::<WhittleEngine>::admission_ready(
+        &provider
+    ));
+    assert!(ReferenceProvider::<WhittleEngine>::claim_rollout(
+        &mut provider,
+        Some(version)
+    ));
+    ReferenceProvider::<WhittleEngine>::finish_rollout(
+        &mut provider,
+        Some(versioned_rollout_outcome(version, -3.0)),
+    );
+
+    assert!(ReferenceProvider::<WhittleEngine>::admission_ready(
+        &provider
+    ));
+    assert!(
+        ReferenceProvider::<WhittleEngine>::reference(&mut provider, &mut engine, root)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!ReferenceProvider::<WhittleEngine>::per_root_policy_mode(
+        &provider
+    ));
+}
+
+#[test]
+fn arena_sampled_tree_skips_the_per_root_trajectory_prelude() {
+    let incumbent = ModelVersion::from_bytes([1; 16]);
+    let current = ModelVersion::from_bytes([2; 16]);
+    let registry = Arc::new(gz_measurer::ArenaGateRegistry::new(4, 0.0, 7));
+    assert!(registry.initialize(incumbent, current, current));
+    let provider = PolicyReferenceProvider::arena_sampled_tree(registry);
+
+    assert!(ReferenceProvider::<WhittleEngine>::sampled_tree_mode(
+        &provider
+    ));
+    assert!(ReferenceProvider::<WhittleEngine>::admission_ready(
+        &provider
+    ));
+    assert!(!ReferenceProvider::<WhittleEngine>::per_root_policy_mode(
+        &provider
     ));
 }

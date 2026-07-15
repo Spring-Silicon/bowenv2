@@ -7,6 +7,13 @@ pub struct SampleConfig {
     pub seed: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleKind {
+    Any,
+    Policy,
+    Value,
+}
+
 pub(crate) struct ReplayRng {
     state: u64,
 }

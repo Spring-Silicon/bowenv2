@@ -1,0 +1,21 @@
+extends = "../../bases/whittle-generated-exphormer-v2-sampled-tree.toml"
+
+[arch]
+dim = 256
+layers = 5
+heads = 8
+ffn_dim = 896
+value_head = "scalar"
+
+[trainer]
+init_checkpoint = "runs/distill-generated-reducing-uniform-v2-10m-s5-1280-1/checkpoints"
+
+[selfplay]
+value_reward = "sign"
+
+[wandb]
+run_name = "whittle-generated-exphormer-v2-10m-sampled-tree-c8-sign-2"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-v2-10m-sampled-tree-c8-sign-2"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/whittle-generated-exphormer-v2-10m-sampled-tree-c8-sign-2"

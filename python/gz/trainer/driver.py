@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import signal
@@ -9,10 +10,16 @@ import sys
 import threading
 import time
 import tomllib
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from gz.model.exphormer import ArchConfig, build_model
+from gz.model.exphormer import ArchConfig, build_model, initialize_policy
+from gz.checkpoints.publish import (
+    ensure_checkpoint_pointer,
+    promote_checkpoint_pointer,
+    prune_checkpoints,
+)
 from gz.trainer.data import TrainingStager
 from gz.trainer.loop import LoopConfig, TrainerLoop
 from gz.trainer.publish import EmaWeights, publish_ema
@@ -24,16 +31,40 @@ class TrainerConfig:
     lr: float = 3e-4
     lr_schedule: str = "cosine"
     warmup_steps: int = 200
+    lr_decay_steps: int | None = None
+    min_lr_ratio: float = 0.0
     batch: int = 256
+    # Zero shares the policy batch, preserving the historical trainer path.
+    # A positive value samples and stages an independent value batch.
+    value_batch: int = 0
     window_rows: int = 200_000
+    # Zero inherits window_rows. Mirrored pair replay uses half the policy
+    # row window because each source row contributes two orientations.
+    value_window_rows: int = 0
     total_steps: int = 1000
     publish_interval: int = 500
+    # Newest ordinary actor checkpoints to retain. Named checkpoint pointers
+    # and in-flight arena challengers are retained in addition; zero disables.
+    checkpoint_retain: int = 0
+    # Hold each periodic checkpoint until the next training gate. A one-block
+    # lag matches whittlezero's overlapped actor snapshot schedule.
+    publish_lag_blocks: int = 0
     value_weight: float = 1.0
     weight_decay: float = 0.01
+    optimizer: str = "adamw"
+    adamw_lr: float | None = None
+    momentum: float = 0.95
+    nesterov: bool = True
+    ns_steps: int = 5
+    policy_init: str = "default"
     ema_decay: float = 0.999
     grad_clip: float = 1.0
     min_startup_rows: int = 256
+    # Optional experiment controls. By default the legacy seed drives both
+    # Torch (initialization/dropout) and replay/value-orientation sampling.
     seed: int = 0
+    model_seed: int | None = None
+    data_seed: int | None = None
     device: str = "cuda:1"
     startup_timeout: float = 60.0
     reconnect_limit: int = 5
@@ -44,19 +75,38 @@ class TrainerConfig:
     # taking the socket read/decode off the step critical path. Off = the
     # historical strictly-serial loop, kept for A/B comparison.
     prefetch: bool = True
-    # Pace the trainer against fresh production: step N+1 waits until
-    # produced_rows >= (N+1)*batch/max_reuse, capping cumulative samples
-    # per produced row (whittlezero's generate-then-train ratio is ~0.55;
-    # our free-running loop measured 7-18). 0 disables.
+    # Sample policy and value batches on separate replay connections. Off
+    # keeps GPU prefetching but issues both requests sequentially on one client.
+    parallel_value_sampling: bool = True
+    # Compile static-shape model forward/backward graphs with TorchInductor.
+    # Optimizer, EMA, and checkpoints continue to own the original module.
+    compile_model: bool = False
+    compile_mode: str = "default"
+    matmul_precision: str = "highest"
+    # Pace the trainer against fresh production: each gate waits until enough
+    # source rows exist for its cumulative policy samples. Zero disables.
     max_reuse: float = 0.0
-    # Train both orientations of every pair (whittlezero's mirrored value
-    # stream) instead of the random per-step flip.
+    # Number of optimizer steps admitted together by max_reuse. One is the
+    # historical streaming gate; whittlezero admits eight after each wave.
+    reuse_gate_interval: int = 1
+    # Completed episodes required per admitted block. Zero disables the
+    # episode-count gate; this preserves fixed actor-wave cadence when
+    # episode lengths change.
+    reuse_gate_episodes: int = 0
+    # Train both pair orientations. With an independent value batch, each
+    # sampled row chooses one orientation, matching whittlezero's replay.
     value_mirror: bool = False
     # Continue an interrupted run in place: load the latest
     # published checkpoint (EMA weights seed both the live model and the
     # EMA -- an approximate resume; optimizer moments restart), and start
     # the step counter at the checkpoint's training_step.
     resume: bool = False
+    # Seed a new run from another checkpoint directory. Only model weights
+    # transfer; optimizer, EMA, counters, and training step restart at zero.
+    init_checkpoint: str = ""
+    # "all" restores every model tensor. "policy" transfers the trunk and
+    # policy while preserving this run's freshly initialized value module.
+    init_checkpoint_scope: str = "all"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,17 +116,41 @@ class SelfplayConfig:
     simulations: int = 8
     max_considered: int = 16
     gumbel_scale: float = 0.0
+    c_visit: float = 50.0
+    c_scale: float = 1.0
     max_steps: int = 8
     max_candidates: int = 255
     reference: str = "self-average"
     root_mode: str = "generated"
     reference_ema_decay: float = 0.99
+    # Fraction of admitted references drawn from the latest measured
+    # challenger instead of the gated best (gated-policy only).
+    reference_gamma: float = 0.0
+    # Stochastic trajectories retained for the accepted policy. Each learner
+    # episode samples one complete trajectory; zero keeps the greedy reference.
+    reference_trajectory_pool: int = 0
+    # Fixed generated-root arena for the greedy historical-policy gate.
+    reference_arena_size: int = 0
+    reference_arena_seed: int = 910_000_001
+    # Optimizer updates between arena challengers. Zero follows every learner
+    # publication for backward compatibility; otherwise it must be a multiple
+    # of trainer.publish_interval.
+    reference_arena_interval: int = 0
+    # None preserves legacy greedy/pool behavior for existing configs.
+    policy_opponent_mode: str | None = None
+    # Optional STOP-masking override for the greedy policy reference.
+    # None inherits the learner's mask_stop setting.
+    reference_mask_stop: bool | None = None
     max_row_backlog: int = 200_000
     replay_retain: int = 0
     eval_device: str = "cuda:0"
     eval_poll_interval: float = 10.0
     seed: int = 0
     max_batch: int = 16
+    # Incumbent evaluator capacity; zero inherits max_batch.
+    reference_max_batch: int = 0
+    # Arena challenger capacity; zero inherits the incumbent capacity.
+    challenger_max_batch: int = 0
     python_dir: str = "python"
     # Export real position features to evals/rows; off = graph + opponent only.
     position_features: bool = True
@@ -89,15 +163,20 @@ class SelfplayConfig:
     # Break equal-reward games by episode length, shorter wins
     # (whittlezero's ptp_duration_tiebreak, discrete form).
     length_tiebreak: bool = False
+    # WhittleZero outcome label: tanh of the root-normalized terminal
+    # learner/reference reward margin when graded, hard +/-1 when sign.
+    value_reward: str = "sign"
+    value_reward_scale: float = 0.1
     # Carry the selected subtree across moves. whittlezero searches a
     # fresh tree per move; visit-based final selection is only faithful
     # with reuse off.
     tree_reuse: bool = True
     # Evaluator server processes; lanes stripe across them (torch only).
     eval_processes: int = 1
-    # Minimum delay between root episode admissions in each lane. Used to
-    # ramp worker cohorts instead of launching every slot at startup.
+    # Fixed per-lane learner-root admission interval; mutually exclusive with
+    # adaptive smoothing.
     admission_stagger_ms: int = 0
+    admission_smoothing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,8 +211,87 @@ def _sample_window_rows(window_rows: int, produced_rows: int) -> int:
     return max(1, min(int(window_rows), int(produced_rows)))
 
 
+def _resolved_trainer_seeds(config: TrainerConfig) -> tuple[int, int]:
+    model_seed = config.seed if config.model_seed is None else config.model_seed
+    data_seed = config.seed if config.data_seed is None else config.data_seed
+    return model_seed, data_seed
+
+
+def _required_produced_rows(
+    step: int,
+    batch: int,
+    max_reuse: float,
+    gate_interval: int,
+) -> int:
+    if max_reuse <= 0.0:
+        return 0
+    block_end = (step // gate_interval + 1) * gate_interval
+    return math.ceil(block_end * batch / max_reuse)
+
+
+def _required_episodes(step: int, gate_interval: int, episodes_per_gate: int) -> int:
+    if episodes_per_gate <= 0:
+        return 0
+    block = step // gate_interval + 1
+    return block * episodes_per_gate
+
+
+@dataclass(frozen=True, slots=True)
+class SampledBatches:
+    policy: object
+    value: object | None
+
+
+def _sample_training_batches(
+    sampler: SampleClient,
+    *,
+    policy_batch: int,
+    policy_window_rows: int,
+    value_batch: int,
+    value_window_rows: int,
+    run_seed: int,
+    step: int,
+    produced_rows: int,
+    sampled_tree: bool = False,
+    value_sampler: SampleClient | None = None,
+    value_executor: Executor | None = None,
+) -> SampledBatches:
+    if value_executor is not None and value_sampler is None:
+        raise ValueError("parallel value sampling requires a separate sample client")
+    value_future = None
+    if value_batch > 0 and value_executor is not None:
+        assert value_sampler is not None
+        value_future = value_executor.submit(
+            value_sampler.sample,
+            value_batch,
+            _sample_window_rows(value_window_rows, produced_rows),
+            step_seed(run_seed, step, "value-sample"),
+            **({"kind": "value"} if sampled_tree else {}),
+        )
+    policy = sampler.sample(
+        policy_batch,
+        _sample_window_rows(policy_window_rows, produced_rows),
+        step_seed(run_seed, step),
+        **({"kind": "policy"} if sampled_tree else {}),
+    )
+    value = None
+    if value_batch > 0:
+        if value_future is not None:
+            value = value_future.result()
+        else:
+            value = sampler.sample(
+                value_batch,
+                _sample_window_rows(value_window_rows, produced_rows),
+                step_seed(run_seed, step, "value-sample"),
+                **({"kind": "value"} if sampled_tree else {}),
+            )
+    return SampledBatches(policy=policy, value=value)
+
+
 def run(config_path: str | Path) -> None:
     config = load_config(config_path)
+    _set_matmul_precision(config.trainer.matmul_precision)
+    model_seed, data_seed = _resolved_trainer_seeds(config.trainer)
     for path in (config.paths.replay_dir, config.paths.checkpoint_dir, config.paths.run_dir):
         path.mkdir(parents=True, exist_ok=True)
     metrics = MetricsWriter(config.paths.run_dir / "metrics.jsonl", WandbRun.start(config))
@@ -143,6 +301,8 @@ def run(config_path: str | Path) -> None:
     ema = None
     published_snapshot = None
     resume_start = 0
+    arena_active_version = None
+    arena_completed_version = None
     if not config.trainer.resume:
         init_replay(config)
         serve = spawn_replay_serve(config)
@@ -153,7 +313,27 @@ def run(config_path: str | Path) -> None:
                 reconnect_limit=config.trainer.reconnect_limit,
             )
             sampler.wait_until_ready(0, alive_check=lambda: check_child(serve, "replay-serve"))
-            model = build_model(sampler.feature_schema, arch).to(config.trainer.device)
+            _seed_model(model_seed)
+            model = build_model(sampler.feature_schema, arch)
+            if config.trainer.init_checkpoint:
+                resolved = _load_initial_checkpoint(
+                    model,
+                    config.trainer.init_checkpoint,
+                    sampler.feature_schema_hash,
+                    arch,
+                    scope=config.trainer.init_checkpoint_scope,
+                )
+                metrics.write(
+                    {
+                        "event": "init_checkpoint",
+                        "source_model_version": resolved.manifest.model_version.hex(),
+                        "source_training_step": resolved.manifest.training_step,
+                        "scope": config.trainer.init_checkpoint_scope,
+                    }
+                )
+            else:
+                initialize_policy(model, config.trainer.policy_init)
+            model = model.to(config.trainer.device)
             ema = EmaWeights(model, config.trainer.ema_decay)
             first = publish_ema(
                 config.paths.checkpoint_dir,
@@ -164,6 +344,19 @@ def run(config_path: str | Path) -> None:
                 training_step=0,
                 run_id=config.paths.run_dir.name,
             )
+            if _uses_incumbent_evaluator(config):
+                promote_checkpoint_pointer(
+                    config.paths.checkpoint_dir,
+                    "best.json",
+                    first.model_version.hex(),
+                )
+            if _uses_arena_evaluator(config):
+                promote_checkpoint_pointer(
+                    config.paths.checkpoint_dir,
+                    "arena.json",
+                    first.model_version.hex(),
+                )
+                arena_completed_version = first.model_version.hex()
             param_norm, _ = ema.norms(None)
             published_snapshot = ema.state_dict()
             metrics.write(
@@ -178,12 +371,38 @@ def run(config_path: str | Path) -> None:
         finally:
             stop_child(serve)
 
+    if _uses_incumbent_evaluator(config) and config.trainer.resume:
+        best = ensure_checkpoint_pointer(config.paths.checkpoint_dir, "best.json")
+        if _uses_arena_evaluator(config):
+            arena = ensure_checkpoint_pointer(config.paths.checkpoint_dir, "arena.json")
+            arena_completed_version = best.model_version.hex()
+            if arena.model_version != best.model_version:
+                arena_active_version = arena.model_version.hex()
+
+    arena_publisher = (
+        ArenaCheckpointPublisher(
+            config.paths.checkpoint_dir,
+            arena_active_version,
+            arena_completed_version,
+        )
+        if _uses_arena_evaluator(config)
+        else None
+    )
+    _prune_training_checkpoints(config, arena_publisher)
     selfplay = spawn_torch_selfplay(config)
     opponent = OpponentTracker()
     selfplay_stats = SelfplayStatsTracker()
     threading.Thread(
         target=pump_selfplay_stderr,
-        args=(selfplay, opponent, selfplay_stats),
+        args=(
+            selfplay,
+            opponent,
+            selfplay_stats,
+            config.paths.checkpoint_dir
+            if _uses_incumbent_evaluator(config)
+            else None,
+            arena_publisher,
+        ),
         daemon=True,
     ).start()
     try:
@@ -195,6 +414,7 @@ def run(config_path: str | Path) -> None:
         ready_ack = sampler.wait_until_ready(
             config.trainer.min_startup_rows,
             alive_check=lambda: check_child(selfplay, "selfplay"),
+            policy_rows=_is_sampled_tree(config),
         )
         if ready_ack.root is not None and not config.trainer.resume:
             metrics.write(
@@ -229,20 +449,23 @@ def run(config_path: str | Path) -> None:
                     "model_version": resolved.manifest.model_version.hex(),
                 }
             )
-        stager = TrainingStager(sampler.feature_schema, config.trainer.batch, config.trainer.device)
+        policy_stager = TrainingStager(
+            sampler.feature_schema,
+            sampler.max_batch,
+            config.trainer.device,
+        )
+        value_stager = (
+            TrainingStager(
+                sampler.feature_schema,
+                sampler.max_batch,
+                config.trainer.device,
+            )
+            if config.trainer.value_batch > 0
+            else None
+        )
         loop = TrainerLoop(
             model,
-            LoopConfig(
-                lr=config.trainer.lr,
-                lr_schedule=config.trainer.lr_schedule,
-                warmup_steps=config.trainer.warmup_steps,
-                total_steps=config.trainer.total_steps,
-                value_weight=config.trainer.value_weight,
-                weight_decay=config.trainer.weight_decay,
-                grad_clip=config.trainer.grad_clip,
-                run_seed=config.trainer.seed,
-                value_mirror=config.trainer.value_mirror,
-            ),
+            trainer_loop_config(config.trainer, data_seed),
         )
         loop.step_index = resume_start
         window = PerfWindow()
@@ -252,13 +475,60 @@ def run(config_path: str | Path) -> None:
                 sampler,
                 config.trainer.batch,
                 config.trainer.window_rows,
-                config.trainer.seed,
+                config.trainer.value_batch,
+                config.trainer.value_window_rows or config.trainer.window_rows,
+                data_seed,
                 config.trainer.total_steps,
+                config.trainer.max_reuse,
+                config.trainer.reuse_gate_interval,
+                config.trainer.reuse_gate_episodes,
+                sampled_tree=_is_sampled_tree(config),
                 start_step=resume_start,
+                value_sampler=(
+                    sampler.fork()
+                    if config.trainer.value_batch > 0
+                    and config.trainer.parallel_value_sampling
+                    else None
+                ),
             )
             prefetcher.start()
+
+        def publish_training_step(training_step: int) -> None:
+            nonlocal published_snapshot
+            manifest = publish_ema(
+                config.paths.checkpoint_dir,
+                ema,
+                schema=sampler.feature_schema,
+                schema_hash=sampler.feature_schema_hash,
+                arch=arch,
+                training_step=training_step,
+                run_id=config.paths.run_dir.name,
+            )
+            if (
+                arena_publisher is not None
+                and training_step % _effective_arena_interval(config) == 0
+            ):
+                arena_publisher.schedule(manifest.model_version.hex(), training_step)
+            pruned = _prune_training_checkpoints(config, arena_publisher)
+            param_norm, update_norm = ema.norms(published_snapshot)
+            published_snapshot = ema.state_dict()
+            metrics.write(
+                {
+                    "event": "publish",
+                    "training_step": training_step,
+                    "model_version": manifest.model_version.hex(),
+                    "param_norm": param_norm,
+                    "update_norm": update_norm,
+                    "checkpoints_pruned": len(pruned),
+                }
+            )
+
         produced_floor = 0
+        value_produced_floor = 0
+        episodes_floor = 0
+        pending_publish_step = None
         for step in range(resume_start, config.trainer.total_steps):
+            opponent.raise_if_error()
             check_child(selfplay, "selfplay")
             if step % 50 == 0:
                 check_memory(config.trainer.min_available_gb)
@@ -266,30 +536,88 @@ def run(config_path: str | Path) -> None:
             # batch: ~0 while sampling keeps up, the residual stall when it
             # does not. The reuse gate stalls inside the same window.
             sample_started = time.perf_counter()
-            if config.trainer.max_reuse > 0:
-                needed = int((step + 1) * config.trainer.batch / config.trainer.max_reuse)
-                while produced_floor < needed:
+            if config.trainer.max_reuse > 0 or config.trainer.reuse_gate_episodes > 0:
+                needed_rows = _required_produced_rows(
+                    step,
+                    config.trainer.batch,
+                    config.trainer.max_reuse,
+                    config.trainer.reuse_gate_interval,
+                )
+                needed_episodes = _required_episodes(
+                    step,
+                    config.trainer.reuse_gate_interval,
+                    config.trainer.reuse_gate_episodes,
+                )
+                needed_value_rows = (
+                    _required_produced_rows(
+                        step,
+                        config.trainer.value_batch,
+                        config.trainer.max_reuse,
+                        config.trainer.reuse_gate_interval,
+                    )
+                    if _is_sampled_tree(config)
+                    else 0
+                )
+                while (
+                    produced_floor < needed_rows
+                    or value_produced_floor < needed_value_rows
+                    or episodes_floor < needed_episodes
+                ):
                     ack = prefetcher.refresh() if prefetcher is not None else sampler.refresh()
-                    produced_floor = ack.produced_rows
-                    if produced_floor >= needed:
+                    produced_floor = (
+                        ack.produced_policy_rows
+                        if _is_sampled_tree(config)
+                        else ack.produced_rows
+                    )
+                    value_produced_floor = ack.produced_rows
+                    episodes_floor = ack.episodes
+                    if (
+                        produced_floor >= needed_rows
+                        and value_produced_floor >= needed_value_rows
+                        and episodes_floor >= needed_episodes
+                    ):
                         break
                     check_child(selfplay, "selfplay")
                     time.sleep(0.1)
+            if pending_publish_step is not None:
+                publish_training_step(pending_publish_step)
+                pending_publish_step = None
             if prefetcher is not None:
-                result = prefetcher.next()
+                samples = prefetcher.next()
             else:
                 ack = sampler.refresh()
-                result = sampler.sample(
-                    config.trainer.batch,
-                    _sample_window_rows(config.trainer.window_rows, ack.produced_rows),
-                    step_seed(config.trainer.seed, step),
+                samples = _sample_training_batches(
+                    sampler,
+                    policy_batch=config.trainer.batch,
+                    policy_window_rows=config.trainer.window_rows,
+                    value_batch=config.trainer.value_batch,
+                    value_window_rows=(
+                        config.trainer.value_window_rows or config.trainer.window_rows
+                    ),
+                    run_seed=data_seed,
+                    step=step,
+                    produced_rows=ack.produced_rows,
+                    sampled_tree=_is_sampled_tree(config),
                 )
             train_started = time.perf_counter()
             # Metrics force a host-device sync; off-interval steps skip them
             # entirely so consecutive steps pipeline on the GPU.
             metrics_step = step % config.trainer.log_interval == 0
+            policy_training_batch = policy_stager.copy(
+                samples.policy.batch,
+                samples.policy.targets,
+            )
+            value_training_batch = None
+            if value_stager is not None:
+                assert samples.value is not None
+                value_training_batch = value_stager.copy(
+                    samples.value.batch,
+                    samples.value.targets,
+                )
             metrics_record = loop.train_step(
-                stager.copy(result.batch, result.targets), with_metrics=metrics_step
+                policy_training_batch,
+                value_training_batch,
+                with_metrics=metrics_step,
             )
             ema.update(model)
             window.record(sample_started, train_started, time.perf_counter())
@@ -311,15 +639,13 @@ def run(config_path: str | Path) -> None:
                     "fraction_valid": metrics_record.fraction_valid,
                     "label_mean": metrics_record.label_mean,
                     "learner_win_rate": metrics_record.learner_win_rate,
-                    "terminal_cost_mean": metrics_record.terminal_cost_mean,
-                    "terminal_cost_best": metrics_record.terminal_cost_best,
+                    "terminal_cost_ema": ack.episode_cost_ema,
+                    "terminal_cost_best": ack.best_cost,
                     "produced_rows": produced,
                     "samples_per_row": ((step + 1) * config.trainer.batch / produced) if produced else 0.0,
                     "stop_rate": stop_rate,
-                    "episode_cost_ema": ack.episode_cost_ema,
                     "episode_len_ema": ack.episode_len_ema,
                     "stop_rate_ema": ack.stop_rate_ema,
-                    "best_cost": ack.best_cost,
                     **opponent.step_fields(),
                     **selfplay_stats.step_fields(),
                 }
@@ -337,52 +663,24 @@ def run(config_path: str | Path) -> None:
                 record.update(window.drain(produced, ack.episodes))
                 for gate_event in opponent.drain_events():
                     metrics.write(gate_event)
+                if arena_publisher is not None:
+                    for publish_event in arena_publisher.drain_events():
+                        metrics.write(publish_event)
                 metrics.write(record)
             if (step + 1) % config.trainer.publish_interval == 0:
-                manifest = publish_ema(
-                    config.paths.checkpoint_dir,
-                    ema,
-                    schema=sampler.feature_schema,
-                    schema_hash=sampler.feature_schema_hash,
-                    arch=arch,
-                    training_step=step + 1,
-                    run_id=config.paths.run_dir.name,
-                )
-                param_norm, update_norm = ema.norms(published_snapshot)
-                published_snapshot = ema.state_dict()
-                metrics.write(
-                    {
-                        "event": "publish",
-                        "training_step": step + 1,
-                        "model_version": manifest.model_version.hex(),
-                        "param_norm": param_norm,
-                        "update_norm": update_norm,
-                    }
-                )
+                if config.trainer.publish_lag_blocks:
+                    pending_publish_step = step + 1
+                else:
+                    publish_training_step(step + 1)
             if config.trainer.step_sleep:
                 time.sleep(config.trainer.step_sleep)
         if prefetcher is not None:
             prefetcher.stop()
-        if config.trainer.total_steps % config.trainer.publish_interval != 0:
-            final = publish_ema(
-                config.paths.checkpoint_dir,
-                ema,
-                schema=sampler.feature_schema,
-                schema_hash=sampler.feature_schema_hash,
-                arch=arch,
-                training_step=config.trainer.total_steps,
-                run_id=config.paths.run_dir.name,
-            )
-            param_norm, update_norm = ema.norms(published_snapshot)
-            metrics.write(
-                {
-                    "event": "publish",
-                    "training_step": config.trainer.total_steps,
-                    "model_version": final.model_version.hex(),
-                    "param_norm": param_norm,
-                    "update_norm": update_norm,
-                }
-            )
+        if pending_publish_step is not None:
+            publish_training_step(pending_publish_step)
+        elif config.trainer.total_steps % config.trainer.publish_interval != 0:
+            publish_training_step(config.trainer.total_steps)
+        opponent.raise_if_error()
     except BaseException:
         # wandb's atexit hook marks the run crashed; only the clean path
         # finishes it explicitly.
@@ -391,6 +689,79 @@ def run(config_path: str | Path) -> None:
     else:
         kill_child(selfplay)
         metrics.finish()
+
+
+class ArenaCheckpointPublisher:
+    """Keeps one arena checkpoint pinned until its gate finishes."""
+
+    def __init__(
+        self,
+        checkpoint_dir: Path,
+        active_version: str | None = None,
+        completed_version: str | None = None,
+    ) -> None:
+        self.checkpoint_dir = checkpoint_dir
+        self.lock = threading.Lock()
+        self.active_version = active_version
+        self.completed_versions = (
+            {completed_version} if completed_version is not None else set()
+        )
+        self.pending: tuple[str, int] | None = None
+        self.events: list[dict[str, object]] = []
+
+    def schedule(self, version: str, training_step: int) -> None:
+        with self.lock:
+            if version == self.active_version or version in self.completed_versions:
+                return
+            if self.active_version is None:
+                self._activate(version, training_step)
+                return
+            self.pending = (version, training_step)
+
+    def complete(self, version: str) -> None:
+        with self.lock:
+            if self.active_version != version:
+                raise RuntimeError(
+                    "arena gate completed unexpected checkpoint: "
+                    f"active={self.active_version} completed={version}"
+                )
+            self.completed_versions.add(version)
+            self.active_version = None
+            pending, self.pending = self.pending, None
+            if pending is not None:
+                self._activate(*pending)
+
+    def drain_events(self) -> list[dict[str, object]]:
+        with self.lock:
+            events, self.events = self.events, []
+        return events
+
+    def protected_versions(self) -> set[str]:
+        with self.lock:
+            versions = (
+                {self.active_version}
+                if self.active_version is not None
+                else set()
+            )
+            if self.pending is not None:
+                versions.add(self.pending[0])
+        return versions
+
+    def _activate(self, version: str, training_step: int) -> None:
+        promote_checkpoint_pointer(
+            self.checkpoint_dir,
+            "arena.json",
+            version,
+        )
+        self.active_version = version
+        self.events.append(
+            {
+                "event": "arena_publish",
+                "timestamp": time.time(),
+                "training_step": training_step,
+                "model_version": version,
+            }
+        )
 
 
 class OpponentTracker:
@@ -406,8 +777,12 @@ class OpponentTracker:
         self.rollout_len = None
         self.accepted_total = 0
         self.rejected_total = 0
+        self.arena_challenger = None
+        self.arena_best = None
+        self.arena_margin = None
+        self.error: str | None = None
 
-    def observe(self, line: str) -> None:
+    def observe(self, line: str) -> tuple[bool, str] | None:
         fields = dict(
             token.split("=", 1) for token in line.strip().split() if "=" in token
         )
@@ -416,8 +791,9 @@ class OpponentTracker:
             challenger_cost = -float(fields["challenger"])
             best_cost = -float(fields["best"])
             rollout_len = int(fields["steps"])
+            version = fields["version"]
         except (KeyError, ValueError):
-            return
+            return None
         with self.lock:
             self.challenger_cost = challenger_cost
             self.best_cost = (
@@ -436,9 +812,59 @@ class OpponentTracker:
                     "challenger_cost": challenger_cost,
                     "best_cost": best_cost,
                     "rollout_len": rollout_len,
-                    "version": fields.get("version", ""),
+                    "version": version,
                 }
             )
+        return accepted, version
+
+    def observe_arena(self, line: str) -> tuple[bool, str] | None:
+        fields = dict(
+            token.split("=", 1) for token in line.strip().split() if "=" in token
+        )
+        try:
+            accepted = fields["accepted"] == "true"
+            challenger = float(fields["challenger"])
+            best = float(fields["best"])
+            margin = float(fields["margin"])
+            rollout_len = int(fields["steps"])
+            arena_size = int(fields["arena_size"])
+            version = fields["version"]
+        except (KeyError, ValueError):
+            return None
+        with self.lock:
+            self.arena_challenger = challenger
+            self.arena_best = best
+            self.arena_margin = margin
+            self.rollout_len = rollout_len
+            if accepted:
+                self.accepted_total += 1
+            else:
+                self.rejected_total += 1
+            self.events.append(
+                {
+                    "event": "opponent_arena_gate",
+                    "timestamp": time.time(),
+                    "accepted": int(accepted),
+                    "challenger_reduction": challenger,
+                    "best_reduction": best,
+                    "margin_sum": margin,
+                    "arena_size": arena_size,
+                    "rollout_len": rollout_len,
+                    "version": version,
+                }
+            )
+        return accepted, version
+
+    def fail(self, error: BaseException) -> None:
+        with self.lock:
+            if self.error is None:
+                self.error = str(error)
+
+    def raise_if_error(self) -> None:
+        with self.lock:
+            error = self.error
+        if error is not None:
+            raise RuntimeError(f"opponent checkpoint promotion failed: {error}")
 
     def drain_events(self) -> list[dict[str, object]]:
         with self.lock:
@@ -447,17 +873,23 @@ class OpponentTracker:
 
     def step_fields(self) -> dict[str, object]:
         with self.lock:
-            if self.challenger_cost is None:
+            if self.challenger_cost is None and self.arena_challenger is None:
                 return {}
             total = self.accepted_total + self.rejected_total
-            return {
-                "opponent_challenger_cost": self.challenger_cost,
-                "opponent_best_cost": self.best_cost,
+            out: dict[str, object] = {
                 "opponent_rollout_len": self.rollout_len,
                 "opponent_accepted_total": self.accepted_total,
                 "opponent_rejected_total": self.rejected_total,
                 "opponent_accept_rate": self.accepted_total / total,
             }
+            if self.challenger_cost is not None:
+                out["opponent_challenger_cost"] = self.challenger_cost
+                out["opponent_best_cost"] = self.best_cost
+            if self.arena_challenger is not None:
+                out["arena_challenger_reduction"] = self.arena_challenger
+                out["arena_best_reduction"] = self.arena_best
+                out["arena_margin_sum"] = self.arena_margin
+            return out
 
 
 class SelfplayStatsTracker:
@@ -475,8 +907,11 @@ class SelfplayStatsTracker:
         self.eval_at = None
         self.folded = None
         self.measure: dict[str, int] = {}
+        self.admission: dict[str, int] = {}
 
     def observe_eval(self, fields: dict[str, str]) -> None:
+        if fields.get("role", "current") != "current":
+            return
         try:
             batches = int(fields["batches"])
             rows = int(fields["rows"])
@@ -497,6 +932,28 @@ class SelfplayStatsTracker:
             return
         with self.lock:
             self.measure = parsed
+
+    def observe_admission(self, fields: dict[str, str]) -> None:
+        try:
+            parsed = {
+                key: int(fields[key])
+                for key in (
+                    "outstanding",
+                    "reserved",
+                    "waiting",
+                    "max_waiting",
+                    "bootstrap_grants",
+                    "paced_grants",
+                    "eval_capacity_milli",
+                    "episode_work_milli",
+                    "pressure_gain_milli",
+                    "gap_us",
+                )
+            }
+        except (KeyError, ValueError):
+            return
+        with self.lock:
+            self.admission = parsed
 
     def step_fields(self) -> dict[str, object]:
         with self.lock:
@@ -522,6 +979,26 @@ class SelfplayStatsTracker:
                     out["measure_repeat_rate"] = (
                         self.measure["finals"] - self.measure["distinct"]
                     ) / self.measure["finals"]
+            if self.admission:
+                for key in (
+                    "outstanding",
+                    "reserved",
+                    "waiting",
+                    "max_waiting",
+                    "bootstrap_grants",
+                    "paced_grants",
+                ):
+                    out[f"admission_{key}"] = self.admission[key]
+                out["admission_eval_capacity"] = (
+                    self.admission["eval_capacity_milli"] / 1_000
+                )
+                out["admission_episode_work"] = (
+                    self.admission["episode_work_milli"] / 1_000
+                )
+                out["admission_pressure_gain"] = (
+                    self.admission["pressure_gain_milli"] / 1_000
+                )
+                out["admission_gap_ms"] = self.admission["gap_us"] / 1_000
             return out
 
 
@@ -533,6 +1010,8 @@ def pump_selfplay_stderr(
     process: subprocess.Popen[bytes],
     tracker: OpponentTracker,
     stats: SelfplayStatsTracker,
+    checkpoint_dir: Path | None = None,
+    arena_publisher: ArenaCheckpointPublisher | None = None,
 ) -> None:
     """Relays the child's stderr to ours line-by-line, feeding gate and
     heartbeat lines to the trackers. Runs as a daemon thread until the
@@ -542,11 +1021,36 @@ def pump_selfplay_stderr(
         sys.stderr.buffer.write(raw)
         sys.stderr.buffer.flush()
         if raw.startswith(b"event=policy_gate "):
-            tracker.observe(raw.decode("utf-8", "replace"))
+            observed = tracker.observe(raw.decode("utf-8", "replace"))
+            if observed is not None and observed[0] and checkpoint_dir is not None:
+                try:
+                    promote_checkpoint_pointer(
+                        checkpoint_dir,
+                        "best.json",
+                        observed[1],
+                    )
+                except BaseException as error:
+                    tracker.fail(error)
+        elif raw.startswith(b"event=arena_gate "):
+            observed = tracker.observe_arena(raw.decode("utf-8", "replace"))
+            if observed is not None:
+                try:
+                    if observed[0] and checkpoint_dir is not None:
+                        promote_checkpoint_pointer(
+                            checkpoint_dir,
+                            "best.json",
+                            observed[1],
+                        )
+                    if arena_publisher is not None:
+                        arena_publisher.complete(observed[1])
+                except BaseException as error:
+                    tracker.fail(error)
         elif raw.startswith(b"event=eval_stats "):
             stats.observe_eval(parse_stat_fields(raw.decode("utf-8", "replace")))
         elif raw.startswith(b"event=measure_stats "):
             stats.observe_measure(parse_stat_fields(raw.decode("utf-8", "replace")))
+        elif raw.startswith(b"event=admission_stats "):
+            stats.observe_admission(parse_stat_fields(raw.decode("utf-8", "replace")))
 
 
 class MetricsWriter:
@@ -567,27 +1071,43 @@ class MetricsWriter:
 
 
 class SamplePrefetcher:
-    """Keeps one sample batch in flight on a background thread so the socket
-    read and decode overlap GPU training. Owns all sampler socket use after
-    start(): the internal lock serializes the sample loop against refresh(),
-    which would otherwise interleave protocol frames on the shared stream.
-    Errors raised while sampling surface on the consumer's next()."""
+    """Keeps one training pair in flight while the GPU trains.
+
+    The policy client remains shared with refresh() under a lock. A distinct
+    value client lets the replay service sample and collate both roles in
+    parallel without interleaving frames on either socket.
+    """
 
     def __init__(
         self,
         sampler: SampleClient,
         batch: int,
         window_rows: int,
+        value_batch: int,
+        value_window_rows: int,
         seed: int,
         total_steps: int,
+        max_reuse: float,
+        reuse_gate_interval: int,
+        reuse_gate_episodes: int,
+        sampled_tree: bool = False,
         start_step: int = 0,
+        *,
+        value_sampler: SampleClient | None = None,
     ) -> None:
         self._sampler = sampler
         self._batch = batch
         self._window_rows = window_rows
+        self._value_batch = value_batch
+        self._value_window_rows = value_window_rows
         self._seed = seed
         self._total_steps = total_steps
+        self._max_reuse = max_reuse
+        self._reuse_gate_interval = reuse_gate_interval
+        self._reuse_gate_episodes = reuse_gate_episodes
+        self._sampled_tree = sampled_tree
         self._start_step = start_step
+        self._value_sampler = value_sampler
         # Depth 2 rides out replay-store read spikes (compaction bursts)
         # without letting sample timing drift more than two steps.
         self._queue: queue.Queue = queue.Queue(maxsize=2)
@@ -617,26 +1137,79 @@ class SamplePrefetcher:
             return self._sampler.refresh()
 
     def _run(self) -> None:
-        for step in range(self._start_step, self._total_steps):
-            if self._stop.is_set():
-                return
-            try:
-                with self._lock:
-                    ack = self._sampler.refresh()
-                    result = self._sampler.sample(
-                        self._batch,
-                        _sample_window_rows(self._window_rows, ack.produced_rows),
-                        step_seed(self._seed, step),
-                    )
-            except BaseException as error:  # surfaced on next()
-                self._queue.put((None, error))
-                return
-            while not self._stop.is_set():
+        value_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="value-sample")
+            if self._value_sampler is not None
+            else None
+        )
+        try:
+            for step in range(self._start_step, self._total_steps):
+                if self._stop.is_set():
+                    return
                 try:
-                    self._queue.put((result, None), timeout=1.0)
-                    break
-                except queue.Full:
-                    continue
+                    needed_rows = _required_produced_rows(
+                        step,
+                        self._batch,
+                        self._max_reuse,
+                        self._reuse_gate_interval,
+                    )
+                    needed_episodes = _required_episodes(
+                        step,
+                        self._reuse_gate_interval,
+                        self._reuse_gate_episodes,
+                    )
+                    needed_value_rows = (
+                        _required_produced_rows(
+                            step,
+                            self._value_batch,
+                            self._max_reuse,
+                            self._reuse_gate_interval,
+                        )
+                        if self._sampled_tree
+                        else 0
+                    )
+                    while True:
+                        with self._lock:
+                            ack = self._sampler.refresh()
+                        policy_rows = (
+                            ack.produced_policy_rows
+                            if self._sampled_tree
+                            else ack.produced_rows
+                        )
+                        if (
+                            policy_rows >= needed_rows
+                            and ack.produced_rows >= needed_value_rows
+                            and ack.episodes >= needed_episodes
+                        ):
+                            break
+                        if self._stop.wait(0.1):
+                            return
+                    with self._lock:
+                        result = _sample_training_batches(
+                            self._sampler,
+                            policy_batch=self._batch,
+                            policy_window_rows=self._window_rows,
+                            value_batch=self._value_batch,
+                            value_window_rows=self._value_window_rows,
+                            run_seed=self._seed,
+                            step=step,
+                            produced_rows=ack.produced_rows,
+                            sampled_tree=self._sampled_tree,
+                            value_sampler=self._value_sampler,
+                            value_executor=value_executor,
+                        )
+                except BaseException as error:  # surfaced on next()
+                    self._queue.put((None, error))
+                    return
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put((result, None), timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            if value_executor is not None:
+                value_executor.shutdown(wait=True, cancel_futures=True)
 
 
 class PerfWindow:
@@ -695,19 +1268,30 @@ WANDB_KEYS = {
     "opponent_accepted_total": "opponent/accepted_total",
     "opponent_rejected_total": "opponent/rejected_total",
     "opponent_accept_rate": "opponent/accept_rate",
+    "arena_challenger_reduction": "arena/challenger_reduction_mean",
+    "arena_best_reduction": "arena/best_reduction_mean",
+    "arena_margin_sum": "arena/margin_sum",
     "eval_mean_batch": "eval/mean_batch",
     "eval_batches_per_s": "eval/batches_per_s",
     "eval_evals_per_s": "eval/evals_per_s",
     "measure_finals": "measure/finals",
     "measure_distinct_finals": "measure/distinct_finals",
     "measure_repeat_rate": "measure/repeat_rate",
-    "terminal_cost_mean": "selfplay/terminal_cost_mean",
+    "admission_outstanding": "admission/outstanding_evals",
+    "admission_reserved": "admission/reserved_evals",
+    "admission_waiting": "admission/waiting_workers",
+    "admission_max_waiting": "admission/max_waiting_workers",
+    "admission_bootstrap_grants": "admission/bootstrap_grants",
+    "admission_paced_grants": "admission/paced_grants",
+    "admission_eval_capacity": "admission/eval_capacity",
+    "admission_episode_work": "admission/evals_per_episode",
+    "admission_pressure_gain": "admission/pressure_gain",
+    "admission_gap_ms": "admission/gap_ms",
+    "terminal_cost_ema": "selfplay/terminal_cost_ema",
     "terminal_cost_best": "selfplay/terminal_cost_best",
     "stop_rate": "selfplay/stop_rate",
-    "episode_cost_ema": "selfplay/episode_cost_ema",
     "episode_len_ema": "selfplay/episode_len_ema",
     "stop_rate_ema": "selfplay/stop_rate_ema",
-    "best_cost": "selfplay/best_cost",
     "reduction_ema": "graph/reduction_ema",
     "reduction_best": "graph/reduction_best",
     "steps_per_s": "perf/steps_per_s",
@@ -729,12 +1313,24 @@ class WandbRun:
         self.publishes = 0
 
     @classmethod
-    def start(cls, config: RunConfig) -> WandbRun | None:
+    def start(
+        cls,
+        config: RunConfig,
+        extra_config: dict[str, object] | None = None,
+    ) -> WandbRun | None:
         if not config.wandb.project:
             return None
         try:
             import wandb
 
+            run_config = {
+                "trainer": asdict(config.trainer),
+                "selfplay": asdict(config.selfplay),
+                "arch": asdict(config.arch),
+                "run_dir": str(config.paths.run_dir),
+            }
+            if extra_config:
+                run_config.update(extra_config)
             run = wandb.init(
                 project=config.wandb.project,
                 entity=config.wandb.entity or None,
@@ -744,14 +1340,7 @@ class WandbRun:
                 resume="must" if config.wandb.run_id else None,
                 # A resumed run keeps its original config; re-sending it
                 # would conflict on any knob the resume changed.
-                config=None
-                if config.wandb.run_id
-                else {
-                    "trainer": asdict(config.trainer),
-                    "selfplay": asdict(config.selfplay),
-                    "arch": asdict(config.arch),
-                    "run_dir": str(config.paths.run_dir),
-                },
+                config=None if config.wandb.run_id else run_config,
             )
         except Exception as error:
             print(f"event=wandb_disabled error={error}", file=sys.stderr, flush=True)
@@ -772,7 +1361,7 @@ class WandbRun:
                 "publish/count": self.publishes,
                 "publish/training_step": record["training_step"],
             }
-            for key in ("param_norm", "update_norm"):
+            for key in ("param_norm", "update_norm", "checkpoints_pruned"):
                 if key in record:
                     payload[f"publish/{key}"] = record[key]
             self.run.log(payload, step=record["training_step"])
@@ -786,6 +1375,90 @@ def _validate(config: RunConfig) -> RunConfig:
         raise ValueError(f"unknown lr_schedule: {config.trainer.lr_schedule}")
     if config.trainer.min_startup_rows < 1:
         raise ValueError("min_startup_rows must be at least 1")
+    if config.trainer.publish_interval < 1:
+        raise ValueError("publish_interval must be positive")
+    if config.trainer.checkpoint_retain < 0:
+        raise ValueError("checkpoint_retain must be non-negative")
+    if config.trainer.publish_lag_blocks not in (0, 1):
+        raise ValueError("publish_lag_blocks must be 0 or 1")
+    if config.trainer.batch < 1:
+        raise ValueError("batch must be positive")
+    if config.trainer.value_batch < 0:
+        raise ValueError("value_batch must be non-negative")
+    if config.trainer.window_rows < 1:
+        raise ValueError("window_rows must be positive")
+    if config.trainer.value_window_rows < 0:
+        raise ValueError("value_window_rows must be non-negative")
+    if config.trainer.compile_mode not in (
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+    ):
+        raise ValueError(f"unknown compile_mode: {config.trainer.compile_mode}")
+    if config.trainer.matmul_precision not in ("highest", "high", "medium"):
+        raise ValueError(
+            f"unknown matmul_precision: {config.trainer.matmul_precision}"
+        )
+    if config.trainer.reuse_gate_interval < 1:
+        raise ValueError("reuse_gate_interval must be positive")
+    if config.trainer.reuse_gate_episodes < 0:
+        raise ValueError("reuse_gate_episodes must be non-negative")
+    if config.trainer.publish_lag_blocks and (
+        config.trainer.reuse_gate_interval != config.trainer.publish_interval
+        or (
+            config.trainer.max_reuse == 0.0
+            and config.trainer.reuse_gate_episodes == 0
+        )
+    ):
+        raise ValueError(
+            "publish_lag_blocks requires a publish-aligned reuse gate"
+        )
+    if not math.isfinite(config.trainer.max_reuse) or config.trainer.max_reuse < 0.0:
+        raise ValueError("max_reuse must be finite and non-negative")
+    if config.trainer.lr_decay_steps is not None and config.trainer.lr_decay_steps < 1:
+        raise ValueError("lr_decay_steps must be positive")
+    if not 0.0 <= config.trainer.min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must be in [0, 1]")
+    if config.trainer.optimizer not in ("adamw", "muon_mixed"):
+        raise ValueError(f"unknown optimizer: {config.trainer.optimizer}")
+    if config.trainer.adamw_lr is not None and config.trainer.adamw_lr <= 0.0:
+        raise ValueError("adamw_lr must be positive")
+    if not 0.0 <= config.trainer.momentum < 1.0:
+        raise ValueError("momentum must be in [0, 1)")
+    if config.trainer.ns_steps < 1:
+        raise ValueError("ns_steps must be positive")
+    if config.trainer.policy_init not in ("default", "neutral"):
+        raise ValueError(f"unsupported policy_init: {config.trainer.policy_init}")
+    if config.trainer.policy_init == "neutral" and config.arch.policy_head != "pointer":
+        raise ValueError("policy_init = 'neutral' requires policy_head = 'pointer'")
+    if config.trainer.resume and config.trainer.init_checkpoint:
+        raise ValueError("resume and init_checkpoint are mutually exclusive")
+    if config.trainer.init_checkpoint_scope not in ("all", "policy"):
+        raise ValueError("init_checkpoint_scope must be 'all' or 'policy'")
+    if not config.trainer.init_checkpoint and config.trainer.init_checkpoint_scope != "all":
+        raise ValueError("init_checkpoint_scope requires init_checkpoint")
+    for name, seed in (
+        ("seed", config.trainer.seed),
+        ("model_seed", config.trainer.model_seed),
+        ("data_seed", config.trainer.data_seed),
+    ):
+        if seed is not None and not 0 <= seed < 2**64:
+            raise ValueError(f"{name} must fit an unsigned 64-bit integer")
+    if (
+        not math.isfinite(config.selfplay.c_visit)
+        or config.selfplay.c_visit < 0.0
+        or not math.isfinite(config.selfplay.c_scale)
+        or config.selfplay.c_scale < 0.0
+    ):
+        raise ValueError("c_visit and c_scale must be finite and non-negative")
+    if (
+        config.arch.position_encoding in {"policy_budget", "remaining_budget"}
+        and not config.selfplay.position_features
+    ):
+        raise ValueError(
+            f"position_encoding = '{config.arch.position_encoding}' requires position_features = true"
+        )
     # The opponent reward scalar lives in the position feature block, so
     # blinding the model (position_features = false) removes the value
     # head's ONLY opponent signal unless the pair input carries the full
@@ -798,7 +1471,155 @@ def _validate(config: RunConfig) -> RunConfig:
         )
     if config.selfplay.admission_stagger_ms < 0:
         raise ValueError("admission_stagger_ms must be non-negative")
+    if config.selfplay.reference_max_batch < 0:
+        raise ValueError("reference_max_batch must be non-negative")
+    if config.selfplay.challenger_max_batch < 0:
+        raise ValueError("challenger_max_batch must be non-negative")
+    if config.selfplay.admission_smoothing and config.selfplay.admission_stagger_ms:
+        raise ValueError(
+            "admission_smoothing and admission_stagger_ms are mutually exclusive"
+        )
+    if config.selfplay.reference_trajectory_pool < 0:
+        raise ValueError("reference_trajectory_pool must be non-negative")
+    if not math.isfinite(config.selfplay.reference_gamma) or not (
+        0.0 <= config.selfplay.reference_gamma < 1.0
+    ):
+        raise ValueError("reference_gamma must be in [0, 1)")
+    if config.selfplay.value_reward not in ("sign", "graded"):
+        raise ValueError(f"unknown value_reward: {config.selfplay.value_reward}")
+    if (
+        not math.isfinite(config.selfplay.value_reward_scale)
+        or config.selfplay.value_reward_scale <= 0.0
+    ):
+        raise ValueError("value_reward_scale must be finite and positive")
+    if config.selfplay.value_reward == "graded":
+        if config.arch.value_head == "scalar" and config.arch.value_activation != "tanh":
+            raise ValueError("graded scalar values require value_activation = 'tanh'")
+    elif config.arch.value_head == "hl_gauss":
+        raise ValueError("value_head = 'hl_gauss' requires value_reward = 'graded'")
+    if config.selfplay.reference_arena_size < 0:
+        raise ValueError("reference_arena_size must be non-negative")
+    if config.selfplay.reference_arena_interval < 0:
+        raise ValueError("reference_arena_interval must be non-negative")
+    if not 0 <= config.selfplay.reference_arena_seed < 2**64:
+        raise ValueError("reference_arena_seed must fit an unsigned 64-bit integer")
+    if config.selfplay.policy_opponent_mode is not None:
+        mode = config.selfplay.policy_opponent_mode
+        if mode not in ("greedy-trajectory", "sampled-trajectory", "sampled-tree"):
+            raise ValueError(f"unknown policy_opponent_mode: {mode}")
+        if mode == "sampled-trajectory" and config.selfplay.reference != "policy":
+            raise ValueError(
+                "policy_opponent_mode = 'sampled-trajectory' requires reference = 'policy'"
+            )
+        if mode != "sampled-trajectory" and config.selfplay.reference != "gated-policy":
+            raise ValueError("policy_opponent_mode requires reference = 'gated-policy'")
+        generated_arena = (
+            mode in ("greedy-trajectory", "sampled-tree")
+            and config.selfplay.root_mode == "generated"
+            and config.selfplay.reference_arena_size > 0
+        )
+        if config.selfplay.root_mode != "fixed" and not generated_arena:
+            raise ValueError(
+                "policy_opponent_mode requires root_mode = 'fixed' or a generated-root arena"
+            )
+        if config.selfplay.reference_trajectory_pool > 0:
+            raise ValueError(
+                "policy_opponent_mode cannot be combined with reference_trajectory_pool"
+            )
+        if mode in ("sampled-trajectory", "sampled-tree") and config.arch.value_input != "pair":
+            raise ValueError(f"policy_opponent_mode = '{mode}' requires value_input = 'pair'")
+        if mode == "sampled-trajectory" and config.selfplay.reference_gamma != 0.0:
+            raise ValueError(
+                "policy_opponent_mode = 'sampled-trajectory' requires reference_gamma = 0; "
+                "active-policy rollouts do not select a historical reference"
+            )
+        if mode == "sampled-tree":
+            if config.selfplay.reference_gamma != 0.0:
+                raise ValueError("sampled-tree requires reference_gamma = 0")
+            if config.selfplay.tree_reuse:
+                raise ValueError("sampled-tree requires tree_reuse = false")
+            if config.trainer.value_batch <= 0:
+                raise ValueError("sampled-tree requires a positive value_batch")
+            if config.trainer.value_mirror:
+                raise ValueError("sampled-tree requires value_mirror = false")
+            if config.selfplay.eval_processes != 1:
+                raise ValueError("sampled-tree requires eval_processes = 1")
+    if (
+        config.selfplay.reference_trajectory_pool > 0
+        and config.selfplay.reference != "gated-policy"
+    ):
+        raise ValueError("reference_trajectory_pool requires reference = 'gated-policy'")
+    if config.selfplay.reference_arena_size > 0 and not (
+        config.selfplay.reference == "gated-policy"
+        and config.selfplay.root_mode == "generated"
+        and config.selfplay.policy_opponent_mode in ("greedy-trajectory", "sampled-tree")
+    ):
+        raise ValueError(
+            "reference_arena_size requires generated gated-policy "
+            "greedy-trajectory or sampled-tree"
+        )
+    if (
+        config.selfplay.reference_arena_size > 0
+        and config.selfplay.reference_trajectory_pool > 0
+    ):
+        raise ValueError(
+            "reference_arena_size cannot be combined with reference_trajectory_pool"
+        )
+    if config.selfplay.reference_arena_size > 0 and config.selfplay.eval_processes != 1:
+        raise ValueError(
+            "generated arena gating requires eval_processes = 1; opaque model versions "
+            "cannot order staggered process swaps"
+        )
+    if _uses_arena_evaluator(config) and (
+        not math.isfinite(config.selfplay.eval_poll_interval)
+        or config.selfplay.eval_poll_interval <= 0.0
+    ):
+        raise ValueError("generated arena gating requires a positive eval_poll_interval")
+    if config.selfplay.reference_arena_interval and not _uses_arena_evaluator(config):
+        raise ValueError("reference_arena_interval requires reference_arena_size > 0")
+    if _uses_arena_evaluator(config):
+        arena_interval = _effective_arena_interval(config)
+        if arena_interval < config.trainer.publish_interval:
+            raise ValueError("reference_arena_interval must not be shorter than publish_interval")
+        if arena_interval % config.trainer.publish_interval:
+            raise ValueError("reference_arena_interval must be a multiple of publish_interval")
     return config
+
+
+def _is_sampled_tree(config: RunConfig) -> bool:
+    return config.selfplay.policy_opponent_mode == "sampled-tree"
+
+
+def _uses_incumbent_evaluator(config: RunConfig) -> bool:
+    return (
+        config.selfplay.reference_arena_size > 0
+        or config.selfplay.reference_trajectory_pool > 0
+        or _is_sampled_tree(config)
+    )
+
+
+def _uses_arena_evaluator(config: RunConfig) -> bool:
+    return config.selfplay.reference_arena_size > 0
+
+
+def _effective_arena_interval(config: RunConfig) -> int:
+    return config.selfplay.reference_arena_interval or config.trainer.publish_interval
+
+
+def _prune_training_checkpoints(
+    config: RunConfig,
+    arena_publisher: ArenaCheckpointPublisher | None,
+) -> tuple[str, ...]:
+    protected = (
+        arena_publisher.protected_versions()
+        if arena_publisher is not None
+        else ()
+    )
+    return prune_checkpoints(
+        config.paths.checkpoint_dir,
+        config.trainer.checkpoint_retain,
+        protected_model_versions=protected,
+    )
 
 
 def load_config(path: str | Path) -> RunConfig:
@@ -885,12 +1706,25 @@ def spawn_replay_serve(config: RunConfig) -> subprocess.Popen[bytes]:
             "--socket",
             str(config.paths.sample_socket),
             "--max-batch",
-            str(config.trainer.batch),
+            str(max(config.trainer.batch, config.trainer.value_batch)),
         ]
     )
 
 
 def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
+    reference_mask_stop = (
+        []
+        if config.selfplay.reference_mask_stop is None
+        else [
+            "--reference-mask-stop",
+            "true" if config.selfplay.reference_mask_stop else "false",
+        ]
+    )
+    policy_opponent_mode = (
+        []
+        if config.selfplay.policy_opponent_mode is None
+        else ["--policy-opponent-mode", config.selfplay.policy_opponent_mode]
+    )
     return subprocess.Popen(
         [
             config.paths.graphzero_bin,
@@ -909,6 +1743,32 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             config.selfplay.root_mode,
             "--reference-ema-decay",
             str(config.selfplay.reference_ema_decay),
+            "--reference-gamma",
+            str(config.selfplay.reference_gamma),
+            "--reference-trajectory-pool",
+            str(config.selfplay.reference_trajectory_pool),
+            "--reference-arena-size",
+            str(config.selfplay.reference_arena_size),
+            "--reference-arena-seed",
+            str(config.selfplay.reference_arena_seed),
+            *(
+                [
+                    "--reference-checkpoint-pointer",
+                    str(config.paths.checkpoint_dir / "best.json"),
+                ]
+                if _uses_incumbent_evaluator(config)
+                else []
+            ),
+            *(
+                [
+                    "--reference-challenger-checkpoint-pointer",
+                    str(config.paths.checkpoint_dir / "arena.json"),
+                ]
+                if _uses_arena_evaluator(config)
+                else []
+            ),
+            *policy_opponent_mode,
+            *reference_mask_stop,
             "--position-features",
             "true" if config.selfplay.position_features else "false",
             "--no-backtrack",
@@ -921,10 +1781,16 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             "true" if config.selfplay.mask_stop else "false",
             "--length-tiebreak",
             "true" if config.selfplay.length_tiebreak else "false",
+            "--value-reward",
+            config.selfplay.value_reward,
+            "--value-reward-scale",
+            str(config.selfplay.value_reward_scale),
             "--eval-processes",
             str(config.selfplay.eval_processes),
             "--admission-stagger-ms",
             str(config.selfplay.admission_stagger_ms),
+            "--admission-smoothing",
+            "true" if config.selfplay.admission_smoothing else "false",
             "--evaluator",
             "torch",
             "--python-dir",
@@ -945,10 +1811,24 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             str(config.selfplay.max_considered),
             "--gumbel-scale",
             str(config.selfplay.gumbel_scale),
+            "--c-visit",
+            str(config.selfplay.c_visit),
+            "--c-scale",
+            str(config.selfplay.c_scale),
             "--max-candidates",
             str(config.selfplay.max_candidates),
             "--max-batch",
             str(config.selfplay.max_batch),
+            *(
+                ["--reference-max-batch", str(config.selfplay.reference_max_batch)]
+                if config.selfplay.reference_max_batch
+                else []
+            ),
+            *(
+                ["--challenger-max-batch", str(config.selfplay.challenger_max_batch)]
+                if config.selfplay.challenger_max_batch
+                else []
+            ),
             "--serve-socket",
             str(config.paths.sample_socket),
             # Sampled GZFB/GZFT batches are encoded at the serve capacity, and
@@ -971,6 +1851,98 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
         # thread relays everything to our stderr unchanged.
         stderr=subprocess.PIPE,
     )
+
+
+def _seed_model(seed: int) -> None:
+    import torch
+
+    torch.manual_seed(seed)
+
+
+def _set_matmul_precision(precision: str) -> None:
+    import torch
+
+    torch.set_float32_matmul_precision(precision)
+
+
+def trainer_loop_config(config: TrainerConfig, data_seed: int) -> LoopConfig:
+    return LoopConfig(
+        lr=config.lr,
+        lr_schedule=config.lr_schedule,
+        warmup_steps=config.warmup_steps,
+        total_steps=config.total_steps,
+        lr_decay_steps=config.lr_decay_steps,
+        min_lr_ratio=config.min_lr_ratio,
+        value_weight=config.value_weight,
+        weight_decay=config.weight_decay,
+        optimizer=config.optimizer,
+        adamw_lr=config.adamw_lr,
+        momentum=config.momentum,
+        nesterov=config.nesterov,
+        ns_steps=config.ns_steps,
+        grad_clip=config.grad_clip,
+        run_seed=data_seed,
+        value_mirror=config.value_mirror,
+        compile_model=config.compile_model,
+        compile_mode=config.compile_mode,
+    )
+
+
+def _load_initial_checkpoint(
+    model: object,
+    source: str | Path,
+    feature_schema_hash: object,
+    arch: ArchConfig,
+    *,
+    scope: str = "all",
+) -> object:
+    from gz.checkpoints import DirectorySource
+    from gz.checkpoints.weights import load_state_dict
+
+    resolved = DirectorySource(Path(source).absolute()).resolve_latest()
+    if resolved.manifest.feature_schema_hash != feature_schema_hash:
+        raise RuntimeError("initial checkpoint feature schema does not match the store")
+    if resolved.manifest.arch_name != arch.name:
+        raise RuntimeError("initial checkpoint arch name does not match [arch] config")
+    source_arch = ArchConfig.from_dict(resolved.manifest.arch_config)
+    if scope == "all" and source_arch != arch:
+        raise RuntimeError("initial checkpoint arch does not match [arch] config")
+    if scope == "policy" and _policy_arch_config(source_arch) != _policy_arch_config(arch):
+        raise RuntimeError("initial checkpoint policy arch does not match [arch] config")
+    state = load_state_dict(resolved.weights_path)
+    if scope == "all":
+        model.load_state_dict(state)
+    elif scope == "policy":
+        policy_state = {
+            name: tensor for name, tensor in state.items() if not name.startswith("value.")
+        }
+        incompatible = model.load_state_dict(policy_state, strict=False)
+        expected_missing = {
+            name for name in model.state_dict() if name.startswith("value.")
+        }
+        if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+            raise RuntimeError("policy checkpoint scope did not isolate the value module")
+    else:
+        raise ValueError(f"unsupported initial checkpoint scope: {scope}")
+    return resolved
+
+
+def _policy_arch_config(arch: ArchConfig) -> dict[str, object]:
+    value_fields = {
+        "value_input",
+        "value_activation",
+        "value_hidden",
+        "value_head",
+        "value_bins",
+        "value_min",
+        "value_max",
+        "value_sigma_ratio",
+    }
+    return {
+        name: value
+        for name, value in arch.to_dict().items()
+        if name not in value_fields
+    }
 
 
 def check_memory(min_available_gb: float) -> None:

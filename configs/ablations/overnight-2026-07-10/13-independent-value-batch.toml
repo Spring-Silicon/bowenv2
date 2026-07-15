@@ -1,0 +1,11 @@
+extends = "../../bases/benchmark-throughput-r8-screen.toml"
+
+[trainer]
+value_batch = 256
+value_window_rows = 5000
+
+[wandb]
+run_name = "ablate-o1-13-independent-value-batch"
+
+[paths]
+run_dir = "runs/ablate-o1-13-independent-value-batch"

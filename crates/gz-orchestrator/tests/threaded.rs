@@ -5,11 +5,12 @@ use gz_eval::{
     RandomValueEvaluatorConfig,
 };
 use gz_orchestrator::{
-    CountedRoots, LaneEpisodes, OrchestratedEpisode, SerialGumbelOrchestrator,
-    ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig, WorkerId,
+    AdmissionSmoothingConfig, CountedRoots, LaneEpisodes, OrchestratedEpisode,
+    SerialGumbelOrchestrator, ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig, WorkerId,
 };
 use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type Roots = CountedRoots<fn(&mut WhittleEngine) -> EngineResult<WhittleGraphId>>;
@@ -40,6 +41,7 @@ fn config(workers_per_lane: usize, max_batch: usize) -> ThreadedOrchestratorConf
         max_batch: NonZeroUsize::new(max_batch).unwrap(),
         flush_after: Duration::from_millis(50),
         admission_stagger: Duration::ZERO,
+        admission_smoothing: None,
     }
 }
 
@@ -57,6 +59,25 @@ fn root_factory(engine: &mut WhittleEngine) -> EngineResult<WhittleGraphId> {
 
 fn repeated_roots(count: u64) -> Roots {
     CountedRoots::new(count, root_factory)
+}
+
+struct RecordingRoots {
+    remaining: u64,
+    admissions: Arc<Mutex<Vec<std::time::Instant>>>,
+}
+
+impl gz_orchestrator::RootSource<WhittleEngine> for RecordingRoots {
+    fn next_root(&mut self, engine: &mut WhittleEngine) -> EngineResult<Option<WhittleGraphId>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.remaining -= 1;
+        self.admissions
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
+        Ok(Some(engine.root()))
+    }
 }
 
 fn engines(count: usize) -> Vec<WhittleEngine> {
@@ -162,6 +183,7 @@ fn slow_evaluator_batches_active_workers() {
             max_batch: NonZeroUsize::new(8).unwrap(),
             flush_after: Duration::from_millis(250),
             admission_stagger: Duration::ZERO,
+            admission_smoothing: None,
         },
     );
     let run = orchestrator
@@ -176,7 +198,7 @@ fn slow_evaluator_batches_active_workers() {
 }
 
 #[test]
-fn admission_stagger_limits_initial_lane_fill() {
+fn adaptive_admission_bootstraps_without_filling_worker_pool() {
     let engines = engines(1);
     let search = search(&engines[0], false);
     let orchestrator = ThreadedGumbelOrchestrator::new(
@@ -190,15 +212,58 @@ fn admission_stagger_limits_initial_lane_fill() {
             workers_per_lane: NonZeroUsize::new(8).unwrap(),
             max_batch: NonZeroUsize::new(8).unwrap(),
             flush_after: Duration::from_millis(250),
-            admission_stagger: Duration::from_millis(10),
+            admission_stagger: Duration::ZERO,
+            admission_smoothing: Some(AdmissionSmoothingConfig {
+                initial_episode_eval_work: NonZeroU64::new(6).unwrap(),
+            }),
         },
     );
+
     let run = orchestrator
-        .run(vec![repeated_roots(8)], GumbelEpisodeContext::default())
+        .run(vec![repeated_roots(16)], GumbelEpisodeContext::default())
         .unwrap();
 
-    assert_eq!(run.lanes[0].episodes.len(), 8);
+    assert_eq!(run.lanes[0].episodes.len(), 16);
     assert_eq!(run.batch_sizes[0], 1);
+}
+
+#[test]
+fn admission_stagger_paces_replacement_admissions() {
+    let engines = engines(1);
+    let search = search(&engines[0], false);
+    let orchestrator = ThreadedGumbelOrchestrator::new(
+        engines,
+        evaluator(),
+        search,
+        ThreadedOrchestratorConfig {
+            workers_per_lane: NonZeroUsize::new(2).unwrap(),
+            max_batch: NonZeroUsize::new(2).unwrap(),
+            flush_after: Duration::ZERO,
+            admission_stagger: Duration::from_millis(100),
+            admission_smoothing: None,
+        },
+    );
+    let admissions = Arc::new(Mutex::new(Vec::new()));
+    let run = orchestrator
+        .run(
+            vec![RecordingRoots {
+                remaining: 4,
+                admissions: Arc::clone(&admissions),
+            }],
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(run.lanes[0].episodes.len(), 4);
+    assert_eq!(run.batch_sizes[0], 1);
+    let admissions = admissions.lock().unwrap();
+    assert_eq!(admissions.len(), 4);
+    for pair in admissions.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0]) >= Duration::from_millis(80),
+            "replacement roots bypassed persistent pacing: {admissions:?}"
+        );
+    }
 }
 
 #[test]

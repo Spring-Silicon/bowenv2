@@ -1,0 +1,10 @@
+extends = "bases/live-trajectory-s42-throughput.toml"
+
+[trainer]
+total_steps = 10000
+
+[wandb]
+run_name = "live-trajectory-s42-10k-1"
+
+[paths]
+run_dir = "runs/live-trajectory-s42-10k"

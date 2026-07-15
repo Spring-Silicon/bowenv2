@@ -1,3 +1,4 @@
+use crate::ReplayDataMode;
 use crate::{ReplayError, ReplayResult};
 use gz_engine::{
     CandidateHash, MeasureSummary, ModelVersion, PortableCandidateRef, PortableSearchActionRef,
@@ -202,9 +203,10 @@ pub(crate) fn validate_episode(
     record: &ReplayEpisodeRecord,
     rows: &[ReplayRow],
     feature_schema_hash: Option<FeatureSchemaHash>,
+    data_mode: ReplayDataMode,
 ) -> ReplayResult<()> {
     validate_admission(record)?;
-    validate_outcome(record)?;
+    validate_outcome(record, data_mode)?;
 
     if rows.len() != record.row_count as usize || rows.len() != record.steps.len() {
         return Err(ReplayError::InvalidRecord);
@@ -233,7 +235,7 @@ pub(crate) fn validate_episode(
             validate_feature_row_header(bytes, &hash).map_err(|_| ReplayError::InvalidRecord)?;
         }
 
-        validate_row(record, row, &expected_history)?;
+        validate_row(record, row, &expected_history, data_mode)?;
         expected_history.push(record.steps[index].action);
     }
 
@@ -252,7 +254,7 @@ fn validate_admission(record: &ReplayEpisodeRecord) -> ReplayResult<()> {
     Ok(())
 }
 
-fn validate_outcome(record: &ReplayEpisodeRecord) -> ReplayResult<()> {
+fn validate_outcome(record: &ReplayEpisodeRecord, data_mode: ReplayDataMode) -> ReplayResult<()> {
     if !record.outcome.learner_reward.is_finite() {
         return Err(ReplayError::InvalidRecord);
     }
@@ -261,7 +263,7 @@ fn validate_outcome(record: &ReplayEpisodeRecord) -> ReplayResult<()> {
         return Err(ReplayError::InvalidRecord);
     }
 
-    validate_value_target(record.outcome.value_target)?;
+    validate_value_target(record.outcome.value_target, data_mode)?;
 
     match &record.outcome.reference {
         Some(reference) => {
@@ -269,11 +271,21 @@ fn validate_outcome(record: &ReplayEpisodeRecord) -> ReplayResult<()> {
                 return Err(ReplayError::InvalidRecord);
             }
 
-            let valid = match sign_target(record.outcome.learner_reward, reference.reward) {
-                // Exact ties are coin-flipped to a hard +/-1 at projection
-                // (random tie-break); either sign is a valid tie label.
-                0.0 => matches!(record.outcome.value_target, Some(-1.0 | 1.0)),
-                expected => record.outcome.value_target == Some(expected),
+            let reward_sign = sign_target(record.outcome.learner_reward, reference.reward);
+            let valid = if data_mode.is_graded() {
+                match (reward_sign, record.outcome.value_target) {
+                    (sign, Some(target)) if sign > 0.0 => target > 0.0,
+                    (sign, Some(target)) if sign < 0.0 => target < 0.0,
+                    (0.0, Some(_)) => true,
+                    _ => false,
+                }
+            } else {
+                match reward_sign {
+                    // Exact ties are coin-flipped to a hard +/-1 at projection
+                    // (random tie-break); either sign is a valid tie label.
+                    0.0 => matches!(record.outcome.value_target, Some(-1.0 | 1.0)),
+                    expected => record.outcome.value_target == Some(expected),
+                }
             };
             if !valid {
                 return Err(ReplayError::InvalidRecord);
@@ -293,6 +305,7 @@ fn validate_row(
     record: &ReplayEpisodeRecord,
     row: &ReplayRow,
     expected_history: &[PortableSearchActionRef],
+    data_mode: ReplayDataMode,
 ) -> ReplayResult<()> {
     let step = &record.steps[row.step_index as usize];
 
@@ -327,18 +340,17 @@ fn validate_row(
         }
     }
 
-    validate_value_target(row.value_target)?;
+    validate_value_target(row.value_target, data_mode)?;
 
     Ok(())
 }
 
-fn validate_value_target(value: Option<f32>) -> ReplayResult<()> {
-    match value {
-        // Hard signs only: ties are coin-flipped at projection, so a
-        // stored zero target is a producer bug.
-        Some(value) if value == -1.0 || value == 1.0 => Ok(()),
-        Some(_) => Err(ReplayError::InvalidRecord),
-        None => Ok(()),
+fn validate_value_target(value: Option<f32>, data_mode: ReplayDataMode) -> ReplayResult<()> {
+    match (value, data_mode.is_graded()) {
+        (Some(value), false) if value == -1.0 || value == 1.0 => Ok(()),
+        (Some(value), true) if value.is_finite() && (-1.0..=1.0).contains(&value) => Ok(()),
+        (Some(_), _) => Err(ReplayError::InvalidRecord),
+        (None, _) => Ok(()),
     }
 }
 

@@ -1,13 +1,13 @@
 use gz_features::{
     ActionFeature, ENCODING_VERSION, FeatureBatchView, FeatureCollator, FeatureEdge, FeatureError,
-    FeatureRow, FeatureSchema, FeatureSchemaConfig, OpponentStateFeatures, PositionFeatures,
-    RowTargets, TrainingTargetsView, decode_feature_row, encode_feature_row,
+    FeatureRow, FeatureSchema, FeatureSchemaConfig, OpponentBatchRef, OpponentStateFeatures,
+    PositionFeatures, RowTargets, TrainingTargetsView, decode_feature_row, encode_feature_row,
     encode_training_targets, validate_batch_action_counts, validate_feature_row_header,
 };
 use std::num::NonZeroUsize;
 
 const HAND_BUILT_BATCH_FINGERPRINT: &str =
-    "7769b626bde107842fbbf00d721a5c541d5284c53f879c829d4bb77dfd9fc34b";
+    "759801a825bede65f27c0c9c9c22471aeb6342d71aa62279fe7c2008c5b48501";
 
 fn schema() -> FeatureSchema {
     FeatureSchema::new(FeatureSchemaConfig {
@@ -139,6 +139,8 @@ fn collate_parse_roundtrips_sections_and_padding() {
     assert_eq!(view.opponent_reward, vec![0.5, 0.0]);
     assert_eq!(view.opponent_present, vec![1, 0]);
     assert_eq!(view.opponent_state_present, vec![1, 0]);
+    assert_eq!(view.opponent_trajectory_id, vec![0, 0]);
+    assert_eq!(view.opponent_row, vec![0, 0]);
     assert_eq!(view.opponent_node_count, vec![2, 0]);
     assert_eq!(view.opponent_node_tokens[0..4], [2, 5, 0, 0]);
     assert_eq!(view.opponent_edge_count, vec![1, 0]);
@@ -146,6 +148,35 @@ fn collate_parse_roundtrips_sections_and_padding() {
     assert_eq!(view.opponent_edge_dst[0..4], [0, 0, 0, 0]);
     assert_eq!(view.opponent_edge_type[0..4], [1, 0, 0, 0]);
     assert_eq!(view.opponent_position[0], [1.0, 0.0, 0.5, 0.25]);
+}
+
+#[test]
+fn collate_roundtrips_transient_opponent_refs() {
+    let schema = schema();
+    let mut collator = FeatureCollator::new(schema, NonZeroUsize::new(2).unwrap());
+    let rows = [row(), row()];
+    let refs = [
+        OpponentBatchRef {
+            trajectory_id: 9,
+            row: 2,
+        },
+        OpponentBatchRef {
+            trajectory_id: 9,
+            row: 3,
+        },
+    ];
+    let mut bytes = Vec::new();
+
+    collator
+        .collate_with_opponent_refs(&rows, &refs, &mut bytes)
+        .unwrap();
+    let view = FeatureBatchView::parse(&bytes).unwrap();
+    assert_eq!(view.opponent_trajectory_id, vec![9, 9]);
+    assert_eq!(view.opponent_row, vec![2, 3]);
+    assert!(matches!(
+        collator.collate_with_opponent_refs(&rows, &refs[..1], &mut bytes),
+        Err(FeatureError::InvalidEncoding(_))
+    ));
 }
 
 #[test]
@@ -296,6 +327,42 @@ fn training_targets_codec_writes_padded_sections() {
         fingerprint(&bytes),
         "bbe4a7663fd71400abf5b8ab6608068be9014cf8ff1af18e4844024d3d39aec1"
     );
+}
+
+#[test]
+fn training_targets_codec_accepts_graded_value() {
+    let targets = [RowTargets {
+        policy: vec![1.0],
+        value: Some(0.25),
+        reward: 0.0,
+    }];
+    let mut bytes = Vec::new();
+
+    encode_training_targets(&targets, 1, 1, &mut bytes).unwrap();
+
+    let view = TrainingTargetsView::parse(&bytes).unwrap();
+    assert_eq!(view.value, vec![0.25]);
+    assert_eq!(view.value_valid, vec![1]);
+}
+
+#[test]
+fn training_targets_codec_rejects_invalid_graded_value() {
+    for value in [f32::NAN, -1.001, 1.001] {
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            encode_training_targets(
+                &[RowTargets {
+                    policy: vec![1.0],
+                    value: Some(value),
+                    reward: 0.0,
+                }],
+                1,
+                1,
+                &mut bytes,
+            ),
+            Err(FeatureError::InvalidEncoding("invalid value target"))
+        ));
+    }
 }
 
 #[test]

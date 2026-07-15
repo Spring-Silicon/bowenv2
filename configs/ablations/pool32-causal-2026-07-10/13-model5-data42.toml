@@ -1,0 +1,25 @@
+extends = "../../bases/gated-pool32-legacy-screen.toml"
+
+# Seed-role cross: seed-5 Torch initialization/dropout with seed-42 replay
+# sampling and value orientation.
+[trainer]
+optimizer = "muon_mixed"
+lr = 0.0002
+adamw_lr = 0.0002
+momentum = 0.95
+nesterov = true
+ns_steps = 5
+lr_schedule = "cosine"
+lr_decay_steps = 800
+min_lr_ratio = 0.1
+seed = 42
+model_seed = 5
+data_seed = 42
+batch = 512
+total_steps = 1500
+
+[wandb]
+run_name = "pool32-causal-model5-data42-1"
+
+[paths]
+run_dir = "runs/pool32-causal-model5-data42-1"

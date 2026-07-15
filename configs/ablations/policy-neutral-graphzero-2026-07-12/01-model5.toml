@@ -1,0 +1,13 @@
+extends = "../../bases/gated-pool32-s42-throughput.toml"
+
+[trainer]
+policy_init = "neutral"
+model_seed = 5
+data_seed = 42
+total_steps = 1000
+
+[wandb]
+run_name = "policy-neutral-gz-s42-model5-1"
+
+[paths]
+run_dir = "runs/policy-neutral-gz-s42-model5-1"

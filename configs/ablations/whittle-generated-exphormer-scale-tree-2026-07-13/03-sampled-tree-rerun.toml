@@ -1,0 +1,17 @@
+extends = "../../bases/whittle-generated-exphormer.toml"
+
+[trainer]
+value_batch = 512
+value_window_rows = 30000
+value_mirror = false
+
+[selfplay]
+policy_opponent_mode = "sampled-tree"
+reference_gamma = 0.0
+length_tiebreak = false
+
+[wandb]
+run_name = "whittle-generated-exphormer-sampled-tree-2"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-sampled-tree-2"

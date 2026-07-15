@@ -1,0 +1,24 @@
+extends = "../../bases/whittle-generated-exphormer-v2-sampled-tree.toml"
+
+[arch]
+value_head = "scalar"
+
+[trainer]
+total_steps = 20000
+resume = false
+init_checkpoint = ""
+init_checkpoint_scope = "all"
+
+[selfplay]
+workers_per_lane = 12
+simulations = 128
+max_considered = 32
+policy_opponent_mode = "greedy-trajectory"
+value_reward = "sign"
+
+[wandb]
+run_name = "whittle-generated-exphormer-v2-greedy-trajectory-c32s128-sign-random-init-20k-1"
+
+[paths]
+run_dir = "runs/gz-greedy-c32s128-rinit-s42-20k-1"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/gz-greedy-c32s128-rinit-s42-20k-1"

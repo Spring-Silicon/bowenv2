@@ -1,0 +1,17 @@
+extends = "bases/gated-pool32-s42-throughput.toml"
+
+[arch]
+value_hidden = 0
+
+[trainer]
+init_checkpoint = "runs/distill-generated-reducing-uniform-100k-1/checkpoint-1280"
+model_seed = 5
+data_seed = 42
+batch = 512
+total_steps = 10000
+
+[wandb]
+run_name = "distilled-gz-b512-s42-10k-1"
+
+[paths]
+run_dir = "runs/distilled-gz-b512-s42-10k-1"

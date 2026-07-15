@@ -1,0 +1,17 @@
+extends = "bases/whittle-generated-exphormer.toml"
+
+[trainer]
+window_rows = 10000
+total_steps = 1000
+
+[selfplay]
+root_mode = "fixed"
+reference_arena_size = 0
+replay_retain = 16000
+seed = 246
+
+[wandb]
+run_name = "distilled-gz-b512-s246-greedy-capacity-paced-1k-3"
+
+[paths]
+run_dir = "runs/distilled-gz-b512-s246-greedy-capacity-paced-1k-3"

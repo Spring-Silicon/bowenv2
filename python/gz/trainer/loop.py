@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from gz.trainer.data import TrainingBatch
+from gz.trainer.optim import build_optimizer
 from gz.trainer.sampler import step_seed
 
 
@@ -12,14 +13,24 @@ class LoopConfig:
     lr: float = 3e-4
     warmup_steps: int = 200
     total_steps: int = 1000
+    lr_decay_steps: int | None = None
     lr_schedule: str = "cosine"
+    min_lr_ratio: float = 0.0
     value_weight: float = 1.0
     grad_clip: float = 1.0
     weight_decay: float = 0.01
+    optimizer: str = "adamw"
+    adamw_lr: float | None = None
+    momentum: float = 0.95
+    nesterov: bool = True
+    ns_steps: int = 5
     run_seed: int = 0
-    # Train both orientations of every pair (targets z and -z) instead of
-    # a random per-step flip: whittlezero's mirrored value stream.
+    # Train both orientations of pair-value data. A separate value batch
+    # samples one orientation per row, matching whittlezero's mirrored replay;
+    # the legacy shared batch evaluates both orientations of every row.
     value_mirror: bool = False
+    compile_model: bool = False
+    compile_mode: str = "default"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,8 +45,6 @@ class StepMetrics:
     fraction_valid: float
     label_mean: float
     learner_win_rate: float
-    terminal_cost_mean: float
-    terminal_cost_best: float
 
 
 class TrainerLoop:
@@ -43,14 +52,40 @@ class TrainerLoop:
         torch = _torch()
         self.model = model
         self.config = config
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        self.optimizer = build_optimizer(
+            model,
+            name=config.optimizer,
+            lr=config.lr,
+            adamw_lr=config.adamw_lr,
+            weight_decay=config.weight_decay,
+            momentum=config.momentum,
+            nesterov=config.nesterov,
+            ns_steps=config.ns_steps,
+        )
+        self._model_forward = model
+        self._policy_logits = model.policy_logits
+        self._value_only = model.value_only
+        if config.compile_model:
+            compile_options = {
+                "fullgraph": True,
+                "dynamic": False,
+                "mode": config.compile_mode,
+            }
+            self._model_forward = torch.compile(model, **compile_options)
+            self._policy_logits = torch.compile(model.policy_logits, **compile_options)
+            self._value_only = torch.compile(model.value_only, **compile_options)
         self.step_index = 0
         # bf16 autocast on CUDA, matching the evaluator's serving numerics.
         # Params and optimizer state stay f32; no GradScaler is needed for
         # bf16 (full f32 exponent range).
         self.device_type = next(model.parameters()).device.type
 
-    def train_step(self, batch: TrainingBatch, with_metrics: bool = True) -> StepMetrics | None:
+    def train_step(
+        self,
+        batch: TrainingBatch,
+        value_batch: TrainingBatch | None = None,
+        with_metrics: bool = True,
+    ) -> StepMetrics | None:
         """One optimizer step. With `with_metrics=False` the step enqueues no
         host-device synchronization at all (no `.item()`/`.cpu()`), so
         back-to-back steps pipeline on the GPU; callers request metrics only
@@ -59,57 +94,146 @@ class TrainerLoop:
         functional = torch.nn.functional
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(
-            device_type=self.device_type,
-            dtype=torch.bfloat16,
-            enabled=self.device_type == "cuda",
-        ):
+        separate_value_batch = self.config.value_weight != 0.0 and value_batch is not None
+        if separate_value_batch:
+            value_batch = _trim_to_row_count(value_batch)
             pair_mode = getattr(getattr(self.model, "arch", None), "value_input", None) == "pair"
-            mirror = self.config.value_mirror and pair_mode
             value_flip = None
-            if pair_mode and not mirror:
-                value_flip = pair_value_flip(torch, batch, self.config.run_seed, self.step_index)
-            value_raw, logits = self.model(
-                batch.features, value_flip=value_flip, value_mirror=mirror
-            )
-            policy_loss = policy_ce_loss(
-                logits, batch.policy, batch.features.action_count, batch.row_count
-            )
-            tanh_head = (
-                getattr(getattr(self.model, "arch", None), "value_activation", "logit") == "tanh"
-            )
-            value_loss_fn = value_mse_loss if tanh_head else value_bce_loss
-            if mirror:
-                # whittlezero's mirrored stream: every pair trains both
-                # orientations (targets z and -z); the swapped example is
-                # masked to rows that actually carry an opponent state.
-                canonical, mirrored = value_raw[0], value_raw[1]
-                value_loss = value_loss_fn(
-                    canonical, batch.value, batch.value_valid, batch.row_count
+            if pair_mode and self.config.value_mirror:
+                value_flip = pair_value_flip(
+                    torch,
+                    value_batch,
+                    self.config.run_seed,
+                    self.step_index,
                 )
-                present = getattr(batch.features, "opponent_state_present", None)
-                if present is not None:
-                    mirrored_valid = batch.value_valid * (present > 0).to(batch.value_valid.dtype)
-                    value_loss = 0.5 * value_loss + 0.5 * value_loss_fn(
-                        mirrored, -batch.value, mirrored_valid, batch.row_count
-                    )
-                value_raw = canonical
-                value = batch.value
-            else:
-                value = flipped_value_targets(torch, batch.value, value_flip)
-                value_loss = value_loss_fn(value_raw, value, batch.value_valid, batch.row_count)
+            with torch.autocast(
+                device_type=self.device_type,
+                dtype=torch.bfloat16,
+                enabled=self.device_type == "cuda",
+            ):
+                logits = self._policy_logits(batch.features)
+                policy_loss = policy_ce_loss(
+                    logits, batch.policy, batch.features.action_count, batch.row_count
+                )
+            policy_loss.backward()
+            policy_loss = policy_loss.detach()
+            del logits
+
+            with torch.autocast(
+                device_type=self.device_type,
+                dtype=torch.bfloat16,
+                enabled=self.device_type == "cuda",
+            ):
+                value_raw = self._value_only(value_batch.features, value_flip=value_flip)
+                value = flipped_value_targets(torch, value_batch.value, value_flip)
+                value_loss = value_head_loss(
+                    self.model,
+                    value_raw,
+                    value,
+                    value_batch.value_valid,
+                    value_batch.row_count,
+                )
+                value_prediction = decode_value_output(self.model, value_raw)
+            (self.config.value_weight * value_loss).backward()
+            value_loss = value_loss.detach()
+            value_prediction = value_prediction.detach()
+            del value_raw
             loss = policy_loss + self.config.value_weight * value_loss
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+        else:
+            with torch.autocast(
+                device_type=self.device_type,
+                dtype=torch.bfloat16,
+                enabled=self.device_type == "cuda",
+            ):
+                if self.config.value_weight == 0.0:
+                    # Policy distillation should not encode the opponent graph or
+                    # execute a value head whose loss is identically zero.
+                    value_batch = batch
+                    logits = self._policy_logits(batch.features)
+                    value_raw = batch.value.new_zeros(batch.value.shape)
+                    value = batch.value
+                    value_prediction = value_raw
+                    policy_loss = policy_ce_loss(
+                        logits,
+                        batch.policy,
+                        batch.features.action_count,
+                        batch.row_count,
+                    )
+                    value_loss = logits.sum() * 0.0
+                else:
+                    pair_mode = (
+                        getattr(getattr(self.model, "arch", None), "value_input", None)
+                        == "pair"
+                    )
+                    value_batch = batch
+                    mirror = self.config.value_mirror and pair_mode
+                    value_flip = None
+                    if pair_mode and not mirror:
+                        value_flip = pair_value_flip(
+                            torch,
+                            value_batch,
+                            self.config.run_seed,
+                            self.step_index,
+                        )
+                    value_raw, logits = self._model_forward(
+                        batch.features, value_flip=value_flip, value_mirror=mirror
+                    )
+                    policy_loss = policy_ce_loss(
+                        logits, batch.policy, batch.features.action_count, batch.row_count
+                    )
+                    if mirror:
+                        # whittlezero's mirrored stream: every pair trains both
+                        # orientations (targets z and -z); the swapped example is
+                        # masked to rows that actually carry an opponent state.
+                        canonical, mirrored = value_raw[0], value_raw[1]
+                        value_loss = value_head_loss(
+                            self.model,
+                            canonical,
+                            value_batch.value,
+                            value_batch.value_valid,
+                            value_batch.row_count,
+                        )
+                        present = getattr(value_batch.features, "opponent_state_present", None)
+                        if present is not None:
+                            mirrored_valid = value_batch.value_valid * (present > 0).to(
+                                value_batch.value_valid.dtype
+                            )
+                            value_loss = 0.5 * value_loss + 0.5 * value_head_loss(
+                                self.model,
+                                mirrored,
+                                -value_batch.value,
+                                mirrored_valid,
+                                value_batch.row_count,
+                            )
+                        value_raw = canonical
+                        value = value_batch.value
+                    else:
+                        value = flipped_value_targets(torch, value_batch.value, value_flip)
+                        value_loss = value_head_loss(
+                            self.model,
+                            value_raw,
+                            value,
+                            value_batch.value_valid,
+                            value_batch.row_count,
+                        )
+                    value_prediction = decode_value_output(self.model, value_raw)
+                loss = policy_loss + self.config.value_weight * value_loss
+            loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            self.config.grad_clip,
+            error_if_nonfinite=True,
+        )
         lr = lr_at_step(
             self.config.lr,
             self.step_index + 1,
             self.config.warmup_steps,
-            self.config.total_steps,
+            self.config.lr_decay_steps or self.config.total_steps,
             self.config.lr_schedule,
+            self.config.min_lr_ratio,
         )
         for group in self.optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * group.get("lr_scale", 1.0)
         self.optimizer.step()
         self.step_index += 1
 
@@ -117,35 +241,27 @@ class TrainerLoop:
             return None
 
         with torch.no_grad():
-            row_mask = _row_mask(torch, batch.row_count, value_raw.shape[0], value_raw.device)
-            valid = row_mask & (batch.value_valid > 0)
+            row_mask = _row_mask(
+                torch,
+                value_batch.row_count,
+                value_prediction.shape[0],
+                value_prediction.device,
+            )
+            valid = row_mask & (value_batch.value_valid > 0)
             valid_count = valid.sum()
             if bool(valid_count.item()):
-                prediction = torch.where(value_raw[valid] >= 0, 1.0, -1.0)
-                # Accuracy against the same flipped targets the loss saw:
-                # value_raw came from flipped pair inputs, so the unflipped
-                # batch.value counts correct flipped predictions as wrong.
-                # label_mean stays unflipped -- it reports the stored data.
+                prediction = torch.where(value_prediction[valid] >= 0, 1.0, -1.0)
                 label = torch.where(value[valid] >= 0, 1.0, -1.0)
                 value_accuracy = (prediction == label).float().mean()
-                label_mean = batch.value[valid].mean()
-                # Fraction of valid rows whose stored label says the
-                # learner beat its reference. Row-weighted like
-                # label_mean; with hard +/-1 labels it is
-                # (label_mean + 1) / 2, but stays meaningful if labels
-                # ever grade.
-                learner_win_rate = (batch.value[valid] > 0).float().mean()
+                label_mean = value[valid].mean()
+                # Fraction of stored learner-perspective labels that beat
+                # the reference. This deliberately ignores orientation flips.
+                learner_win_rate = (value_batch.value[valid] > 0).float().mean()
             else:
-                value_accuracy = value_raw.new_tensor(0.0)
-                label_mean = value_raw.new_tensor(0.0)
-                learner_win_rate = value_raw.new_tensor(0.0)
+                value_accuracy = value_prediction.new_tensor(0.0)
+                label_mean = value_prediction.new_tensor(0.0)
+                learner_win_rate = value_prediction.new_tensor(0.0)
             fraction_valid = valid.float().mean()
-            # Whittle reward is -(measured cost); report the cost directly.
-            # Row-weighted: long episodes contribute more rows to the batch.
-            costs = -batch.reward[row_mask]
-            terminal_cost_mean = costs.mean() if batch.row_count else costs.new_tensor(0.0)
-            terminal_cost_best = costs.min() if batch.row_count else costs.new_tensor(0.0)
-
         return StepMetrics(
             step=self.step_index,
             policy_loss=float(policy_loss.detach().cpu()),
@@ -157,8 +273,6 @@ class TrainerLoop:
             fraction_valid=float(fraction_valid.detach().cpu()),
             label_mean=float(label_mean.detach().cpu()),
             learner_win_rate=float(learner_win_rate.detach().cpu()),
-            terminal_cost_mean=float(terminal_cost_mean.detach().cpu()),
-            terminal_cost_best=float(terminal_cost_best.detach().cpu()),
         )
 
 
@@ -171,8 +285,9 @@ def policy_ce_loss(logits: object, policy: object, action_count: object, row_cou
     log_probs = torch.log_softmax(masked_logits, dim=-1)
     policy_masked = torch.where(action_mask, policy, torch.zeros_like(policy))
     per_row = -(policy_masked * log_probs).sum(dim=1)
-    denom = max(row_count, 1)
-    return (per_row * row_mask.to(per_row.dtype)).sum() / denom
+    valid = row_mask & (policy_masked.sum(dim=1) > 0)
+    weight = valid.to(per_row.dtype)
+    return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
 
 
 def value_bce_loss(value_raw: object, value: object, value_valid: object, row_count: int) -> object:
@@ -206,12 +321,77 @@ def value_mse_loss(value_raw: object, value: object, value_valid: object, row_co
     return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
 
 
+def hl_gauss_target_probs(
+    target: object,
+    bin_edges: object,
+    sigma: float,
+) -> object:
+    torch = _torch()
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("HL-Gauss sigma must be finite and positive")
+    edges = bin_edges.to(device=target.device, dtype=torch.float32)
+    target = target.to(dtype=torch.float32)
+    target = torch.minimum(torch.maximum(target, edges[0]), edges[-1])
+    denominator = math.sqrt(2.0) * sigma
+    cdf = torch.special.erf((edges - target.unsqueeze(-1)) / denominator)
+    normalizer = cdf[..., -1] - cdf[..., 0]
+    probabilities = cdf[..., 1:] - cdf[..., :-1]
+    return probabilities / normalizer.clamp_min(1.0e-12).unsqueeze(-1)
+
+
+def value_hl_gauss_loss(
+    value_logits: object,
+    value: object,
+    value_valid: object,
+    row_count: int,
+    bin_edges: object,
+    sigma: float,
+) -> object:
+    torch = _torch()
+    row_mask = _row_mask(torch, row_count, value_logits.shape[0], value_logits.device)
+    valid = row_mask & (value_valid > 0)
+    target = torch.where(valid, value, torch.zeros_like(value))
+    target_probs = hl_gauss_target_probs(target, bin_edges, sigma)
+    per_row = -(target_probs * torch.log_softmax(value_logits.float(), dim=-1)).sum(dim=-1)
+    weight = valid.to(per_row.dtype)
+    return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
+
+
+def value_head_loss(
+    model: object,
+    value_raw: object,
+    value: object,
+    value_valid: object,
+    row_count: int,
+) -> object:
+    arch = getattr(model, "arch", None)
+    if getattr(arch, "value_head", "scalar") == "hl_gauss":
+        sigma = arch.value_sigma_ratio * (arch.value_max - arch.value_min) / arch.value_bins
+        return value_hl_gauss_loss(
+            value_raw,
+            value,
+            value_valid,
+            row_count,
+            model.value_bin_edges,
+            sigma,
+        )
+    if getattr(arch, "value_activation", "logit") == "tanh":
+        return value_mse_loss(value_raw, value, value_valid, row_count)
+    return value_bce_loss(value_raw, value, value_valid, row_count)
+
+
+def decode_value_output(model: object, value_raw: object) -> object:
+    if getattr(getattr(model, "arch", None), "value_head", "scalar") == "hl_gauss":
+        return model.decode_value(value_raw)
+    return value_raw
+
+
 def pair_value_flip(torch: object, batch: TrainingBatch, run_seed: int, step: int) -> object:
     if getattr(batch.features, "opponent_state_present", None) is None:
         return None
     device = batch.value.device
     generator = torch.Generator(device=device)
-    generator.manual_seed(step_seed(run_seed, step))
+    generator.manual_seed(step_seed(run_seed, step, "value-orientation"))
     row_mask = _row_mask(torch, batch.row_count, batch.value.shape[0], device)
     present = batch.features.opponent_state_present > 0
     return (torch.rand(batch.value.shape, generator=generator, device=device) < 0.5) & row_mask & present
@@ -229,6 +409,7 @@ def lr_at_step(
     warmup_steps: int,
     total_steps: int,
     schedule: str = "cosine",
+    min_lr_ratio: float = 0.0,
 ) -> float:
     if warmup_steps > 0 and step <= warmup_steps:
         return base_lr * step / warmup_steps
@@ -237,11 +418,27 @@ def lr_at_step(
     if total_steps <= warmup_steps:
         return base_lr
     progress = min(1.0, (step - warmup_steps) / (total_steps - warmup_steps))
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
 
 def _row_mask(torch: object, row_count: int, capacity: int, device: object) -> object:
     return torch.arange(capacity, device=device) < row_count
+
+
+def _trim_to_row_count(batch: TrainingBatch) -> TrainingBatch:
+    row_count = batch.row_count
+    if batch.value.shape[0] == row_count:
+        return batch
+    features = type(batch.features)(*(tensor[:row_count] for tensor in batch.features))
+    return TrainingBatch(
+        features=features,
+        policy=batch.policy[:row_count],
+        value=batch.value[:row_count],
+        value_valid=batch.value_valid[:row_count],
+        reward=batch.reward[:row_count],
+        row_count=row_count,
+    )
 
 
 def _torch():

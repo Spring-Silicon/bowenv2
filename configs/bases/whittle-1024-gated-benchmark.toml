@@ -58,6 +58,7 @@ max_candidates = 1023
 reference = "gated-policy"
 root_mode = "fixed"
 reference_ema_decay = 0.0
+reference_gamma = 0.2
 max_row_backlog = 1000000
 replay_retain = 150000
 eval_device = "cuda:0"

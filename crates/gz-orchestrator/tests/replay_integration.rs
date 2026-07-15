@@ -2,12 +2,13 @@ use gz_engine::{CandidateOptions, EngineResult, GraphEngine, ModelVersion};
 use gz_engine_whittle::{WhittleEngine, WhittleEngineConfig, WhittleGraphId};
 use gz_eval::{EvalOutput, EvalRequest, EvalResult, Evaluator};
 use gz_eval::{RandomValueEvaluator, RandomValueEvaluatorConfig};
+use gz_measurer::ValueTargetConfig;
 use gz_orchestrator::reference::{
     GreedyReferenceProvider, PolicyReferenceProvider, ReferenceProvider, RootBaselineProvider,
 };
 use gz_orchestrator::{
-    CountedRoots, ReplayBackpressure, ReplayRuntime, RootSource, ThreadedGumbelOrchestrator,
-    ThreadedOrchestratorConfig,
+    AdmissionSmoothingConfig, CountedRoots, ReplayBackpressure, ReplayRuntime, RootSource,
+    ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig,
 };
 use gz_replay::{ReplayEpisodeRecord, ReplayReferenceKind, ReplayStore, SampleConfig};
 use gz_search::{
@@ -90,6 +91,7 @@ fn config(workers_per_lane: usize) -> ThreadedOrchestratorConfig {
         max_batch: NonZeroUsize::new(8).unwrap(),
         flush_after: Duration::from_millis(20),
         admission_stagger: Duration::ZERO,
+        admission_smoothing: None,
     }
 }
 
@@ -125,6 +127,7 @@ fn root_baseline_replay_appends_every_eligible_episode() {
                 providers,
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();
@@ -165,6 +168,85 @@ fn root_baseline_replay_appends_every_eligible_episode() {
 }
 
 #[test]
+fn graded_replay_uses_the_measured_root_reward_as_its_denominator() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let search = search(&engines[0]);
+    let providers = root_providers(&engines);
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+
+    let run = orchestrator
+        .run_with_replay(
+            vec![roots(1)],
+            GumbelEpisodeContext::default(),
+            ReplayRuntime {
+                store: &store,
+                providers,
+                backpressure: None,
+                length_tiebreak: false,
+                value_target: ValueTargetConfig::graded(0.1),
+            },
+        )
+        .unwrap();
+
+    let record = replay_records(&store, run.episodes_appended)
+        .into_iter()
+        .next()
+        .unwrap();
+    let reference_reward = record.outcome.reference.as_ref().unwrap().reward;
+    let expected = (((record.outcome.learner_reward - reference_reward)
+        / reference_reward.abs().max(1.0))
+        / 0.1)
+        .tanh();
+    let actual = record.outcome.value_target.unwrap();
+
+    assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+    assert!(actual.abs() <= 1.0);
+}
+
+#[test]
+fn adaptive_admission_completes_with_backend_demand() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let search = search(&engines[0]);
+    let providers = root_providers(&engines);
+    let orchestrator = ThreadedGumbelOrchestrator::new(
+        engines,
+        evaluator(),
+        search,
+        ThreadedOrchestratorConfig {
+            workers_per_lane: NonZeroUsize::new(4).unwrap(),
+            max_batch: NonZeroUsize::new(1).unwrap(),
+            flush_after: Duration::ZERO,
+            admission_stagger: Duration::ZERO,
+            admission_smoothing: Some(AdmissionSmoothingConfig {
+                initial_episode_eval_work: NonZeroU64::new(6).unwrap(),
+            }),
+        },
+    );
+
+    let run = orchestrator
+        .run_with_replay(
+            vec![roots(12)],
+            GumbelEpisodeContext::default(),
+            ReplayRuntime {
+                store: &store,
+                providers,
+                backpressure: None,
+                length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(run.lanes[0].episodes_completed, 12);
+    assert_eq!(run.episodes_appended, 12);
+    assert!(store.episode_latency_ema().is_some());
+}
+
+#[test]
 fn replay_store_contents_are_deterministic_for_identical_runs() {
     let left = run_root_replay(1, 1, 4);
     let right = run_root_replay(1, 1, 4);
@@ -198,6 +280,7 @@ fn greedy_reference_labels_are_valid_and_present() {
                 providers,
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();
@@ -258,6 +341,7 @@ fn backpressure_gate_allows_consumer_to_drain_and_complete() {
                         gate_poll: Duration::from_millis(1),
                     }),
                     length_tiebreak: false,
+                    value_target: ValueTargetConfig::Sign,
                 },
             )
             .unwrap();
@@ -296,6 +380,7 @@ fn run_root_replay(
                 providers,
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();
@@ -389,6 +474,7 @@ fn policy_reference_refreshes_per_model_version_and_skips_replay() {
                 providers: vec![PolicyReferenceProvider::new()],
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();
@@ -478,6 +564,7 @@ fn self_average_reference_labels_after_the_first_episode() {
                 providers,
                 backpressure: None,
                 length_tiebreak: false,
+                value_target: ValueTargetConfig::Sign,
             },
         )
         .unwrap();

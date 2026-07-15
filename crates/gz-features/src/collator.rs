@@ -10,6 +10,12 @@ const OUTPUT_MAGIC: &[u8; 4] = b"GZFO";
 const BATCH_HEADER_LEN: usize = 68;
 const OUTPUT_HEADER_LEN: usize = 16;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OpponentBatchRef {
+    pub trajectory_id: u64,
+    pub row: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct FeatureCollator {
     schema: FeatureSchema,
@@ -36,6 +42,29 @@ impl FeatureCollator {
     }
 
     pub fn collate_into(&mut self, rows: &[FeatureRow], out: &mut Vec<u8>) -> FeatureResult<()> {
+        self.collate(rows, None, out)
+    }
+
+    pub fn collate_with_opponent_refs(
+        &mut self,
+        rows: &[FeatureRow],
+        opponent_refs: &[OpponentBatchRef],
+        out: &mut Vec<u8>,
+    ) -> FeatureResult<()> {
+        if opponent_refs.len() != rows.len() {
+            return Err(FeatureError::InvalidEncoding(
+                "opponent batch ref length mismatch",
+            ));
+        }
+        self.collate(rows, Some(opponent_refs), out)
+    }
+
+    fn collate(
+        &mut self,
+        rows: &[FeatureRow],
+        opponent_refs: Option<&[OpponentBatchRef]>,
+        out: &mut Vec<u8>,
+    ) -> FeatureResult<()> {
         if rows.is_empty() {
             return Err(FeatureError::EmptyBatch);
         }
@@ -134,6 +163,14 @@ impl FeatureCollator {
                 row.position.opponent_reward,
             );
             out[layout.opponent_present + row_index] = u8::from(row.position.opponent_present);
+            if let Some(opponent_ref) = opponent_refs.and_then(|refs| refs.get(row_index)) {
+                write_u64_at(
+                    out,
+                    layout.opponent_trajectory_id + row_index * 8,
+                    opponent_ref.trajectory_id,
+                );
+                write_u32_at(out, layout.opponent_row + row_index * 4, opponent_ref.row);
+            }
             if let Some(opponent) = &row.opponent {
                 out[layout.opponent_state_present + row_index] = 1;
                 write_u32_at(
@@ -347,6 +384,8 @@ pub struct FeatureBatchView {
     pub opponent_reward: Vec<f32>,
     pub opponent_present: Vec<u8>,
     pub opponent_state_present: Vec<u8>,
+    pub opponent_trajectory_id: Vec<u64>,
+    pub opponent_row: Vec<u32>,
     pub opponent_node_count: Vec<u32>,
     pub opponent_node_tokens: Vec<u16>,
     pub opponent_node_attrs: Vec<f32>,
@@ -406,6 +445,8 @@ impl FeatureBatchView {
             opponent_state_present: bytes
                 [layout.opponent_state_present..layout.opponent_state_present + layout.b]
                 .to_vec(),
+            opponent_trajectory_id: read_u64_vec(bytes, layout.opponent_trajectory_id, layout.b)?,
+            opponent_row: read_u32_vec(bytes, layout.opponent_row, layout.b)?,
             opponent_node_count: read_u32_vec(bytes, layout.opponent_node_count, layout.b)?,
             opponent_node_tokens: read_u16_vec(
                 bytes,
@@ -504,6 +545,8 @@ struct BatchLayout {
     opponent_reward: usize,
     opponent_present: usize,
     opponent_state_present: usize,
+    opponent_trajectory_id: usize,
+    opponent_row: usize,
     opponent_node_count: usize,
     opponent_node_tokens: usize,
     opponent_node_attrs: usize,
@@ -546,6 +589,8 @@ impl BatchLayout {
         let opponent_reward = section(&mut cursor, b * 2);
         let opponent_present = section(&mut cursor, b);
         let opponent_state_present = section(&mut cursor, b);
+        let opponent_trajectory_id = section(&mut cursor, b * 8);
+        let opponent_row = section(&mut cursor, b * 4);
         let opponent_node_count = section(&mut cursor, b * 4);
         let opponent_node_tokens = section(&mut cursor, b * n * 2);
         let opponent_node_attrs = section(&mut cursor, b * n * d * 2);
@@ -579,6 +624,8 @@ impl BatchLayout {
             opponent_reward,
             opponent_present,
             opponent_state_present,
+            opponent_trajectory_id,
+            opponent_row,
             opponent_node_count,
             opponent_node_tokens,
             opponent_node_attrs,
@@ -630,6 +677,10 @@ fn write_u32_at(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_u64_at(out: &mut [u8], offset: usize, value: u64) {
+    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn write_bf16_at(out: &mut [u8], offset: usize, value: f32) {
     out[offset..offset + 2].copy_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
 }
@@ -652,6 +703,15 @@ fn read_u32_at(bytes: &[u8], offset: usize) -> FeatureResult<u32> {
         .get(offset..offset + 4)
         .ok_or(FeatureError::InvalidEncoding("u32 truncated"))?;
     Ok(u32::from_le_bytes(
+        slice.try_into().expect("length checked"),
+    ))
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize) -> FeatureResult<u64> {
+    let slice = bytes
+        .get(offset..offset + 8)
+        .ok_or(FeatureError::InvalidEncoding("u64 truncated"))?;
+    Ok(u64::from_le_bytes(
         slice.try_into().expect("length checked"),
     ))
 }
@@ -683,6 +743,14 @@ fn read_u32_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
         out.push(read_u32_at(bytes, offset + index * 4)?);
+    }
+    Ok(out)
+}
+
+fn read_u64_vec(bytes: &[u8], offset: usize, count: usize) -> FeatureResult<Vec<u64>> {
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        out.push(read_u64_at(bytes, offset + index * 8)?);
     }
     Ok(out)
 }

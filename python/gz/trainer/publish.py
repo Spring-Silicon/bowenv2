@@ -40,6 +40,13 @@ class EmaWeights:
     def state_dict(self) -> dict[str, object]:
         return {name: tensor.detach().clone() for name, tensor in self.shadow.items()}
 
+    def assert_finite(self) -> None:
+        import torch
+
+        for name, tensor in self.shadow.items():
+            if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+                raise RuntimeError(f"refusing to publish non-finite EMA tensor: {name}")
+
     def norms(self, previous: dict[str, object] | None) -> tuple[float, float]:
         """(L2 norm of the EMA weights, L2 norm of the delta vs `previous`).
         The update norm is 0.0 when there is no previous snapshot."""
@@ -83,6 +90,7 @@ def publish_ema(
     run_id: str,
     tags: PublishTags | None = None,
 ) -> CheckpointManifest:
+    ema.assert_finite()
     tags = tags or PublishTags.zeros()
     return publish_checkpoint(
         checkpoint_dir,
