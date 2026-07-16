@@ -1,8 +1,8 @@
 mod categorical;
 mod sampled_tree;
 mod schedule;
+mod strategy;
 mod task;
-mod tree;
 mod types;
 
 pub use categorical::CategoricalPolicyEpisodeTask;
@@ -15,15 +15,14 @@ pub use types::{
     GumbelSearchContext, GumbelStep, GumbelStopReason,
 };
 
-use crate::gumbel::schedule::budget_fraction;
 use crate::gumbel_search_config_hash;
-use crate::support::{candidate_info, internal};
-use crate::work::{
-    EngineIdentity, ExpandResult, ExpandWork, ExpandedCandidate, SearchPoll, SearchWork,
-    SearchWorkResult,
-};
+use crate::mcts::driver::{run_episode, run_root};
+use crate::mcts::math::budget_fraction;
+use crate::mcts::task::{MctsEpisodeTask, MctsRootTask};
+use crate::mcts::types::{MctsEpisodeContext, MctsRootResult};
+use crate::work::EngineIdentity;
 use gz_engine::{EngineResult, GraphEngine, SearchConfigHash};
-use gz_eval::{EngineEvalRequest, EngineEvaluator};
+use gz_eval::EngineEvaluator;
 use std::num::NonZeroUsize;
 
 pub struct GumbelMcts {
@@ -196,41 +195,18 @@ impl GumbelMcts {
         E: GraphEngine,
         V: EngineEvaluator<E>,
     {
-        let identity = EngineIdentity::from_engine(engine);
-        let mut task = GumbelEpisodeTask::new(self, identity, root, context);
-
-        loop {
-            let poll = match task.poll() {
-                Ok(poll) => poll,
-                Err(error) => {
-                    release_task_all(engine, &mut task)?;
-                    return Err(error);
-                }
-            };
-            match poll {
-                SearchPoll::Work(work) => {
-                    release_task_releasable(engine, &mut task)?;
-                    let token = work.token();
-                    let result = match service_search_work(engine, evaluator, work) {
-                        Ok(result) => result,
-                        Err(error) => {
-                            release_task_all(engine, &mut task)?;
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = task.resume(token, result) {
-                        release_task_all(engine, &mut task)?;
-                        return Err(error);
-                    }
-                    release_task_releasable(engine, &mut task)?;
-                }
-                SearchPoll::Blocked => {
-                    release_task_all(engine, &mut task)?;
-                    return Err(internal("serial driver blocked"));
-                }
-                SearchPoll::Done(result) => return Ok(result),
-            }
-        }
+        let task = MctsEpisodeTask::new(
+            task::common_config(self),
+            strategy::GumbelStrategy::new(self.config),
+            self.search_config_hash,
+            EngineIdentity::from_engine(engine),
+            root,
+            MctsEpisodeContext {
+                opponent: context.opponent,
+                noise_seed: context.noise_seed,
+            },
+        );
+        run_episode(engine, evaluator, task).map(task::gumbel_episode)
     }
 
     pub fn search_root<E, V>(
@@ -244,113 +220,14 @@ impl GumbelMcts {
         E: GraphEngine,
         V: EngineEvaluator<E>,
     {
-        let identity = EngineIdentity::from_engine(engine);
-        let mut task = GumbelRootTask::new(self, identity, root, context);
-
-        loop {
-            match task.poll()? {
-                SearchPoll::Work(work) => {
-                    let token = work.token();
-                    let result = service_search_work(engine, evaluator, work)?;
-                    task.resume(token, result)?;
-                }
-                SearchPoll::Blocked => return Err(internal("serial driver blocked")),
-                SearchPoll::Done(result) => return Ok(result),
-            }
-        }
+        let task = MctsRootTask::new(
+            task::common_config(self),
+            strategy::GumbelStrategy::new(self.config),
+            EngineIdentity::from_engine(engine),
+            root,
+            task::common_context(context),
+        );
+        run_root(engine, evaluator, task)
+            .map(|result: MctsRootResult<_, _>| task::gumbel_result(result))
     }
-}
-
-fn release_task_releasable<E>(
-    engine: &mut E,
-    task: &mut GumbelEpisodeTask<E::Graph, E::Candidate>,
-) -> EngineResult<()>
-where
-    E: GraphEngine,
-{
-    release_handles(engine, task.take_releasable())
-}
-
-fn release_task_all<E>(
-    engine: &mut E,
-    task: &mut GumbelEpisodeTask<E::Graph, E::Candidate>,
-) -> EngineResult<()>
-where
-    E: GraphEngine,
-{
-    release_handles(engine, task.take_all_handles())
-}
-
-fn release_handles<E>(
-    engine: &mut E,
-    handles: GumbelHandleBatch<E::Graph, E::Candidate>,
-) -> EngineResult<()>
-where
-    E: GraphEngine,
-{
-    if handles.is_empty() {
-        return Ok(());
-    }
-    engine.release(&handles.graphs, &handles.candidates)
-}
-
-fn service_search_work<E, V>(
-    engine: &mut E,
-    evaluator: &mut V,
-    work: SearchWork<E::Graph, E::Candidate>,
-) -> EngineResult<SearchWorkResult<E::Graph, E::Candidate>>
-where
-    E: GraphEngine,
-    V: EngineEvaluator<E>,
-{
-    match work {
-        SearchWork::Expand(work) => service_expand_work(engine, work).map(SearchWorkResult::Expand),
-        SearchWork::Apply(work) => engine
-            .apply(work.graph, work.candidate)
-            .map(SearchWorkResult::Apply),
-        SearchWork::Measure(work) => engine
-            .measure(work.graph, work.options)
-            .map(SearchWorkResult::Measure),
-        SearchWork::Eval(work) => {
-            let output = evaluator.evaluate(
-                engine,
-                EngineEvalRequest {
-                    graph: work.graph,
-                    candidates: &work.candidates,
-                    request: &work.request,
-                    measure_options: work.measure_options,
-                },
-            )?;
-            Ok(SearchWorkResult::Eval(output))
-        }
-    }
-}
-
-pub(crate) fn service_expand_work<E>(
-    engine: &mut E,
-    work: ExpandWork<E::Graph>,
-) -> EngineResult<ExpandResult<E::Candidate>>
-where
-    E: GraphEngine,
-{
-    let mut candidates = Vec::new();
-    engine.candidates(work.graph, work.options, &mut candidates)?;
-    let graph_hash = engine.hash(work.graph)?;
-    let candidates = candidates
-        .into_iter()
-        .map(|candidate| {
-            candidate_info(engine, work.graph, candidate).map(|info| ExpandedCandidate {
-                candidate,
-                candidate_hash: info.candidate_hash,
-                kind: info.kind,
-                tags: info.tags,
-                static_prior: info.static_prior,
-            })
-        })
-        .collect::<EngineResult<Vec<_>>>()?;
-
-    Ok(ExpandResult {
-        graph_hash,
-        candidates,
-    })
 }

@@ -7,6 +7,8 @@ mod episode;
 mod greedy;
 mod gumbel;
 mod hash;
+mod mcts;
+mod puct;
 mod random;
 mod scratch;
 mod support;
@@ -26,8 +28,14 @@ pub use gumbel::{
 };
 pub use hash::{
     beam_search_config_hash, categorical_policy_config_hash, greedy_search_config_hash,
-    gumbel_search_config_hash, random_search_config_hash, reducing_uniform_distill_config_hash,
-    sampled_tree_search_config_hash,
+    gumbel_search_config_hash, puct_search_config_hash, random_search_config_hash,
+    reducing_uniform_distill_config_hash, sampled_tree_search_config_hash,
+};
+pub use mcts::{MctsHandleBatch, MctsOpponentContext};
+pub use puct::{
+    PuctEpisode, PuctEpisodeContext, PuctEpisodeTask, PuctHandleBatch, PuctMcts, PuctMctsConfig,
+    PuctOpponentContext, PuctRootResult, PuctRootStats, PuctRootTask, PuctSearchContext, PuctStep,
+    PuctStopReason,
 };
 pub use random::{RandomEpisode, RandomSearch, RandomSearchConfig, RandomStopReason};
 pub use work::{

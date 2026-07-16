@@ -3,8 +3,10 @@ use gz_engine::{
     CandidateOptions, MeasureOptions, MeasureResult, ModelVersion, PortableSearchActionRef,
     ReplayGraphContext, SearchConfigHash, SearchStepRef,
 };
-use gz_eval::EvalOpponentContext;
 use std::num::NonZeroUsize;
+
+pub type GumbelHandleBatch<G, C> = crate::mcts::types::MctsHandleBatch<G, C>;
+pub type GumbelOpponentContext = crate::mcts::types::MctsOpponentContext;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GumbelMctsConfig {
@@ -86,27 +88,6 @@ impl Default for GumbelSearchContext {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GumbelOpponentContext {
-    pub trajectory_id: u64,
-    pub row_count: u32,
-    pub final_reward: f32,
-}
-
-impl GumbelOpponentContext {
-    /// The eval-side opponent context aligned to a time point: the
-    /// trajectory row at `min(step, row_count - 1)`.
-    #[must_use]
-    pub fn aligned_to(self, step: u64) -> EvalOpponentContext {
-        EvalOpponentContext {
-            trajectory_id: self.trajectory_id,
-            row_count: self.row_count,
-            final_reward: self.final_reward,
-            row: step.min(u64::from(self.row_count.saturating_sub(1))) as u32,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct GumbelRootResult<G, C> {
     pub root: G,
@@ -181,28 +162,6 @@ pub struct GumbelCompetitiveTrace<G, C> {
     pub opponent_steps: Vec<GumbelStep<G, C>>,
     pub opponent_final_measure: MeasureResult<G>,
     pub opponent_stop_reason: GumbelStopReason,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GumbelHandleBatch<G, C> {
-    pub graphs: Vec<G>,
-    pub candidates: Vec<C>,
-}
-
-impl<G, C> Default for GumbelHandleBatch<G, C> {
-    fn default() -> Self {
-        Self {
-            graphs: Vec::new(),
-            candidates: Vec::new(),
-        }
-    }
-}
-
-impl<G, C> GumbelHandleBatch<G, C> {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.graphs.is_empty() && self.candidates.is_empty()
-    }
 }
 
 impl<G: PartialEq, C: PartialEq> PartialEq for GumbelEpisode<G, C> {

@@ -26,6 +26,9 @@ pub(crate) struct TestEngine {
     measures: BTreeMap<u8, MeasureCase>,
     priors: BTreeMap<u8, f32>,
     pub(crate) apply_calls: Vec<(u8, u8)>,
+    pub(crate) measure_calls: Vec<u8>,
+    pub(crate) released_graphs: Vec<u8>,
+    pub(crate) released_candidates: Vec<u8>,
 }
 
 impl TestEngine {
@@ -36,6 +39,9 @@ impl TestEngine {
             measures: BTreeMap::new(),
             priors: BTreeMap::new(),
             apply_calls: Vec::new(),
+            measure_calls: Vec::new(),
+            released_graphs: Vec::new(),
+            released_candidates: Vec::new(),
         }
     }
 
@@ -206,6 +212,7 @@ impl GraphEngine for TestEngine {
         graph: Self::Graph,
         options: MeasureOptions,
     ) -> EngineResult<MeasureResult<Self::Graph>> {
+        self.measure_calls.push(graph);
         let case = self.measures.get(&graph).copied().unwrap_or(MeasureCase {
             measured: true,
             valid: true,
@@ -223,6 +230,16 @@ impl GraphEngine for TestEngine {
             failure: None,
             metadata: MeasureMetadata::default(),
         })
+    }
+
+    fn release(
+        &mut self,
+        graphs: &[Self::Graph],
+        candidates: &[Self::Candidate],
+    ) -> EngineResult<()> {
+        self.released_graphs.extend_from_slice(graphs);
+        self.released_candidates.extend_from_slice(candidates);
+        Ok(())
     }
 
     fn export_graph(&self, graph: Self::Graph) -> EngineResult<GraphArtifact> {

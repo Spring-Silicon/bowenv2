@@ -1,53 +1,52 @@
-use super::super::schedule::GumbelRng;
-use super::super::tree::Edge;
+use super::super::tree::MctsEdge;
 use crate::SearchCandidateSummary;
 use crate::work::{SearchWork, WorkToken};
 use gz_engine::{CandidateHash, ReplayGraphContext};
 use gz_eval::{EvalAction, EvalRequest};
 use std::collections::HashSet;
 
-pub(super) enum RootTaskState<G, C> {
+pub(super) enum RootTaskState<G, C, R> {
     EmitNodeExpand {
         graph: G,
         expected_context: Option<ReplayGraphContext>,
         depth: usize,
-        run: Option<RunState<G, C>>,
+        run: Option<RunState<R>>,
     },
     EmitNodeEval {
         expansion: NodeExpansion<G, C>,
-        run: Option<RunState<G, C>>,
+        run: Option<RunState<R>>,
     },
-    Running(RunState<G, C>),
+    Running(RunState<R>),
     Done,
 }
 
-pub(super) enum PendingRootWork<G, C> {
+pub(super) enum PendingRootWork<G, C, R> {
     ExpandNode {
         token: WorkToken,
         graph: G,
         expected_context: Option<ReplayGraphContext>,
         depth: usize,
-        run: Option<RunState<G, C>>,
+        run: Option<RunState<R>>,
     },
     EvalNode {
         token: WorkToken,
         expansion: NodeExpansion<G, C>,
-        run: Option<RunState<G, C>>,
+        run: Option<RunState<R>>,
         request: EvalRequest,
     },
     Apply {
         token: WorkToken,
-        run: RunState<G, C>,
+        run: RunState<R>,
         action: usize,
     },
     StopEval {
         token: WorkToken,
-        run: RunState<G, C>,
+        run: RunState<R>,
         request: EvalRequest,
     },
 }
 
-impl<G, C> PendingRootWork<G, C> {
+impl<G, C, R> PendingRootWork<G, C, R> {
     pub(super) const fn token(&self) -> WorkToken {
         match self {
             Self::ExpandNode { token, .. }
@@ -68,22 +67,15 @@ pub(super) struct NodeExpansion<G, C> {
     pub(super) summaries: Vec<Option<SearchCandidateSummary>>,
 }
 
-pub(super) struct RunState<G, C> {
-    pub(super) base_scores: Vec<f32>,
-    pub(super) considered: Vec<usize>,
-    pub(super) baseline_visits: Vec<u32>,
-    pub(super) schedule: Vec<u32>,
-    pub(super) schedule_index: usize,
+pub(super) struct RunState<R> {
+    pub(super) strategy: R,
     pub(super) simulations: usize,
-    pub(super) rng: GumbelRng,
     pub(super) descent: Option<DescentState>,
-    pub(super) _marker: std::marker::PhantomData<(G, C)>,
 }
 
-impl<G, C> RunState<G, C> {
+impl<R> RunState<R> {
     pub(super) fn complete_simulation(&mut self) {
         self.simulations += 1;
-        self.schedule_index += 1;
         self.descent = None;
     }
 }
@@ -91,13 +83,13 @@ impl<G, C> RunState<G, C> {
 pub(super) struct DescentState {
     pub(super) node_index: usize,
     pub(super) depth: usize,
-    pub(super) path: Vec<Edge>,
+    pub(super) path: Vec<MctsEdge>,
     pub(super) seen: HashSet<ReplayGraphContext>,
     pub(super) forced: Option<usize>,
 }
 
 #[allow(clippy::large_enum_variant)]
-pub(super) enum DescentPoll<G, C> {
-    Continue(RunState<G, C>),
-    Work(SearchWork<G, C>, PendingRootWork<G, C>),
+pub(super) enum DescentPoll<G, C, R> {
+    Continue(RunState<R>),
+    Work(SearchWork<G, C>, PendingRootWork<G, C, R>),
 }

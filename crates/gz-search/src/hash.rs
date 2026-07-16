@@ -140,6 +140,34 @@ pub fn gumbel_search_config_hash(
     SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn puct_search_config_hash(
+    max_steps: usize,
+    simulations: usize,
+    c_puct: f32,
+    seed: u64,
+    temperature_moves: usize,
+    tree_reuse: bool,
+    mask_stop: bool,
+    no_backtrack: bool,
+    candidate_options: CandidateOptions,
+    measure_options: MeasureOptions,
+) -> SearchConfigHash {
+    let mut hasher = blake3::Hasher::new();
+    update_chunk(&mut hasher, b"gz-search-puct-mcts-v1");
+    update_u64(&mut hasher, max_steps as u64);
+    update_u64(&mut hasher, simulations as u64);
+    update_u32(&mut hasher, c_puct.to_bits());
+    update_u64(&mut hasher, seed);
+    update_u64(&mut hasher, temperature_moves as u64);
+    update_bool(&mut hasher, tree_reuse);
+    update_bool(&mut hasher, mask_stop);
+    update_bool(&mut hasher, no_backtrack);
+    update_candidate_options(&mut hasher, candidate_options);
+    update_measure_options(&mut hasher, measure_options);
+    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
+}
+
 fn update_candidate_options(hasher: &mut blake3::Hasher, options: CandidateOptions) {
     update_option_usize(hasher, options.max_candidates);
     update_bool(hasher, options.deterministic_order);
