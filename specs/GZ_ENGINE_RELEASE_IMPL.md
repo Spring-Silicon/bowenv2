@@ -1,6 +1,8 @@
 # Engine Arena Release Implementation Spec
 
-Status: implementation work order
+Status: historical implementation record. Current ownership rules are in
+`GZ_ENGINE.md`; commands and measurements below describe the retired fixed-root
+pipeline and are not current CLI instructions.
 
 Purpose: stop the selfplay memory leak that froze the box. The Whittle
 engine retains every applied graph body, every enumerated candidate
@@ -24,7 +26,7 @@ crates/gz-engine-whittle/src/engine.rs
   GraphArena / CandidateArena    Vec arenas, no reuse -- become slabs
   Caches { candidates, transitions }  keyed by GraphHash; entries must
                                  die with their graphs
-crates/gz-search/src/gumbel.rs   GumbelEpisodeTask sees every created
+crates/gz-search/src/{gumbel,mcts}/ Gumbel tasks see every created
                                  handle (ApplyResult.after, ExpandResult
                                  candidates); episode result carries them
 crates/gz-orchestrator/src/lanes.rs  lanes own engines; release after

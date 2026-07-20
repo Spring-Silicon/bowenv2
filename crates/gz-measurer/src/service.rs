@@ -1,45 +1,17 @@
-use crate::ValueTargetConfig;
-use crate::{
-    CompletedEpisodeArtifact, MeasurerError, ProjectedReference, ProjectionMode, episode_reward,
-    project_episode_with_value_target,
-};
+use crate::{CompletedEpisodeArtifact, MeasurerError, episode_reward, project_episode};
 use gz_engine::{GraphHash, ModelVersion, PortableSearchActionRef};
 use gz_replay::{ReplayError, ReplayStore};
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct MeasuredEpisode {
-    pub lane: usize,
-    pub episode_id: u64,
-    pub artifact: CompletedEpisodeArtifact,
-    pub root_reward: f32,
-    pub reference: Option<ProjectedReference>,
-    pub mode: ProjectionMode,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MeasuredCompetitiveGame {
-    pub lane: usize,
-    pub game_id: u64,
-    pub learner_is_p1: bool,
-    pub root_reward: f32,
-    pub p1_artifact: CompletedEpisodeArtifact,
-    pub p1_reference: ProjectedReference,
-    pub p2_artifact: CompletedEpisodeArtifact,
-    pub p2_reference: ProjectedReference,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct MeasuredSymmetricGame {
     pub lane: usize,
-    pub game_id: u64,
     pub p1_artifact: CompletedEpisodeArtifact,
     pub p2_artifact: CompletedEpisodeArtifact,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeasurerAdmission {
-    pub learner_reward: Option<f32>,
     pub status: MeasurerAdmissionStatus,
 }
 
@@ -85,7 +57,6 @@ pub struct MeasurerStats {
 pub struct ReplayMeasurer<'a> {
     store: &'a ReplayStore,
     length_tiebreak: bool,
-    value_target: ValueTargetConfig,
     summary: MeasurerRunSummary,
     ledger: MeasureLedger,
 }
@@ -93,129 +64,12 @@ pub struct ReplayMeasurer<'a> {
 impl<'a> ReplayMeasurer<'a> {
     #[must_use]
     pub fn new(store: &'a ReplayStore, length_tiebreak: bool) -> Self {
-        Self::with_value_target(store, length_tiebreak, ValueTargetConfig::Sign)
-    }
-
-    #[must_use]
-    pub fn with_value_target(
-        store: &'a ReplayStore,
-        length_tiebreak: bool,
-        value_target: ValueTargetConfig,
-    ) -> Self {
         Self {
             store,
             length_tiebreak,
-            value_target,
             summary: MeasurerRunSummary::default(),
             ledger: MeasureLedger::default(),
         }
-    }
-
-    pub fn admit(&mut self, episode: MeasuredEpisode) -> Result<MeasurerAdmission, ReplayError> {
-        let learner_reward = episode_reward(&episode.artifact);
-        if learner_reward.is_some() {
-            self.ledger.observe(&episode.artifact);
-        }
-
-        let (status, replay_rows) = match project_episode_with_value_target(
-            &episode.artifact,
-            episode.reference.as_ref(),
-            self.length_tiebreak,
-            episode.episode_id,
-            episode.mode,
-            episode.root_reward,
-            self.value_target,
-        ) {
-            Ok((record, rows)) => {
-                let row_count = rows.len() as u64;
-                self.store.append_episode(&record, &rows)?;
-                (MeasurerAdmissionStatus::Appended { row_count }, row_count)
-            }
-            Err(reason) => (MeasurerAdmissionStatus::Dropped { reason }, 0),
-        };
-
-        match status {
-            MeasurerAdmissionStatus::Appended { row_count } => {
-                self.summary.episodes_appended += 1;
-                self.summary.replay_rows += row_count;
-                let lane = lane_summary(&mut self.summary.lanes, episode.lane);
-                lane.episodes_appended += 1;
-                lane.replay_rows += replay_rows;
-            }
-            MeasurerAdmissionStatus::Dropped { .. } => {
-                self.summary.episodes_dropped += 1;
-                lane_summary(&mut self.summary.lanes, episode.lane).episodes_dropped += 1;
-            }
-        }
-
-        Ok(MeasurerAdmission {
-            learner_reward,
-            status,
-        })
-    }
-
-    pub fn admit_competitive(
-        &mut self,
-        game: MeasuredCompetitiveGame,
-    ) -> Result<MeasurerAdmission, ReplayError> {
-        let p1_reward = episode_reward(&game.p1_artifact);
-        let p2_reward = episode_reward(&game.p2_artifact);
-        let learner_reward = if game.learner_is_p1 {
-            p1_reward
-        } else {
-            p2_reward
-        };
-        if p1_reward.is_some() {
-            self.ledger.observe(&game.p1_artifact);
-        }
-        if p2_reward.is_some() {
-            self.ledger.observe(&game.p2_artifact);
-        }
-
-        let projected = project_competitive_game(&game, self.length_tiebreak, self.value_target);
-        let (status, replay_rows) = match projected {
-            Ok((p1, p2, p1_target)) => {
-                let value_sign_accuracy = learner_value_sign_accuracies(&game, p1_target);
-                let (learner, opponent) = if game.learner_is_p1 {
-                    (&p1, &p2)
-                } else {
-                    (&p2, &p1)
-                };
-                let row_count = if self.store.data_mode()?.is_sampled_tree() {
-                    self.store.append_episode(&learner.0, &learner.1)?;
-                    learner.1.len() as u64
-                } else {
-                    self.store.append_episode_pair(
-                        (&learner.0, &learner.1),
-                        (&opponent.0, &opponent.1),
-                    )?;
-                    (learner.1.len() + opponent.1.len()) as u64
-                };
-                self.store
-                    .observe_value_sign_accuracy(value_sign_accuracy.0, value_sign_accuracy.1);
-                (MeasurerAdmissionStatus::Appended { row_count }, row_count)
-            }
-            Err(reason) => (MeasurerAdmissionStatus::Dropped { reason }, 0),
-        };
-
-        match status {
-            MeasurerAdmissionStatus::Appended { row_count } => {
-                self.summary.episodes_appended += 1;
-                self.summary.replay_rows += row_count;
-                let lane = lane_summary(&mut self.summary.lanes, game.lane);
-                lane.episodes_appended += 1;
-                lane.replay_rows += replay_rows;
-            }
-            MeasurerAdmissionStatus::Dropped { .. } => {
-                self.summary.episodes_dropped += 1;
-                lane_summary(&mut self.summary.lanes, game.lane).episodes_dropped += 1;
-            }
-        }
-
-        Ok(MeasurerAdmission {
-            learner_reward,
-            status,
-        })
     }
 
     pub fn admit_symmetric(
@@ -229,7 +83,7 @@ impl<'a> ReplayMeasurer<'a> {
             self.ledger.observe(&game.p2_artifact);
         }
 
-        let projected = project_symmetric_game(&game, self.length_tiebreak, self.value_target);
+        let projected = project_symmetric_game(&game, self.length_tiebreak);
         let (status, replay_rows) = match projected {
             Ok((p1, p2, p1_target)) => {
                 let value_sign_accuracy = symmetric_value_sign_accuracies(&game, p1_target);
@@ -257,15 +111,9 @@ impl<'a> ReplayMeasurer<'a> {
             }
         }
 
-        Ok(MeasurerAdmission {
-            learner_reward: None,
-            status,
-        })
+        Ok(MeasurerAdmission { status })
     }
 
-    /// Cumulative admission and ledger counters for periodic
-    /// heartbeats; cheap, borrow-only (finish() still owns the full
-    /// per-version snapshot).
     #[must_use]
     pub fn stats(&self) -> MeasurerStats {
         MeasurerStats {
@@ -284,68 +132,14 @@ impl<'a> ReplayMeasurer<'a> {
 }
 
 type ProjectedEpisode = (gz_replay::ReplayEpisodeRecord, Vec<gz_replay::ReplayRow>);
-type ProjectedCompetitiveGame = (ProjectedEpisode, ProjectedEpisode, f32);
+type ProjectedSymmetricGame = (ProjectedEpisode, ProjectedEpisode, f32);
 
 const VALUE_SIGN_LATE_STEP: usize = 40;
-
-fn project_competitive_game(
-    game: &MeasuredCompetitiveGame,
-    length_tiebreak: bool,
-    value_target_config: ValueTargetConfig,
-) -> Result<ProjectedCompetitiveGame, MeasurerError> {
-    if value_target_config == ValueTargetConfig::SingleVanilla {
-        return Err(MeasurerError::InvalidValueTargetConfig);
-    }
-    let p1_reward = episode_reward(&game.p1_artifact).ok_or(MeasurerError::Unmeasured)?;
-    let p2_reward = episode_reward(&game.p2_artifact).ok_or(MeasurerError::Unmeasured)?;
-    let p1_target = if matches!(value_target_config, ValueTargetConfig::Sign)
-        && p1_reward == p2_reward
-        && !length_tiebreak
-    {
-        1.0
-    } else {
-        crate::outcome_target(
-            value_target_config,
-            p1_reward,
-            p2_reward,
-            game.root_reward,
-            game.p1_artifact.steps.len(),
-            Some(game.p2_artifact.steps.len()),
-            length_tiebreak,
-            game.game_id,
-        )
-    };
-    let mut p1 = project_episode_with_value_target(
-        &game.p1_artifact,
-        Some(&game.p1_reference),
-        false,
-        game.game_id,
-        ProjectionMode::RequireReference,
-        game.root_reward,
-        value_target_config,
-    )?;
-    let mut p2 = project_episode_with_value_target(
-        &game.p2_artifact,
-        Some(&game.p2_reference),
-        false,
-        game.game_id,
-        ProjectionMode::RequireReference,
-        game.root_reward,
-        value_target_config,
-    )?;
-    set_value_target(&mut p1, p1_target);
-    set_value_target(&mut p2, -p1_target);
-    Ok((p1, p2, p1_target))
-}
 
 fn project_symmetric_game(
     game: &MeasuredSymmetricGame,
     length_tiebreak: bool,
-    value_target_config: ValueTargetConfig,
-) -> Result<ProjectedCompetitiveGame, MeasurerError> {
-    if value_target_config != ValueTargetConfig::Sign {
-        return Err(MeasurerError::InvalidValueTargetConfig);
-    }
+) -> Result<ProjectedSymmetricGame, MeasurerError> {
     let p1_reward = episode_reward(&game.p1_artifact).ok_or(MeasurerError::Unmeasured)?;
     let p2_reward = episode_reward(&game.p2_artifact).ok_or(MeasurerError::Unmeasured)?;
     let p1_target = symmetric_outcome_target(
@@ -355,24 +149,8 @@ fn project_symmetric_game(
         symmetric_rewrite_count(&game.p2_artifact),
         length_tiebreak,
     );
-    let mut p1 = project_episode_with_value_target(
-        &game.p1_artifact,
-        None,
-        false,
-        game.game_id,
-        ProjectionMode::AllowUnlabeled,
-        0.0,
-        ValueTargetConfig::Sign,
-    )?;
-    let mut p2 = project_episode_with_value_target(
-        &game.p2_artifact,
-        None,
-        false,
-        game.game_id,
-        ProjectionMode::AllowUnlabeled,
-        0.0,
-        ValueTargetConfig::Sign,
-    )?;
+    let mut p1 = project_episode(&game.p1_artifact)?;
+    let mut p2 = project_episode(&game.p2_artifact)?;
     set_value_target(&mut p1, p1_target);
     set_value_target(&mut p2, -p1_target);
     set_horizon_value_targets(&mut p1, &game.p1_artifact, p1_target)?;
@@ -406,33 +184,6 @@ fn symmetric_outcome_target(
     } else {
         0.0
     }
-}
-
-fn learner_value_sign_accuracies(
-    game: &MeasuredCompetitiveGame,
-    p1_target: f32,
-) -> (Option<f64>, Option<f64>) {
-    let (learner, target) = if game.learner_is_p1 {
-        (&game.p1_artifact, p1_target)
-    } else {
-        (&game.p2_artifact, -p1_target)
-    };
-    let mut correct = [0_u64; 2];
-    let mut total = [0_u64; 2];
-    for (step, prediction) in learner
-        .steps
-        .iter()
-        .enumerate()
-        .filter_map(|(step, artifact)| artifact.root_value.map(|value| (step, value)))
-        .filter(|(_, value)| value.is_finite())
-    {
-        let phase = usize::from(step >= VALUE_SIGN_LATE_STEP);
-        total[phase] += 1;
-        correct[phase] += u64::from((prediction >= 0.0) == (target >= 0.0));
-    }
-    let accuracy =
-        |phase: usize| (total[phase] != 0).then(|| correct[phase] as f64 / total[phase] as f64);
-    (accuracy(0), accuracy(1))
 }
 
 fn symmetric_value_sign_accuracies(

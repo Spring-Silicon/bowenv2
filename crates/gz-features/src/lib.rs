@@ -15,8 +15,7 @@ pub use codec::{
     validate_feature_row_header,
 };
 pub use collator::{
-    FeatureBatchView, FeatureCollator, OpponentBatchRef, RowOutput, decode_outputs,
-    validate_batch_action_counts,
+    FeatureBatchView, FeatureCollator, RowOutput, decode_outputs, validate_batch_action_counts,
 };
 pub use error::{FeatureError, FeatureResult};
 pub use row::{ActionFeature, FeatureEdge, FeatureRow, OpponentStateFeatures, PositionFeatures};

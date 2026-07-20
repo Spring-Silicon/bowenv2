@@ -7,7 +7,7 @@ use gz_orchestrator::{
     SelfplayBenchConfig, SelfplayEpisodeStats, SerialGumbelOrchestrator, WorkerId,
     run_serial_selfplay_benchmark,
 };
-use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
+use gz_search::{GumbelMcts, GumbelMctsConfig};
 use std::num::NonZeroUsize;
 
 fn main() -> gz_engine::EngineResult<()> {
@@ -31,7 +31,7 @@ fn main() -> gz_engine::EngineResult<()> {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: gz_search::GumbelValueMode::Competitive,
+        value_mode: gz_search::GumbelValueMode::SingleAgent,
         candidate_options: CandidateOptions::default(),
         measure_options: engine.measure_options(),
     });
@@ -42,7 +42,7 @@ fn main() -> gz_engine::EngineResult<()> {
         search,
     );
     let report = run_serial_selfplay_benchmark(SelfplayBenchConfig::new(config.episodes), || {
-        let episode = orchestrator.run(generated.graph, GumbelEpisodeContext::default())?;
+        let episode = orchestrator.run(generated.graph)?;
         Ok(SelfplayEpisodeStats::new(episode.episode.steps.len() as u64))
     })?;
 

@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: graphzero
-Version: 0.1.0
-Requires-Python: >=3.12
-Requires-Dist: numpy>=1.26
-Provides-Extra: torch
-Requires-Dist: torch>=2.9; extra == "torch"
-Requires-Dist: safetensors; extra == "torch"

@@ -210,7 +210,7 @@ c_actor = -final_measure.scalar_reward
 The Whittle adapter defines `scalar_reward = -(compact node count)`, so this is
 the actual measured ending size, not a proxy and not the P1-P2 margin. P1 rows
 target P1's final graph size; P2 rows target P2's final graph size. Unlike the
-competitive value target, the score target is positive and is not negated when
+outcome value target, the score target is positive and is not negated when
 the player perspective changes.
 
 The semantic prediction is in node-count units. Optimize it on a bounded scale:
@@ -327,14 +327,13 @@ tasks.
 Initial scope requires:
 
 ```text
-training_mode = "symmetric-selfplay"
-value_head = "scalar"
-value_activation = "tanh"
-value_reward = "sign"
+generated-root symmetric selfplay
+the fixed tanh scalar outcome head
+auxiliary_heads = "v8-v32-score"
 ```
 
-HL-Gauss, logit/BCE, single-vanilla, opponent-reference modes, and non-Whittle
-score transforms are not part of the first experiment.
+Alternate value losses and non-Whittle score transforms are not part of the
+first experiment.
 
 ## Loss Contract
 
@@ -566,7 +565,7 @@ trunk interference: auxiliary gradients can hurt policy or the main value
 head even when their own losses fall
 
 score-task dominance: terminal size is denser and may be easier than the
-competitive target, causing the trunk to over-specialize to absolute size;
+outcome target, causing the trunk to over-specialize to absolute size;
 the normalized loss budget and per-head gradient metrics guard this risk
 
 engine-specific scale: Whittle node count has a natural finite support, but a

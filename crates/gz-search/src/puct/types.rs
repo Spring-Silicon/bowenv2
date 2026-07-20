@@ -4,7 +4,6 @@ use std::num::NonZeroUsize;
 pub type PuctHandleBatch<G, C> = crate::mcts::types::MctsHandleBatch<G, C>;
 pub type PuctEpisode<G, C> = crate::mcts::types::MctsEpisode<G, C>;
 pub type PuctEpisodeContext = crate::mcts::types::MctsEpisodeContext;
-pub type PuctOpponentContext = crate::mcts::types::MctsOpponentContext;
 pub type PuctRootResult<G, C> = crate::mcts::types::MctsRootResult<G, C>;
 pub type PuctRootStats = crate::mcts::types::MctsRootStats;
 pub type PuctStep<G, C> = crate::mcts::types::MctsStep<G, C>;

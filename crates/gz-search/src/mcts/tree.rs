@@ -6,7 +6,6 @@ use gz_engine::{
     CandidateHash, EngineResult, ModelVersion, PortableCandidateRef, PortableSearchActionRef,
     ReplayGraphContext,
 };
-use gz_eval::EvalAction;
 
 pub(crate) struct MctsTree<G, C> {
     pub(crate) config: MctsConfig,
@@ -139,7 +138,6 @@ pub(crate) struct MctsNode<G, C> {
     pub(crate) graph: G,
     pub(crate) context: ReplayGraphContext,
     pub(crate) candidates: Vec<C>,
-    pub(crate) eval_actions: Vec<EvalAction>,
     pub(crate) candidate_hashes: Vec<CandidateHash>,
     pub(crate) summaries: Vec<Option<SearchCandidateSummary>>,
     pub(crate) logits: Vec<f32>,
@@ -163,7 +161,6 @@ where
         graph: G,
         context: ReplayGraphContext,
         candidates: Vec<C>,
-        eval_actions: Vec<EvalAction>,
         candidate_hashes: Vec<CandidateHash>,
         summaries: Vec<Option<SearchCandidateSummary>>,
         output: gz_eval::EvalOutput,
@@ -180,7 +177,6 @@ where
             graph,
             context,
             candidates,
-            eval_actions,
             candidate_hashes,
             summaries,
             logits: output.policy_logits,

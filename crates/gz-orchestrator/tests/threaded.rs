@@ -8,7 +8,7 @@ use gz_orchestrator::{
     AdmissionSmoothingConfig, CountedRoots, LaneEpisodes, OrchestratedEpisode,
     SerialGumbelOrchestrator, ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig, WorkerId,
 };
-use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
+use gz_search::{GumbelMcts, GumbelMctsConfig};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,7 +29,7 @@ fn search(engine: &WhittleEngine, tree_reuse: bool) -> GumbelMcts {
         tree_reuse,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: gz_search::GumbelValueMode::Competitive,
+        value_mode: gz_search::GumbelValueMode::SingleAgent,
         candidate_options: gz_engine::CandidateOptions::default(),
         export_position: true,
         measure_options: engine.measure_options(),
@@ -103,9 +103,7 @@ fn run_threaded(
         .map(repeated_roots)
         .collect::<Vec<_>>();
 
-    orchestrator
-        .run(roots, GumbelEpisodeContext::default())
-        .unwrap()
+    orchestrator.run(roots).unwrap()
 }
 
 fn run_serial(
@@ -118,11 +116,7 @@ fn run_serial(
         SerialGumbelOrchestrator::new(WorkerId::new(0), engine, evaluator(), search);
 
     (0..roots)
-        .map(|_| {
-            orchestrator
-                .run_from_root(GumbelEpisodeContext::default())
-                .unwrap()
-        })
+        .map(|_| orchestrator.run_from_root().unwrap())
         .collect()
 }
 
@@ -187,9 +181,7 @@ fn slow_evaluator_batches_active_workers() {
             admission_smoothing: None,
         },
     );
-    let run = orchestrator
-        .run(vec![repeated_roots(16)], GumbelEpisodeContext::default())
-        .unwrap();
+    let run = orchestrator.run(vec![repeated_roots(16)]).unwrap();
     let evals = run.batch_sizes.iter().sum::<usize>();
     let average = evals as f64 / run.batch_sizes.len() as f64;
 
@@ -220,9 +212,7 @@ fn adaptive_admission_bootstraps_without_filling_worker_pool() {
         },
     );
 
-    let run = orchestrator
-        .run(vec![repeated_roots(16)], GumbelEpisodeContext::default())
-        .unwrap();
+    let run = orchestrator.run(vec![repeated_roots(16)]).unwrap();
 
     assert_eq!(run.lanes[0].episodes.len(), 16);
     assert_eq!(run.batch_sizes[0], 1);
@@ -246,13 +236,10 @@ fn admission_stagger_paces_replacement_admissions() {
     );
     let admissions = Arc::new(Mutex::new(Vec::new()));
     let run = orchestrator
-        .run(
-            vec![RecordingRoots {
-                remaining: 4,
-                admissions: Arc::clone(&admissions),
-            }],
-            GumbelEpisodeContext::default(),
-        )
+        .run(vec![RecordingRoots {
+            remaining: 4,
+            admissions: Arc::clone(&admissions),
+        }])
         .unwrap();
 
     assert_eq!(run.lanes[0].episodes.len(), 4);
@@ -274,9 +261,7 @@ fn eval_failure_returns_without_hanging() {
     let orchestrator =
         ThreadedGumbelOrchestrator::new(engines, FailingEvaluator, search, config(2, 4));
 
-    let error = orchestrator
-        .run(vec![repeated_roots(2)], GumbelEpisodeContext::default())
-        .unwrap_err();
+    let error = orchestrator.run(vec![repeated_roots(2)]).unwrap_err();
 
     assert!(error.to_string().contains("eval failed"));
 }
@@ -287,9 +272,7 @@ fn lane_count_mismatch_is_rejected() {
     let search = search(&engines[0], false);
     let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(2, 4));
 
-    let error = orchestrator
-        .run(vec![repeated_roots(1)], GumbelEpisodeContext::default())
-        .unwrap_err();
+    let error = orchestrator.run(vec![repeated_roots(1)]).unwrap_err();
 
     assert!(error.to_string().contains("lane count mismatch"));
 }

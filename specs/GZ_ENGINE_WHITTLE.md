@@ -629,9 +629,9 @@ metadata = compact binary fields:
 ```
 
 Reason: GraphZero should maximize scalar reward, and lower Whittle cost is
-better. Higher-level PTP/sign/graded targets can still be computed later from
-measured costs or trajectory comparisons; the engine-level measurement remains
-simple and deterministic.
+better. Higher-level training targets are derived outside the engine from
+measured costs or game outcomes; engine-level measurement remains simple and
+deterministic.
 
 `MeasureOptions`:
 

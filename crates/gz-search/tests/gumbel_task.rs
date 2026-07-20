@@ -6,9 +6,8 @@ use gz_engine::{CandidateOptions, GraphEngine, ModelVersion};
 use gz_eval::EvalOutput;
 use gz_search::{
     EngineIdentity, EvalWork, ExpandResult, ExpandedCandidate, GumbelEpisodeContext,
-    GumbelEpisodeTask, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext, GumbelRootTask,
-    GumbelSearchContext, GumbelValueMode, PolicyRollout, PolicyRolloutConfig, PolicyRolloutContext,
-    PolicyRolloutEpisodeTask, SearchAction, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
+    GumbelEpisodeTask, GumbelMcts, GumbelMctsConfig, GumbelRootTask, GumbelSearchContext,
+    GumbelValueMode, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
 };
 use std::num::NonZeroUsize;
 
@@ -27,7 +26,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: GumbelValueMode::Competitive,
+        value_mode: GumbelValueMode::SingleAgent,
         candidate_options: CandidateOptions::default(),
         measure_options: measure_options(),
     }
@@ -121,80 +120,6 @@ fn root_task_first_emits_expand_then_eval() {
     assert_eq!(eval.graph, 0);
     assert_eq!(eval.candidates, vec![1, 2]);
     assert_eq!(eval.request.action_count(), 3);
-}
-
-#[test]
-fn policy_rollout_task_ranks_once_and_skips_rejected_actions() {
-    let mut engine = TestEngine::new()
-        .candidates(0, [1, 2])
-        .rejected(0, 1)
-        .apply(0, 2, 2)
-        .reward(2, 7.0);
-    let mut rollout_config = config(1);
-    rollout_config.no_backtrack = true;
-    let search = PolicyRollout::new(PolicyRolloutConfig {
-        max_steps: rollout_config.max_steps,
-        seed: rollout_config.seed,
-        export_position: rollout_config.export_position,
-        mask_stop: rollout_config.mask_stop,
-        no_backtrack: rollout_config.no_backtrack,
-        candidate_options: rollout_config.candidate_options,
-        measure_options: rollout_config.measure_options,
-    });
-    let mut task = PolicyRolloutEpisodeTask::new(
-        &search,
-        EngineIdentity::from_engine(&engine),
-        0,
-        PolicyRolloutContext { noise_seed: 19 },
-    );
-
-    let expand = match task.poll().unwrap() {
-        SearchPoll::Work(SearchWork::Expand(work)) => work,
-        other => panic!("expected expand, got {other:?}"),
-    };
-    task.resume(
-        expand.token,
-        SearchWorkResult::Expand(expand_result(&mut engine, expand.graph, expand.options)),
-    )
-    .unwrap();
-    let eval = match task.poll().unwrap() {
-        SearchPoll::Work(SearchWork::Eval(work)) => work,
-        other => panic!("expected eval, got {other:?}"),
-    };
-    task.resume(
-        eval.token,
-        SearchWorkResult::Eval(output_with_logits(vec![100.0, 0.0, -100.0], 0.25)),
-    )
-    .unwrap();
-
-    for expected_candidate in [1, 2] {
-        let apply = match task.poll().unwrap() {
-            SearchPoll::Work(SearchWork::Apply(work)) => work,
-            other => panic!("expected apply, got {other:?}"),
-        };
-        assert_eq!(apply.candidate, expected_candidate);
-        let result = GraphEngine::apply(&mut engine, apply.graph, apply.candidate).unwrap();
-        task.resume(apply.token, SearchWorkResult::Apply(result))
-            .unwrap();
-    }
-    assert_eq!(task.take_releasable().graphs, vec![0]);
-
-    let measure = match task.poll().unwrap() {
-        SearchPoll::Work(SearchWork::Measure(work)) => work,
-        other => panic!("expected measure, got {other:?}"),
-    };
-    let result = engine.measure(measure.graph, measure.options).unwrap();
-    task.resume(measure.token, SearchWorkResult::Measure(result))
-        .unwrap();
-    let episode = match task.poll().unwrap() {
-        SearchPoll::Done(episode) => episode,
-        other => panic!("expected done, got {other:?}"),
-    };
-
-    assert_eq!(engine.apply_calls, vec![(0, 1), (0, 2)]);
-    assert_eq!(episode.steps.len(), 1);
-    assert_eq!(episode.steps[0].action, SearchAction::Candidate(2));
-    assert_eq!(episode.final_measure.scalar_reward, Some(7.0));
 }
 
 #[test]
@@ -358,38 +283,6 @@ fn root_task_poll_after_done_is_rejected() {
 
     let error = task.poll().unwrap_err();
     assert!(error.to_string().contains("poll after done"));
-}
-
-#[test]
-fn opponent_stop_alignment_emits_second_eval() {
-    let mut engine = TestEngine::new().candidates(0, []);
-    let search = GumbelMcts::new(config(1));
-    let mut task = GumbelRootTask::new(
-        &search,
-        EngineIdentity::from_engine(&engine),
-        0,
-        GumbelSearchContext {
-            root_step: 1,
-            opponent: Some(GumbelOpponentContext {
-                trajectory_id: 9,
-                row_count: 4,
-                final_reward: -2.0,
-            }),
-            ..GumbelSearchContext::default()
-        },
-    );
-    let (token, graph, options) = first_expand(&mut task);
-    let eval = first_eval(&mut task, &mut engine, token, graph, options);
-    task.resume(eval.token, SearchWorkResult::Eval(output(1, 0.0)))
-        .unwrap();
-
-    let stop_eval = match task.poll().unwrap() {
-        SearchPoll::Work(SearchWork::Eval(work)) => work,
-        other => panic!("expected stop eval, got {other:?}"),
-    };
-
-    assert_eq!(stop_eval.request.position.leaf_depth, 2);
-    assert_eq!(stop_eval.request.position.opponent_row(), Some(3));
 }
 
 #[test]

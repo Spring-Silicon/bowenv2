@@ -269,7 +269,6 @@ where
                     0.0
                 },
                 noise_seed: self.context.noise_seed,
-                opponent: self.context.opponent,
                 export_position: self.config.export_position,
             },
         );

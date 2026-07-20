@@ -1,5 +1,5 @@
 use super::super::strategy::GumbelStrategy;
-use super::super::{GumbelMcts, GumbelRootResult, GumbelSearchContext, GumbelValueMode};
+use super::super::{GumbelMcts, GumbelRootResult, GumbelSearchContext};
 use crate::mcts::task::MctsRootTask;
 use crate::mcts::types::{MctsConfig, MctsRootResult, MctsSearchContext};
 use crate::work::{EngineIdentity, SearchPoll, SearchWorkResult, WorkToken};
@@ -59,7 +59,7 @@ pub(crate) fn common_config(search: &GumbelMcts) -> MctsConfig {
         export_position: search.config.export_position,
         mask_stop: search.config.mask_stop,
         no_backtrack: search.config.no_backtrack,
-        predicted_horizon: search.config.value_mode == GumbelValueMode::SingleVanilla,
+        predicted_horizon: false,
         candidate_options: search.config.candidate_options,
         measure_options: search.config.measure_options,
     }
@@ -71,7 +71,6 @@ pub(crate) fn common_context(context: GumbelSearchContext) -> MctsSearchContext 
         budget_fraction: context.budget_fraction,
         budget_step: context.budget_step,
         selection_temperature: context.selection_temperature,
-        opponent: context.opponent,
         noise_seed: context.noise_seed,
         export_position: context.export_position,
     }

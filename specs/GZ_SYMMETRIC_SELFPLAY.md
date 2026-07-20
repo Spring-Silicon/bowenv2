@@ -2,10 +2,10 @@
 
 ## Scope
 
-`training_mode = "symmetric-selfplay"` is a two-player AlphaZero-style mode for
-Whittle rewrites. It uses adversarial MCTS, one shared policy/value model, and
-no reference policy, arena, or opponent trunk. Replay V1 preserves
-the original STOP-disabled mode; V2 enables learned per-player STOP actions.
+The production selfplay path is a two-player AlphaZero-style game over Whittle
+rewrites. It uses adversarial MCTS and one shared joint-board policy/value model,
+with no reference policy or arena. Replay V1 preserves the original
+STOP-disabled mode; V2 enables learned per-player STOP actions.
 
 ## Game State
 
@@ -91,7 +91,7 @@ player graph needed by the joint-board trunk.
 
 The replay store is stamped `symmetric-selfplay-v1` when STOP is masked and
 `symmetric-selfplay-v2` when STOP is enabled. The modes cannot be mixed with
-each other or with standard, sampled-tree, graded, or single-vanilla rows.
+each other or with standard rows.
 
 ## Metrics
 
@@ -126,12 +126,11 @@ analysis must use the `symmetric/` metrics instead.
 
 The mode requires:
 
-- `arch.state_input = "joint-board"` and `arch.value_input = "single"`;
-- `reference = "none"` with all reference and arena controls disabled;
+- the fixed `gz-graph-v2` joint-board Exphormer architecture;
+- generated Whittle roots for production training;
 - `length_tiebreak = true`; `tree_reuse` may be enabled or disabled;
 - either `mask_stop = true` for V1 or `mask_stop = false` with
   `position_features = true` for V2;
-- `value_reward = "sign"` and `trainer.value_mirror = false`;
 - a featurized evaluator and a new topology-compatible checkpoint.
 
 The initial implementation is available in

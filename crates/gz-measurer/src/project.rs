@@ -1,7 +1,5 @@
 use gz_engine::{MeasureSummary, ModelVersion, PortableSearchActionRef, SearchConfigHash};
-use gz_replay::{
-    ReplayEpisodeRecord, ReplayOutcome, ReplayReference, ReplayReferenceKind, ReplayRow,
-};
+use gz_replay::{ReplayEpisodeRecord, ReplayOutcome, ReplayRow};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompletedEpisodeArtifact {
@@ -26,146 +24,23 @@ pub struct CompletedEpisodeStep {
     pub model_version: Option<ModelVersion>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProjectedReference {
-    pub kind: ReplayReferenceKind,
-    pub final_reward: f32,
-    pub final_graph: Option<gz_engine::ReplayGraphContext>,
-    pub ref_id: Option<u64>,
-    pub search_config_hash: Option<SearchConfigHash>,
-    pub model_version: Option<ModelVersion>,
-    pub step_count: usize,
-}
-
-impl From<&crate::ReferenceSnapshot> for ProjectedReference {
-    fn from(snapshot: &crate::ReferenceSnapshot) -> Self {
-        Self {
-            kind: snapshot.kind,
-            final_reward: snapshot.final_reward,
-            final_graph: snapshot.final_graph,
-            ref_id: Some(snapshot.ref_id),
-            search_config_hash: Some(snapshot.search_config_hash),
-            model_version: Some(snapshot.version),
-            step_count: snapshot.steps.len(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProjectionMode {
-    AllowUnlabeled,
-    RequireReference,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MeasurerError {
     Unmeasured,
-    MissingReference,
-    UnexpectedReference,
     FeatureRowCountMismatch,
     StepCountOverflow,
-    InvalidValueTargetConfig,
     InvalidRootSearchValue,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum ValueTargetConfig {
-    #[default]
-    Sign,
-    SingleVanilla,
-    Graded {
-        reward_scale: f32,
-    },
-}
-
-impl ValueTargetConfig {
-    #[must_use]
-    pub const fn graded(reward_scale: f32) -> Self {
-        Self::Graded { reward_scale }
-    }
-
-    #[must_use]
-    pub fn is_valid(self) -> bool {
-        match self {
-            Self::Sign | Self::SingleVanilla => true,
-            Self::Graded { reward_scale } => reward_scale.is_finite() && reward_scale > 0.0,
-        }
-    }
 }
 
 pub fn project_episode(
     artifact: &CompletedEpisodeArtifact,
-    reference: Option<&ProjectedReference>,
-    length_tiebreak: bool,
-    episode_id: u64,
-    mode: ProjectionMode,
 ) -> Result<(ReplayEpisodeRecord, Vec<ReplayRow>), MeasurerError> {
-    project_episode_with_value_target(
-        artifact,
-        reference,
-        length_tiebreak,
-        episode_id,
-        mode,
-        0.0,
-        ValueTargetConfig::Sign,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn project_episode_with_value_target(
-    artifact: &CompletedEpisodeArtifact,
-    reference: Option<&ProjectedReference>,
-    length_tiebreak: bool,
-    episode_id: u64,
-    mode: ProjectionMode,
-    root_reward: f32,
-    value_target_config: ValueTargetConfig,
-) -> Result<(ReplayEpisodeRecord, Vec<ReplayRow>), MeasurerError> {
-    if !value_target_config.is_valid()
-        || matches!(value_target_config, ValueTargetConfig::Graded { .. })
-            && !root_reward.is_finite()
-    {
-        return Err(MeasurerError::InvalidValueTargetConfig);
-    }
-    let learner_reward = episode_reward(artifact).ok_or(MeasurerError::Unmeasured)?;
-    if matches!(mode, ProjectionMode::RequireReference) && reference.is_none() {
-        return Err(MeasurerError::MissingReference);
-    }
+    let reward = episode_reward(artifact).ok_or(MeasurerError::Unmeasured)?;
     if let Some(feature_rows) = &artifact.feature_rows
         && feature_rows.len() != artifact.steps.len()
     {
         return Err(MeasurerError::FeatureRowCountMismatch);
     }
-
-    let value_target = if value_target_config == ValueTargetConfig::SingleVanilla {
-        if reference.is_some() {
-            return Err(MeasurerError::UnexpectedReference);
-        }
-        Some(learner_reward)
-    } else {
-        reference.map(|reference| {
-            let reference_len =
-                (length_tiebreak && reference.step_count > 0).then(|| reference.step_count - 1);
-            outcome_target(
-                value_target_config,
-                learner_reward,
-                reference.final_reward,
-                root_reward,
-                artifact.steps.len(),
-                reference_len,
-                length_tiebreak,
-                episode_id,
-            )
-        })
-    };
-    let replay_reference = reference.map(|reference| ReplayReference {
-        kind: reference.kind,
-        reward: reference.final_reward,
-        final_graph: reference.final_graph,
-        trajectory_id: reference.ref_id,
-        search_config_hash: reference.search_config_hash,
-        model_version: reference.model_version,
-    });
 
     let mut action_history = Vec::<PortableSearchActionRef>::new();
     let mut search_steps = Vec::with_capacity(artifact.steps.len());
@@ -183,9 +58,9 @@ pub fn project_episode_with_value_target(
             legal_actions: step.legal_actions.clone(),
             policy_target: step.policy_target.clone(),
             selected_action: step.selected_action,
-            value_target,
+            value_target: None,
             horizon_value_targets: None,
-            reward_target: Some(learner_reward),
+            reward_target: Some(reward),
             final_measure: artifact.final_measure.clone(),
             model_version: step.model_version,
             search_config_hash: artifact.search_config_hash,
@@ -202,12 +77,7 @@ pub fn project_episode_with_value_target(
         final_graph: artifact.final_graph,
         steps: search_steps,
         final_measure: artifact.final_measure.clone(),
-        outcome: ReplayOutcome {
-            value_target,
-            learner_reward,
-            reference: replay_reference,
-            stopped: artifact.stop_selected,
-        },
+        outcome: ReplayOutcome::new(None, reward, artifact.stop_selected),
         search_config_hash: artifact.search_config_hash,
         row_count: rows.len() as u32,
     };
@@ -249,90 +119,4 @@ pub fn horizon_value_targets(
         *target = next;
     }
     Ok(targets)
-}
-
-pub fn sign_target(
-    learner: f32,
-    reference: f32,
-    learner_len: usize,
-    reference_len: Option<usize>,
-    episode_id: u64,
-) -> f32 {
-    if learner > reference {
-        return 1.0;
-    }
-    if learner < reference {
-        return -1.0;
-    }
-    if let Some(reference_len) = reference_len {
-        if learner_len < reference_len {
-            return 1.0;
-        }
-        if learner_len > reference_len {
-            return -1.0;
-        }
-    }
-
-    const TIE_SALT: u64 = 0x7469_655f_6272_6561; // "tie_brea"
-    if episode_noise_seed(episode_id ^ TIE_SALT) & 1 == 0 {
-        1.0
-    } else {
-        -1.0
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[must_use]
-pub fn outcome_target(
-    config: ValueTargetConfig,
-    learner: f32,
-    reference: f32,
-    root_reward: f32,
-    learner_len: usize,
-    reference_len: Option<usize>,
-    length_tiebreak: bool,
-    episode_id: u64,
-) -> f32 {
-    match config {
-        ValueTargetConfig::Sign => {
-            sign_target(learner, reference, learner_len, reference_len, episode_id)
-        }
-        ValueTargetConfig::SingleVanilla => learner,
-        ValueTargetConfig::Graded { reward_scale } => {
-            let denominator = root_reward.abs().max(1.0);
-            let mut margin = (learner - reference) / denominator;
-            if learner == reference
-                && length_tiebreak
-                && let Some(reference_len) = reference_len
-            {
-                margin += (reference_len as f32 - learner_len as f32) / denominator;
-            }
-            (margin / reward_scale).tanh()
-        }
-    }
-}
-
-// splitmix64 finalizer, bit-identical to gz-orchestrator's
-// root::episode_noise_seed: stored tie coins must not change across
-// the projection move (crates cannot share it -- dependency direction).
-fn episode_noise_seed(episode_id: u64) -> u64 {
-    let mut value = episode_id.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-#[cfg(test)]
-mod coin_tests {
-    use super::sign_target;
-
-    /// Frozen against the original implementation (splitmix64 with
-    /// wrapping_add, salted "tie_brea"): stored labels from before the
-    /// projection moved crates must reproduce byte-identically.
-    #[test]
-    fn tie_coin_values_are_frozen() {
-        assert_eq!(sign_target(0.0, 0.0, 1, None, 7), -1.0);
-        assert_eq!(sign_target(0.0, 0.0, 1, None, 42), -1.0);
-        assert_eq!(sign_target(0.0, 0.0, 1, None, 1000), 1.0);
-    }
 }

@@ -9,9 +9,7 @@ use gz_features::{
     ActionFeature, FeatureEdge, FeatureRow, FeatureSchema, FeatureSchemaConfig, PositionFeatures,
     encode_feature_row,
 };
-use gz_replay::{
-    ReplayEpisodeRecord, ReplayOutcome, ReplayReference, ReplayReferenceKind, ReplayRow,
-};
+use gz_replay::{ReplayEpisodeRecord, ReplayOutcome, ReplayRow};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -105,7 +103,7 @@ pub fn episode_with_rows(row_count: usize) -> (ReplayEpisodeRecord, Vec<ReplayRo
             legal_actions: vec![action, stop_action(before)],
             policy_target: vec![1.0, 0.0],
             selected_action: action,
-            value_target: Some(1.0),
+            value_target: None,
             horizon_value_targets: None,
             reward_target: Some(5.0),
             final_measure: final_measure.clone(),
@@ -121,19 +119,7 @@ pub fn episode_with_rows(row_count: usize) -> (ReplayEpisodeRecord, Vec<ReplayRo
         final_graph,
         steps,
         final_measure,
-        outcome: ReplayOutcome {
-            value_target: Some(1.0),
-            learner_reward: 5.0,
-            stopped: false,
-            reference: Some(ReplayReference {
-                kind: ReplayReferenceKind::RootBaseline,
-                reward: 4.0,
-                final_graph: None,
-                trajectory_id: None,
-                search_config_hash: None,
-                model_version: None,
-            }),
-        },
+        outcome: ReplayOutcome::new(None, 5.0, false),
         search_config_hash: search_hash(),
         row_count: row_count as u32,
     };

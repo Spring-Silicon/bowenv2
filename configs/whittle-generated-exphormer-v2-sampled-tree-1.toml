@@ -1,8 +1,0 @@
-extends = "bases/whittle-generated-exphormer-v2-sampled-tree.toml"
-
-[wandb]
-run_name = "whittle-generated-exphormer-v2-sampled-tree-1"
-
-[paths]
-run_dir = "runs/whittle-generated-exphormer-v2-sampled-tree-1"
-replay_dir = "/opt/dlami/nvme/graphzero-replay/whittle-generated-exphormer-v2-sampled-tree-1"

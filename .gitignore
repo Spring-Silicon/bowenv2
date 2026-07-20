@@ -1,5 +1,11 @@
 /target/
 __pycache__/
 *.py[cod]
+*.egg-info/
+*.launch.log
+*.queue.log
+/.codex/
+/package.json
+/package-lock.json
 /runs/
 /wandb/

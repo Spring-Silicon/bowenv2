@@ -1,0 +1,27 @@
+extends = "bases/whittle-generated-exphormer-v2-symmetric-selfplay.toml"
+
+[trainer]
+total_steps = 20000
+value_batch = 512
+value_window_rows = 300000
+value_trunk_grad_scale = 0.1
+model_seed = 5
+data_seed = 42
+
+[selfplay]
+lanes = 44
+workers_per_lane = 4
+max_steps = 96
+mask_stop = false
+length_tiebreak = true
+wave_batching = true
+tree_reuse = true
+replay_retain = 320000
+
+[wandb]
+run_name = "whittle-generated-exphormer-v2-symmetric-selfplay"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-v2-symmetric-selfplay"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/whittle-generated-exphormer-v2-symmetric-selfplay"
+sample_socket = "/tmp/gz-whittle-generated-exphormer-v2-symmetric-selfplay.sock"

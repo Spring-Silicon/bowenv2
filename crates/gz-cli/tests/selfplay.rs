@@ -1,19 +1,11 @@
-use gz_cli::selfplay::{
-    EvaluatorMode, PolicyOpponentMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig,
-    TrainingMode, ValueReward, init_replay, run,
-};
-use gz_features::FeatureSchema;
-use gz_replay::{ReplayStore, SampleConfig};
-use std::num::{NonZeroU64, NonZeroUsize};
+use gz_cli::selfplay::{EvaluatorMode, ReplayInitConfig, SelfplayConfig, init_replay, run};
+use gz_replay::{ReplayDataMode, ReplayEpisodeId, ReplayStore};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
-struct TestDir {
-    path: PathBuf,
-}
+struct TestDir(PathBuf);
 
 impl TestDir {
     fn new() -> Self {
@@ -21,1378 +13,152 @@ impl TestDir {
         let path =
             std::env::temp_dir().join(format!("gz-cli-selfplay-test-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
-
-        Self { path }
+        Self(path)
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        &self.0
     }
 }
 
 impl Drop for TestDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
 #[test]
-fn selfplay_config_defaults_tree_reuse_on() {
-    assert!(SelfplayConfig::default().tree_reuse);
-}
-
-#[test]
-fn single_vanilla_selfplay_stores_raw_terminal_reward_without_reference() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 1,
-        lanes: 1,
-        workers_per_lane: 1,
-        training_mode: TrainingMode::SingleVanilla,
-        reference: ReferenceMode::None,
-        reference_ema_decay: 0.0,
-        tree_reuse: false,
-        max_steps: 2,
-        simulations: 2,
-        max_considered: 2,
-        max_batch: 1,
-        ..SelfplayConfig::default()
-    })
-    .unwrap();
-
-    assert_eq!(summary.episodes_appended, 1);
-    assert_eq!((summary.wins, summary.losses, summary.ties), (0, 0, 0));
-    let store = ReplayStore::open(dir.path()).unwrap();
-    assert_eq!(
-        store.data_mode().unwrap(),
-        gz_replay::ReplayDataMode::SingleVanilla
-    );
-    let record = store
-        .episode(gz_replay::ReplayEpisodeId::new(0))
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        record.outcome.value_target,
-        Some(record.outcome.learner_reward)
-    );
-    assert!(record.outcome.reference.is_none());
-}
-
-#[test]
-fn single_vanilla_rejects_reuse_and_reference_settings() {
-    let base = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        training_mode: TrainingMode::SingleVanilla,
-        reference: ReferenceMode::None,
-        reference_ema_decay: 0.0,
-        tree_reuse: false,
-        ..SelfplayConfig::default()
-    };
-    assert!(base.validate().is_ok());
-    assert!(
-        SelfplayConfig {
-            tree_reuse: true,
-            ..base.clone()
-        }
-        .validate()
-        .unwrap_err()
-        .contains("--tree-reuse false")
-    );
-    assert!(
-        SelfplayConfig {
-            reference: ReferenceMode::Root,
-            ..base
-        }
-        .validate()
-        .unwrap_err()
-        .contains("reference and arena settings disabled")
-    );
-}
-
-#[test]
-fn wave_batching_requires_symmetric_selfplay() {
-    let config = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        wave_batching: true,
-        ..SelfplayConfig::default()
-    };
-    assert!(
-        config
-            .validate()
-            .unwrap_err()
-            .contains("--training-mode symmetric-selfplay")
-    );
-}
-
-#[test]
-fn symmetric_selfplay_allows_stop_with_position_features_and_no_reference() {
-    let base = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        training_mode: TrainingMode::SymmetricSelfplay,
-        reference: ReferenceMode::None,
-        reference_ema_decay: 0.0,
-        tree_reuse: false,
-        mask_stop: true,
-        length_tiebreak: true,
-        evaluator: EvaluatorMode::Stub,
-        ..SelfplayConfig::default()
-    };
-    assert!(base.validate().is_ok());
-    assert!(
-        SelfplayConfig {
-            wave_batching: true,
-            ..base.clone()
-        }
-        .validate()
-        .is_ok()
-    );
-    assert!(
-        SelfplayConfig {
-            tree_reuse: true,
-            ..base.clone()
-        }
-        .validate()
-        .is_ok()
-    );
-    assert!(
-        SelfplayConfig {
-            mask_stop: false,
-            ..base.clone()
-        }
-        .validate()
-        .is_ok()
-    );
-    assert!(
-        SelfplayConfig {
-            mask_stop: false,
-            position_features: false,
-            ..base.clone()
-        }
-        .validate()
-        .unwrap_err()
-        .contains("--position-features true")
-    );
-    assert!(
-        SelfplayConfig {
-            reference: ReferenceMode::Root,
-            ..base
-        }
-        .validate()
-        .unwrap_err()
-        .contains("reference and arena settings disabled")
-    );
-}
-
-#[test]
-fn symmetric_selfplay_stub_run_appends_both_player_rows() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 1,
-        lanes: 1,
-        workers_per_lane: 1,
-        training_mode: TrainingMode::SymmetricSelfplay,
-        reference: ReferenceMode::None,
-        reference_ema_decay: 0.0,
-        tree_reuse: false,
-        mask_stop: true,
-        length_tiebreak: true,
-        evaluator: EvaluatorMode::Stub,
-        max_steps: 1,
-        simulations: 2,
-        max_considered: 2,
-        max_batch: 1,
-        ..SelfplayConfig::default()
-    })
-    .unwrap();
-
-    assert_eq!(summary.episodes_appended, 1);
-    assert_eq!(summary.wins + summary.losses + summary.ties, 2);
-    assert_eq!(summary.measure_ledger.finals, 2);
-    let store = ReplayStore::open(dir.path()).unwrap();
-    assert_eq!(
-        store.data_mode().unwrap(),
-        gz_replay::ReplayDataMode::SymmetricSelfplay
-    );
-    assert_eq!(store.counters().produced_rows, 2);
-    for episode in [0, 1] {
-        let record = store
-            .episode(gz_replay::ReplayEpisodeId::new(episode))
-            .unwrap()
-            .unwrap();
-        assert!(record.outcome.reference.is_none());
-        assert!(!record.outcome.stopped);
-        assert!(
-            record.steps.iter().all(|step| !matches!(
-                step.action,
-                gz_engine::PortableSearchActionRef::Stop { .. }
-            ))
-        );
-    }
-}
-
-#[test]
-fn symmetric_selfplay_stub_run_retains_stop_targets_in_v2_replay() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 1,
-        lanes: 1,
-        workers_per_lane: 1,
-        training_mode: TrainingMode::SymmetricSelfplay,
-        reference: ReferenceMode::None,
-        reference_ema_decay: 0.0,
-        tree_reuse: true,
-        mask_stop: false,
-        length_tiebreak: true,
-        evaluator: EvaluatorMode::Stub,
-        max_steps: 1,
-        simulations: 2,
-        max_considered: 2,
-        max_batch: 1,
-        ..SelfplayConfig::default()
-    })
-    .unwrap();
-
-    assert_eq!(summary.episodes_appended, 1);
-    let store = ReplayStore::open(dir.path()).unwrap();
-    assert_eq!(
-        store.data_mode().unwrap(),
-        gz_replay::ReplayDataMode::SymmetricSelfplayStop
-    );
-    let rows = store
-        .sample_rows(SampleConfig {
-            batch: NonZeroUsize::new(2).unwrap(),
-            window_rows: NonZeroU64::new(2).unwrap(),
-            seed: 7,
-        })
-        .unwrap();
-    assert!(rows.iter().all(|(_, row)| matches!(
-        row.legal_actions.last(),
-        Some(gz_engine::PortableSearchActionRef::Stop { .. })
-    )));
-}
-
-#[test]
-fn selfplay_config_rejects_zero_reference_max_batch() {
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference_max_batch: Some(0),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-
-    assert!(error.contains("--reference-max-batch"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_zero_challenger_max_batch() {
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        challenger_max_batch: Some(0),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-
-    assert!(error.contains("--challenger-max-batch"), "{error}");
-}
-
-#[test]
-fn replay_init_writes_feature_schema_without_rows() {
+fn replay_init_persists_the_feature_schema() {
     let dir = TestDir::new();
     let summary = init_replay(ReplayInitConfig {
         replay_dir: Some(dir.path().to_path_buf()),
-        max_candidates: 7,
-    })
-    .unwrap();
-
-    let store = ReplayStore::open(dir.path()).unwrap();
-    let config = store.feature_schema().unwrap().unwrap();
-
-    assert_eq!(config.max_actions, 8);
-    assert_eq!(summary.max_actions, 8);
-    assert_eq!(
-        summary.feature_schema_hash,
-        FeatureSchema::new(config).unwrap().hash()
-    );
-    assert_eq!(store.counters().produced_rows, 0);
-    assert_eq!(store.episode_counters(), (0, 0));
-}
-
-#[test]
-fn replay_init_cli_writes_feature_schema_without_rows() {
-    let dir = TestDir::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_graphzero"))
-        .args([
-            "replay-init",
-            "--replay-dir",
-            dir.path().to_str().unwrap(),
-            "--max-candidates",
-            "3",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("max_actions=4"),
-        "{output:?}"
-    );
-
-    let store = ReplayStore::open(dir.path()).unwrap();
-    let config = store.feature_schema().unwrap().unwrap();
-    assert_eq!(config.max_actions, 4);
-    assert_eq!(store.counters().produced_rows, 0);
-    assert_eq!(store.episode_counters(), (0, 0));
-}
-
-#[test]
-fn replay_init_rejects_action_width_overflow() {
-    let error = ReplayInitConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        max_candidates: usize::MAX,
-    }
-    .validate()
-    .unwrap_err();
-
-    assert!(error.contains("--max-candidates"), "{error}");
-}
-
-#[test]
-fn selfplay_cli_accepts_tree_reuse_flag() {
-    let dir = TestDir::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_graphzero"))
-        .args([
-            "selfplay",
-            "--replay-dir",
-            dir.path().to_str().unwrap(),
-            "--episodes",
-            "1",
-            "--lanes",
-            "1",
-            "--workers-per-lane",
-            "1",
-            "--max-steps",
-            "1",
-            "--simulations",
-            "1",
-            "--tree-reuse",
-            "false",
-            "--reference-gamma",
-            "0",
-            "--admission-stagger-ms",
-            "1",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "{output:?}");
-}
-
-#[test]
-fn selfplay_run_writes_replay_rows() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 4,
-        lanes: 2,
-        workers_per_lane: 2,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::Root,
-        root_mode: RootMode::Generated,
-        reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
-        reference_trajectory_pool: 0,
-        reference_arena_size: 0,
-        reference_arena_seed: 910_000_001,
-        reference_checkpoint_pointer: None,
-        reference_challenger_checkpoint_pointer: None,
-        policy_opponent_mode: None,
-        reference_mask_stop: None,
-        seed: 3,
-        max_steps: 2,
-        simulations: 2,
-        max_considered: 16,
-        gumbel_scale: 0.0,
-        c_visit: 50.0,
-        c_scale: 1.0,
-        gumbel_noise_overlap: -1.0,
-        tree_reuse: false,
         max_candidates: 255,
-        max_batch: 4,
-        reference_max_batch: None,
-        challenger_max_batch: None,
-        evaluator: EvaluatorMode::Random,
-        python_dir: None,
-        checkpoint_dir: None,
-        eval_device: None,
-        eval_poll_interval: None,
-        serve_socket: None,
-        serve_max_batch: 512,
-        replay_backlog: None,
-        replay_retain: None,
-        position_features: true,
-        no_backtrack: false,
-        mask_stop: false,
-        length_tiebreak: false,
-        value_reward: ValueReward::Sign,
-        value_reward_scale: 0.1,
-        eval_processes: 1,
-        admission_stagger_ms: 0,
-        admission_smoothing: false,
-        wave_batching: false,
     })
     .unwrap();
-    let store = ReplayStore::open(dir.path()).unwrap();
-    let counters = store.counters();
 
-    assert_eq!(summary.counters, counters);
-    assert_eq!(summary.rows_produced, counters.produced_rows);
-    assert_eq!(summary.episodes_appended + summary.episodes_dropped, 4);
-    assert!(summary.rows_produced > 0);
+    assert_eq!(summary.max_actions, 256);
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let schema = store.feature_schema().unwrap().unwrap();
+    assert_eq!(schema.max_actions, 256);
 }
 
 #[test]
-fn selfplay_run_supports_stub_evaluator() {
+fn stub_selfplay_appends_both_symmetric_perspectives() {
     let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 2,
-        lanes: 1,
-        workers_per_lane: 2,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::Root,
-        root_mode: RootMode::Generated,
-        reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
-        reference_trajectory_pool: 0,
-        reference_arena_size: 0,
-        reference_arena_seed: 910_000_001,
-        reference_checkpoint_pointer: None,
-        reference_challenger_checkpoint_pointer: None,
-        policy_opponent_mode: None,
-        reference_mask_stop: None,
-        seed: 4,
-        max_steps: 2,
-        simulations: 2,
-        max_considered: 16,
-        gumbel_scale: 0.0,
-        c_visit: 50.0,
-        c_scale: 1.0,
-        gumbel_noise_overlap: -1.0,
-        tree_reuse: false,
-        max_candidates: 255,
-        max_batch: 2,
-        reference_max_batch: None,
-        challenger_max_batch: None,
-        evaluator: EvaluatorMode::Stub,
-        python_dir: None,
-        checkpoint_dir: None,
-        eval_device: None,
-        eval_poll_interval: None,
-        serve_socket: None,
-        serve_max_batch: 512,
-        replay_backlog: None,
-        replay_retain: None,
-        position_features: true,
-        no_backtrack: false,
-        mask_stop: false,
-        length_tiebreak: false,
-        value_reward: ValueReward::Sign,
-        value_reward_scale: 0.1,
-        eval_processes: 1,
-        admission_stagger_ms: 0,
-        admission_smoothing: false,
-        wave_batching: false,
-    })
-    .unwrap();
+    let summary = run(short_config(dir.path())).unwrap();
 
     assert_eq!(summary.evaluator, EvaluatorMode::Stub);
-    assert!(summary.model_version.is_some());
-    assert_eq!(summary.episodes_appended + summary.episodes_dropped, 2);
-}
-
-#[test]
-fn selfplay_run_supports_self_average_reference() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 4,
-        lanes: 1,
-        workers_per_lane: 1,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::SelfAverage,
-        root_mode: RootMode::Generated,
-        reference_ema_decay: 0.9,
-        reference_gamma: 0.0,
-        reference_trajectory_pool: 0,
-        reference_arena_size: 0,
-        reference_arena_seed: 910_000_001,
-        reference_checkpoint_pointer: None,
-        reference_challenger_checkpoint_pointer: None,
-        policy_opponent_mode: None,
-        reference_mask_stop: None,
-        seed: 11,
-        max_steps: 2,
-        simulations: 2,
-        max_considered: 16,
-        gumbel_scale: 0.0,
-        c_visit: 50.0,
-        c_scale: 1.0,
-        gumbel_noise_overlap: -1.0,
-        tree_reuse: false,
-        max_candidates: 255,
-        max_batch: 1,
-        reference_max_batch: None,
-        challenger_max_batch: None,
-        evaluator: EvaluatorMode::Random,
-        python_dir: None,
-        checkpoint_dir: None,
-        eval_device: None,
-        eval_poll_interval: None,
-        serve_socket: None,
-        serve_max_batch: 512,
-        replay_backlog: None,
-        replay_retain: None,
-        position_features: true,
-        no_backtrack: false,
-        mask_stop: false,
-        length_tiebreak: false,
-        value_reward: ValueReward::Sign,
-        value_reward_scale: 0.1,
-        eval_processes: 1,
-        admission_stagger_ms: 0,
-        admission_smoothing: false,
-        wave_batching: false,
-    })
-    .unwrap();
-
-    // The first admission per lane has no EMA yet; it is dropped rather
-    // than stored unlabeled.
-    assert_eq!(summary.episodes_appended, 3);
-    assert_eq!(summary.episodes_dropped, 1);
-    let labeled = summary.wins + summary.losses + summary.ties;
-    assert_eq!(labeled, 3);
-}
-
-#[test]
-fn selfplay_run_supports_policy_reference() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 4,
-        lanes: 1,
-        workers_per_lane: 1,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        reference_ema_decay: 0.0,
-        reference_gamma: 0.0,
-        reference_trajectory_pool: 0,
-        reference_arena_size: 0,
-        reference_arena_seed: 910_000_001,
-        reference_checkpoint_pointer: None,
-        reference_challenger_checkpoint_pointer: None,
-        policy_opponent_mode: None,
-        reference_mask_stop: None,
-        seed: 11,
-        max_steps: 2,
-        simulations: 2,
-        max_considered: 16,
-        gumbel_scale: 0.5,
-        c_visit: 50.0,
-        c_scale: 1.0,
-        gumbel_noise_overlap: -1.0,
-        tree_reuse: false,
-        max_candidates: 255,
-        max_batch: 1,
-        reference_max_batch: None,
-        challenger_max_batch: None,
-        evaluator: EvaluatorMode::Stub,
-        python_dir: None,
-        checkpoint_dir: None,
-        eval_device: None,
-        eval_poll_interval: None,
-        serve_socket: None,
-        serve_max_batch: 512,
-        replay_backlog: None,
-        replay_retain: None,
-        position_features: true,
-        no_backtrack: false,
-        mask_stop: false,
-        length_tiebreak: false,
-        value_reward: ValueReward::Sign,
-        value_reward_scale: 0.1,
-        eval_processes: 1,
-        admission_stagger_ms: 0,
-        admission_smoothing: false,
-        wave_batching: false,
-    })
-    .unwrap();
-
-    // The opponent rollout is excluded from the episode counters, and
-    // learner admission holds until it finishes (the seed rollout), so
-    // every episode labels against the rollout scalar -- no unlabeled
-    // admissions, nothing dropped.
-    assert_eq!(summary.episodes_appended, 4);
+    assert_eq!(summary.episodes_appended, 2);
     assert_eq!(summary.episodes_dropped, 0);
-    let labeled = summary.wins + summary.losses + summary.ties;
-    assert_eq!(labeled, 4);
-}
+    assert_eq!(summary.wins + summary.losses + summary.ties, 4);
+    assert_eq!(summary.wins, summary.losses);
+    assert_eq!(summary.rows_produced, summary.replay_rows);
+    assert!(summary.rows_produced > 0);
 
-#[test]
-fn selfplay_run_supports_sampled_trajectory_policy_reference() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 4,
-        lanes: 2,
-        workers_per_lane: 1,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
-        seed: 11,
-        max_steps: 2,
-        simulations: 2,
-        tree_reuse: false,
-        max_batch: 2,
-        evaluator: EvaluatorMode::Stub,
-        ..SelfplayConfig::default()
-    })
-    .unwrap();
-
-    assert_eq!(summary.episodes_appended, 4);
-    assert_eq!(summary.episodes_dropped, 0);
     let store = ReplayStore::open(dir.path()).unwrap();
-    let references = (0..summary.episodes_appended)
-        .map(|id| {
-            store
-                .episode(gz_replay::ReplayEpisodeId::new(id))
-                .unwrap()
-                .unwrap()
-                .outcome
-                .reference
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        references
-            .iter()
-            .all(|reference| reference.kind == gz_replay::ReplayReferenceKind::Gumbel)
-    );
-    let ids = references
-        .iter()
-        .map(|reference| reference.trajectory_id.unwrap())
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(ids.len(), 4);
-}
-
-#[test]
-fn gated_policy_trajectory_pool_fills_across_cold_lanes_before_admission() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 16,
-        lanes: 2,
-        workers_per_lane: 1,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        reference_ema_decay: 0.0,
-        reference_trajectory_pool: 2,
-        policy_opponent_mode: None,
-        seed: 11,
-        max_steps: 2,
-        simulations: 2,
-        gumbel_scale: 0.5,
-        tree_reuse: false,
-        max_batch: 1,
-        evaluator: EvaluatorMode::ProcessStub,
-        python_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python")),
-        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/unused-best.json")),
-        ..SelfplayConfig::default()
-    })
-    .unwrap();
-
-    assert_eq!(summary.episodes_appended, 16);
-    assert_eq!(summary.episodes_dropped, 0);
-    let store = ReplayStore::open(dir.path()).unwrap();
-    let ids = (0..summary.episodes_appended)
-        .map(|id| {
-            store
-                .episode(gz_replay::ReplayEpisodeId::new(id))
-                .unwrap()
-                .unwrap()
-                .outcome
-                .reference
-                .unwrap()
-                .trajectory_id
-                .unwrap()
-        })
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(ids, std::collections::HashSet::from([2, 3]));
-}
-
-#[test]
-fn reference_ema_decay_zero_is_only_valid_for_non_self_average_references() {
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        reference_ema_decay: 0.0,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::SelfAverage,
-        reference_ema_decay: 0.0,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-
-    assert!(error.contains("self-average"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_policy_reference_with_generated_roots() {
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Generated,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-
-    assert!(error.contains("requires --root-mode fixed"), "{error}");
-}
-
-#[test]
-fn selfplay_config_validates_reference_gamma() {
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        reference_gamma: 0.5,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        reference_gamma: 0.5,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(
-        error.contains("requires --reference gated-policy"),
-        "{error}"
-    );
-
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        reference_gamma: 1.0,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(error.contains("--reference-gamma"), "{error}");
-}
-
-#[test]
-fn selfplay_config_validates_reference_trajectory_pool() {
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        reference_trajectory_pool: 8,
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/checkpoints/best.json")),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    let missing_pointer = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        reference_trajectory_pool: 8,
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(
-        missing_pointer.contains("reference-checkpoint-pointer"),
-        "{missing_pointer}"
-    );
-
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        reference_trajectory_pool: 8,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(error.contains("--reference-trajectory-pool"), "{error}");
-}
-
-#[test]
-fn selfplay_config_validates_policy_opponent_mode() {
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        evaluator: EvaluatorMode::Stub,
-        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    let pool_error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        evaluator: EvaluatorMode::Stub,
-        reference_trajectory_pool: 8,
-        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(pool_error.contains("cannot be combined"), "{pool_error}");
-
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/checkpoints/best.json")),
-        tree_reuse: false,
-        length_tiebreak: true,
-        policy_opponent_mode: Some(PolicyOpponentMode::SampledTree),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    let gamma_error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Policy,
-        root_mode: RootMode::Fixed,
-        evaluator: EvaluatorMode::Stub,
-        reference_gamma: 0.2,
-        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(gamma_error.contains("reference-gamma 0"), "{gamma_error}");
-
-    let gated_error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        evaluator: EvaluatorMode::Stub,
-        policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(gated_error.contains("--reference policy"), "{gated_error}");
-}
-
-#[test]
-fn selfplay_config_accepts_only_complete_generated_arena_policy_setup() {
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Generated,
-        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
-        reference_arena_size: 8,
-        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/best.json")),
-        reference_challenger_checkpoint_pointer: Some(PathBuf::from("/tmp/arena.json")),
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Generated,
-        policy_opponent_mode: Some(PolicyOpponentMode::SampledTree),
-        reference_arena_size: 8,
-        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/best.json")),
-        reference_challenger_checkpoint_pointer: Some(PathBuf::from("/tmp/arena.json")),
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        tree_reuse: false,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    let missing_pointer = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Generated,
-        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
-        reference_arena_size: 8,
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(
-        missing_pointer.contains("reference-checkpoint-pointer"),
-        "{missing_pointer}"
-    );
-
-    let missing_challenger_pointer = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Generated,
-        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
-        reference_arena_size: 8,
-        reference_checkpoint_pointer: Some(PathBuf::from("/tmp/best.json")),
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(
-        missing_challenger_pointer.contains("reference-challenger-checkpoint-pointer"),
-        "{missing_challenger_pointer}"
-    );
-
-    let missing_arena = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Generated,
-        policy_opponent_mode: Some(PolicyOpponentMode::GreedyTrajectory),
-        evaluator: EvaluatorMode::Torch,
-        checkpoint_dir: Some(PathBuf::from("/tmp/checkpoints")),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(
-        missing_arena.contains("generated-root arena"),
-        "{missing_arena}"
-    );
-}
-
-#[test]
-fn selfplay_config_validates_reference_stop_override() {
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::GatedPolicy,
-        root_mode: RootMode::Fixed,
-        reference_mask_stop: Some(true),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    let error = SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        reference: ReferenceMode::Root,
-        reference_mask_stop: Some(true),
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(error.contains("--reference-mask-stop"), "{error}");
-}
-
-#[test]
-fn selfplay_config_validates_gumbel_scaling() {
-    SelfplayConfig {
-        replay_dir: Some(PathBuf::from("/tmp/unused")),
-        c_visit: 50.0,
-        c_scale: 0.3,
-        ..SelfplayConfig::default()
-    }
-    .validate()
-    .unwrap();
-
-    for (c_visit, c_scale) in [(f32::NAN, 0.3), (50.0, -0.1)] {
-        let error = SelfplayConfig {
-            replay_dir: Some(PathBuf::from("/tmp/unused")),
-            c_visit,
-            c_scale,
-            ..SelfplayConfig::default()
-        }
-        .validate()
-        .unwrap_err();
-        assert!(error.contains("--c-"), "{error}");
-    }
-}
-
-fn serving_config(dir: &TestDir) -> SelfplayConfig {
-    SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 0,
-        lanes: 1,
-        workers_per_lane: 1,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::Root,
-        root_mode: RootMode::Generated,
-        reference_ema_decay: 0.99,
-        reference_gamma: 0.0,
-        reference_trajectory_pool: 0,
-        reference_arena_size: 0,
-        reference_arena_seed: 910_000_001,
-        reference_checkpoint_pointer: None,
-        reference_challenger_checkpoint_pointer: None,
-        policy_opponent_mode: None,
-        reference_mask_stop: None,
-        seed: 3,
-        max_steps: 2,
-        simulations: 2,
-        max_considered: 16,
-        gumbel_scale: 0.0,
-        c_visit: 50.0,
-        c_scale: 1.0,
-        gumbel_noise_overlap: -1.0,
-        tree_reuse: false,
-        max_candidates: 255,
-        max_batch: 1,
-        reference_max_batch: None,
-        challenger_max_batch: None,
-        evaluator: EvaluatorMode::Stub,
-        python_dir: None,
-        checkpoint_dir: None,
-        eval_device: None,
-        eval_poll_interval: None,
-        serve_socket: Some(dir.path().join("live.sock")),
-        serve_max_batch: 512,
-        replay_backlog: None,
-        replay_retain: None,
-        position_features: true,
-        no_backtrack: false,
-        mask_stop: false,
-        length_tiebreak: false,
-        value_reward: ValueReward::Sign,
-        value_reward_scale: 0.1,
-        eval_processes: 1,
-        admission_stagger_ms: 0,
-        admission_smoothing: false,
-        wave_batching: false,
-    }
-}
-
-#[test]
-fn selfplay_config_rejects_serve_socket_with_bounded_episodes() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.episodes = 4;
-
-    let error = config.validate().unwrap_err();
-    assert!(
-        error.contains("--serve-socket requires --episodes 0"),
-        "{error}"
-    );
-}
-
-#[test]
-fn selfplay_config_rejects_unbounded_episodes_without_serve_socket() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.serve_socket = None;
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("requires --serve-socket"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_serve_socket_with_random_evaluator() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.evaluator = EvaluatorMode::Random;
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("featurized evaluator"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_zero_replay_backlog() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.replay_backlog = Some(0);
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("--replay-backlog"), "{error}");
-}
-
-#[test]
-fn selfplay_config_separates_fixed_and_adaptive_admission_pacing() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.admission_smoothing = true;
-    config.validate().unwrap();
-
-    config.admission_stagger_ms = 1;
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("mutually exclusive"), "{error}");
-}
-
-#[test]
-fn torch_evaluator_builds_the_child_command_line() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.evaluator = EvaluatorMode::Torch;
-    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
-    config.validate().unwrap();
-
     assert_eq!(
-        config.evaluator_extra_args(),
-        [
-            "--backend",
-            "torch",
-            "--checkpoint-dir",
-            "/ckpt",
-            "--device",
-            "cuda:0"
-        ]
+        store.data_mode().unwrap(),
+        ReplayDataMode::SymmetricSelfplay
     );
-
-    config.eval_device = Some("cuda:1".to_owned());
-    assert_eq!(config.evaluator_extra_args()[5], "cuda:1");
-}
-
-#[test]
-fn symmetric_torch_evaluator_requires_joint_board_checkpoint() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.evaluator = EvaluatorMode::Torch;
-    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
-    config.training_mode = TrainingMode::SymmetricSelfplay;
-    config.reference = ReferenceMode::None;
-    config.reference_ema_decay = 0.0;
-    config.length_tiebreak = true;
-    config.validate().unwrap();
-
-    let args = config.evaluator_extra_args();
-    assert_eq!(
-        &args[6..],
-        [
-            "--require-state-input",
-            "joint-board",
-            "--require-value-input",
-            "single"
-        ]
-    );
-}
-
-#[test]
-fn historical_torch_evaluators_are_policy_only() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.evaluator = EvaluatorMode::Torch;
-    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
-    config.reference_checkpoint_pointer = Some(PathBuf::from("/ckpt/best.json"));
-    config.reference_challenger_checkpoint_pointer = Some(PathBuf::from("/ckpt/arena.json"));
-
-    let reference = config.reference_evaluator_extra_args();
-    let challenger = config.challenger_evaluator_extra_args();
-
-    assert!(reference.iter().any(|arg| arg == "--policy-only"));
-    assert!(challenger.iter().any(|arg| arg == "--policy-only"));
-    assert_eq!(reference.last().unwrap(), "/ckpt/best.json");
-    assert_eq!(challenger.last().unwrap(), "/ckpt/arena.json");
-}
-
-#[test]
-fn stub_evaluators_pass_no_extra_args() {
-    let dir = TestDir::new();
-    let config = serving_config(&dir);
-
-    assert!(config.evaluator_extra_args().is_empty());
-}
-
-#[test]
-fn selfplay_config_rejects_torch_without_checkpoint_dir() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.evaluator = EvaluatorMode::Torch;
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("requires --checkpoint-dir"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_checkpoint_dir_without_torch() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("--checkpoint-dir requires"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_eval_device_without_torch() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.eval_device = Some("cuda:1".to_owned());
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("--eval-device requires"), "{error}");
-}
-
-#[test]
-fn torch_evaluator_forwards_the_poll_interval() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.evaluator = EvaluatorMode::Torch;
-    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
-    config.eval_poll_interval = Some(0.5);
-    config.validate().unwrap();
-
-    let args = config.evaluator_extra_args();
-    assert_eq!(&args[6..], ["--poll-interval", "0.5"]);
-}
-
-#[test]
-fn selfplay_config_rejects_poll_interval_without_torch() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.eval_poll_interval = Some(0.5);
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("--eval-poll-interval requires"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_negative_poll_interval() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.evaluator = EvaluatorMode::Torch;
-    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
-    config.eval_poll_interval = Some(-1.0);
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("--eval-poll-interval must be"), "{error}");
-}
-
-#[test]
-fn selfplay_config_rejects_zero_max_candidates() {
-    let dir = TestDir::new();
-    let mut config = serving_config(&dir);
-    config.max_candidates = 0;
-
-    let error = config.validate().unwrap_err();
-    assert!(error.contains("--max-candidates"), "{error}");
-}
-
-#[test]
-fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
-    let dir = TestDir::new();
-    let summary = run(SelfplayConfig {
-        replay_dir: Some(dir.path().to_path_buf()),
-        episodes: 6,
-        lanes: 2,
-        workers_per_lane: 2,
-        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
-        reference: ReferenceMode::SelfAverage,
-        root_mode: RootMode::Fixed,
-        reference_ema_decay: 0.9,
-        reference_gamma: 0.0,
-        reference_trajectory_pool: 0,
-        reference_arena_size: 0,
-        reference_arena_seed: 910_000_001,
-        reference_checkpoint_pointer: None,
-        reference_challenger_checkpoint_pointer: None,
-        policy_opponent_mode: None,
-        reference_mask_stop: None,
-        seed: 11,
-        max_steps: 3,
-        simulations: 4,
-        max_considered: 4,
-        gumbel_scale: 1.0,
-        c_visit: 50.0,
-        c_scale: 1.0,
-        gumbel_noise_overlap: -1.0,
-        tree_reuse: true,
-        max_candidates: 255,
-        max_batch: 2,
-        reference_max_batch: None,
-        challenger_max_batch: None,
-        evaluator: EvaluatorMode::Stub,
-        python_dir: None,
-        checkpoint_dir: None,
-        eval_device: None,
-        eval_poll_interval: None,
-        serve_socket: None,
-        serve_max_batch: 512,
-        replay_backlog: None,
-        replay_retain: None,
-        position_features: true,
-        no_backtrack: false,
-        mask_stop: false,
-        length_tiebreak: false,
-        value_reward: ValueReward::Sign,
-        value_reward_scale: 0.1,
-        eval_processes: 1,
-        admission_stagger_ms: 0,
-        admission_smoothing: false,
-        wave_batching: false,
-    })
-    .unwrap();
-    // Admissions that precede a lane's first completed episode have no
-    // EMA reference yet and are dropped (up to workers-per-lane each),
-    // so only the labeled remainder reaches the store.
-    assert_eq!(summary.episodes_appended + summary.episodes_dropped, 6);
-    assert!(
-        summary.episodes_appended >= 2,
-        "{}",
-        summary.episodes_appended
-    );
-
-    let store = ReplayStore::open(dir.path()).unwrap();
-    let mut roots = std::collections::HashSet::new();
-    let mut step_sets = std::collections::HashSet::new();
-    for id in 0..summary.episodes_appended {
-        let record = store
-            .episode(gz_replay::ReplayEpisodeId::new(id))
+    assert!(store.feature_schema().unwrap().is_some());
+    for pair in [[0, 1], [2, 3]] {
+        let left = store
+            .episode(ReplayEpisodeId::new(pair[0]))
             .unwrap()
-            .expect("episode exists");
-        roots.insert(record.root);
-        step_sets.insert(format!("{:?}", record.steps));
+            .unwrap();
+        let right = store
+            .episode(ReplayEpisodeId::new(pair[1]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            left.outcome.value_target,
+            right.outcome.value_target.map(|v| -v)
+        );
+        assert!(left.outcome.value_target.is_some());
+        assert!(right.outcome.value_target.is_some());
     }
+}
 
-    // Every episode starts from the same graph...
-    assert_eq!(roots.len(), 1, "fixed mode must share one root");
-    // ...but per-episode Gumbel noise makes trajectories diverge.
-    assert!(
-        step_sets.len() > 1,
-        "episodes from a fixed root must not be identical"
+#[test]
+fn stop_enabled_selfplay_uses_the_stop_replay_contract() {
+    let dir = TestDir::new();
+    let mut config = short_config(dir.path());
+    config.episodes = 1;
+    config.mask_stop = false;
+
+    run(config).unwrap();
+
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(
+        store.data_mode().unwrap(),
+        ReplayDataMode::SymmetricSelfplayStop
     );
+    for id in 0..2 {
+        let episode = store.episode(ReplayEpisodeId::new(id)).unwrap().unwrap();
+        assert!(episode.outcome.value_target.is_some());
+    }
+}
+
+#[test]
+fn validation_rejects_incoherent_runtime_settings() {
+    let dir = TestDir::new();
+    let mut config = short_config(dir.path());
+    config.length_tiebreak = false;
+    assert!(config.validate().unwrap_err().contains("length-tiebreak"));
+
+    let mut config = short_config(dir.path());
+    config.mask_stop = false;
+    config.position_features = false;
+    assert!(config.validate().unwrap_err().contains("position-features"));
+
+    let mut config = short_config(dir.path());
+    config.episodes = 0;
+    assert!(config.validate().unwrap_err().contains("serve-socket"));
+
+    let mut config = short_config(dir.path());
+    config.eval_processes = 2;
+    assert!(config.validate().unwrap_err().contains("cannot exceed"));
+}
+
+#[test]
+fn torch_evaluator_args_select_checkpoint_and_device() {
+    let dir = TestDir::new();
+    let mut config = short_config(dir.path());
+    config.evaluator = EvaluatorMode::Torch;
+    config.checkpoint_dir = Some(PathBuf::from("/checkpoints"));
+    config.eval_device = Some("cuda:1".to_owned());
+    config.eval_poll_interval = Some(0.25);
+    config.validate().unwrap();
+
+    let args = config.evaluator_extra_args();
+    assert!(args.windows(2).any(|pair| pair == ["--backend", "torch"]));
+    assert!(args.windows(2).any(|pair| pair == ["--device", "cuda:1"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--poll-interval", "0.25"])
+    );
+    assert!(!args.iter().any(|arg| arg.starts_with("--require-")));
+}
+
+fn short_config(path: &Path) -> SelfplayConfig {
+    SelfplayConfig {
+        replay_dir: Some(path.to_path_buf()),
+        episodes: 2,
+        lanes: 1,
+        workers_per_lane: 1,
+        seed: 42,
+        max_steps: 2,
+        simulations: 2,
+        max_considered: 2,
+        gumbel_scale: 0.0,
+        gumbel_noise_overlap: -1.0,
+        tree_reuse: false,
+        max_candidates: 255,
+        max_batch: 2,
+        evaluator: EvaluatorMode::Stub,
+        mask_stop: true,
+        length_tiebreak: true,
+        no_backtrack: true,
+        ..SelfplayConfig::default()
+    }
 }

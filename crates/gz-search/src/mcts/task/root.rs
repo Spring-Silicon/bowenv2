@@ -9,8 +9,8 @@ use super::state::{
 use crate::SearchCandidateSummary;
 use crate::support::internal;
 use crate::work::{
-    ApplyWork, EngineIdentity, EvalModel, EvalWork, ExpandResult, ExpandWork, SearchPoll,
-    SearchWork, SearchWorkResult, WorkToken,
+    ApplyWork, EngineIdentity, EvalWork, ExpandResult, ExpandWork, SearchPoll, SearchWork,
+    SearchWorkResult, WorkToken,
 };
 use gz_engine::{ApplyResult, EngineResult, PortableCandidateRef, ReplayGraphContext};
 use gz_eval::{EvalAction, EvalRequest, eval_error_to_engine_error};
@@ -177,27 +177,6 @@ where
             (PendingRootWork::Apply { run, action, .. }, SearchWorkResult::Apply(result)) => {
                 self.resume_apply(run, action, result)
             }
-            (
-                PendingRootWork::StopEval {
-                    mut run, request, ..
-                },
-                SearchWorkResult::Eval(output),
-            ) => {
-                output
-                    .validate_for(&request)
-                    .map_err(eval_error_to_engine_error)?;
-                self.tree.eval_count += 1;
-                let path = run
-                    .descent
-                    .as_ref()
-                    .ok_or_else(|| internal("missing descent"))?
-                    .path
-                    .clone();
-                self.tree.backup(&path, output.value);
-                run.complete_simulation();
-                self.state = RootTaskState::Running(run);
-                Ok(())
-            }
             (pending, _) => {
                 self.pending = Some(pending);
                 Err(internal("mismatched work result"))
@@ -237,7 +216,6 @@ where
             candidates: expansion.candidates.clone(),
             request: request.clone(),
             measure_options: self.config.measure_options,
-            model: EvalModel::Episode,
             opponent: None,
         };
         self.pending = Some(PendingRootWork::EvalNode {
@@ -304,27 +282,6 @@ where
                 node_index: descent.node_index,
                 action,
             });
-            if let Some(request) = self.stop_eval_request(descent.node_index, descent.depth)? {
-                run.descent = Some(descent);
-                let token = self.next_token();
-                let node = &self.tree.nodes[run.descent.as_ref().unwrap().node_index];
-                let work = EvalWork {
-                    token,
-                    graph: node.graph,
-                    candidates: node.candidates.clone(),
-                    request: request.clone(),
-                    measure_options: self.config.measure_options,
-                    model: EvalModel::Episode,
-                    opponent: None,
-                };
-                let pending = PendingRootWork::StopEval {
-                    token,
-                    run,
-                    request,
-                };
-                return Ok(DescentPoll::Work(SearchWork::Eval(work), pending));
-            }
-
             let value = self.tree.nodes[descent.node_index].value;
             self.tree.backup(&descent.path, value);
             run.descent = Some(descent);
@@ -499,46 +456,15 @@ where
         Ok(())
     }
 
-    fn stop_eval_request(
-        &self,
-        node_index: usize,
-        depth: usize,
-    ) -> EngineResult<Option<EvalRequest>> {
-        let Some(opponent) = self.context.opponent else {
-            return Ok(None);
-        };
-        let Some(last) = opponent.row_count.checked_sub(1) else {
-            return Ok(None);
-        };
-        let effective_depth = depth.max(last.saturating_sub(self.context.root_step) as usize);
-        if effective_depth == depth {
-            return Ok(None);
-        }
-        let node = &self.tree.nodes[node_index];
-        EvalRequest::with_position(
-            node.context,
-            node.eval_actions.clone(),
-            self.context.position(effective_depth),
-        )
-        .map(Some)
-        .map_err(|_| internal("invalid mcts stop eval request"))
-    }
-
     fn finalize_node(
         &mut self,
         expansion: NodeExpansion<G, C>,
         output: gz_eval::EvalOutput,
     ) -> usize {
-        let eval_actions = if self.context.opponent.is_some() {
-            expansion.eval_actions
-        } else {
-            Vec::new()
-        };
         let node = MctsNode::new(
             expansion.graph,
             expansion.context,
             expansion.candidates,
-            eval_actions,
             expansion.candidate_hashes,
             expansion.summaries,
             output,

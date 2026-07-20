@@ -3,7 +3,7 @@ use crate::root::RootSource;
 use crate::serial::OrchestratedEpisode;
 use gz_engine::{EngineResult, GraphEngine};
 use gz_eval::{EvalOutput, EvalRequest, Evaluator, eval_error_to_engine_error, validate_outputs};
-use gz_search::{EngineIdentity, GumbelEpisodeContext, GumbelMcts};
+use gz_search::{EngineIdentity, GumbelMcts};
 use std::num::NonZeroUsize;
 
 pub struct BatchedGumbelOrchestrator<E, V> {
@@ -33,11 +33,7 @@ where
         }
     }
 
-    pub fn run<R>(
-        &mut self,
-        roots: &mut R,
-        context: GumbelEpisodeContext,
-    ) -> EngineResult<BatchedRun<E::Graph, E::Candidate>>
+    pub fn run<R>(&mut self, roots: &mut R) -> EngineResult<BatchedRun<E::Graph, E::Candidate>>
     where
         R: RootSource<E>,
     {
@@ -53,30 +49,19 @@ where
                 let mut admission = Admission {
                     search: &self.search,
                     identity,
-                    context,
-                    sampled_tree: false,
                     symmetric_selfplay: false,
                     pressure_reserved: false,
                     next_episode_id: &mut next_episode_id,
                 };
-                roots_exhausted = pool.admit(
-                    &mut self.engine,
-                    roots,
-                    &mut admission,
-                    |_, _, _, context| Ok(context),
-                )?;
+                roots_exhausted =
+                    pool.admit(&mut self.engine, roots, &mut admission, |_, _, _| Ok(()))?;
             }
 
             episodes.extend(
-                pool.drive(
-                    &mut self.engine,
-                    "batched driver blocked",
-                    None,
-                    |_, _, _| {},
-                )?
-                .into_iter()
-                .map(crate::pool::CompletedTask::into_gumbel)
-                .collect::<EngineResult<Vec<_>>>()?,
+                pool.drive(&mut self.engine, "batched driver blocked", None)?
+                    .into_iter()
+                    .map(crate::pool::CompletedTask::into_gumbel)
+                    .collect::<EngineResult<Vec<_>>>()?,
             );
 
             if roots_exhausted && !pool.active() {

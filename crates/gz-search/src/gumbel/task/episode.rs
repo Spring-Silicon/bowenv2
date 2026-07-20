@@ -33,7 +33,6 @@ where
                 identity,
                 root,
                 MctsEpisodeContext {
-                    opponent: context.opponent,
                     noise_seed: context.noise_seed,
                 },
             ),
@@ -97,7 +96,6 @@ pub(crate) fn gumbel_episode<G, C>(episode: MctsEpisode<G, C>) -> GumbelEpisode<
             MctsStopReason::SelectedStop => GumbelStopReason::SelectedStop,
         },
         search_config_hash: episode.search_config_hash,
-        competitive: None,
     }
 }
 

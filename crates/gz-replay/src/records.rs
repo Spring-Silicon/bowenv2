@@ -40,25 +40,39 @@ pub struct ReplayEpisodeRecord {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ReplayOutcome {
     pub value_target: Option<f32>,
-    pub learner_reward: f32,
-    pub reference: Option<ReplayReference>,
+    pub reward: f32,
+    // Retained in the postcard layout so schema-v8 symmetric replay stores
+    // remain readable. New records reject non-empty legacy references.
+    legacy_reference: Option<StoredReplayReference>,
     /// True when the search selected STOP; false when the episode hit the
     /// move budget.
     pub stopped: bool,
 }
 
+impl ReplayOutcome {
+    #[must_use]
+    pub const fn new(value_target: Option<f32>, reward: f32, stopped: bool) -> Self {
+        Self {
+            value_target,
+            reward,
+            legacy_reference: None,
+            stopped,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct ReplayReference {
-    pub kind: ReplayReferenceKind,
-    pub reward: f32,
-    pub final_graph: Option<ReplayGraphContext>,
-    pub trajectory_id: Option<u64>,
-    pub search_config_hash: Option<SearchConfigHash>,
-    pub model_version: Option<ModelVersion>,
+struct StoredReplayReference {
+    kind: StoredReplayReferenceKind,
+    reward: f32,
+    final_graph: Option<ReplayGraphContext>,
+    trajectory_id: Option<u64>,
+    search_config_hash: Option<SearchConfigHash>,
+    model_version: Option<ModelVersion>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum ReplayReferenceKind {
+enum StoredReplayReferenceKind {
     RootBaseline,
     Greedy,
     Beam,
@@ -68,9 +82,6 @@ pub enum ReplayReferenceKind {
     // the end keeps every existing store's bytes decoding unchanged. Any
     // future variant must also be appended, never inserted.
     SelfAverage,
-    /// Historical-best policy rollout: the bar is the best greedy rollout
-    /// any published checkpoint achieved this run; model_version is the
-    /// incumbent that set it.
     GatedPolicy,
 }
 
@@ -259,63 +270,32 @@ fn validate_admission(record: &ReplayEpisodeRecord) -> ReplayResult<()> {
 }
 
 fn validate_outcome(record: &ReplayEpisodeRecord, data_mode: ReplayDataMode) -> ReplayResult<()> {
-    if !record.outcome.learner_reward.is_finite() {
+    if !record.outcome.reward.is_finite() {
         return Err(ReplayError::InvalidRecord);
     }
 
-    if Some(record.outcome.learner_reward) != record.final_measure.scalar_reward {
+    if Some(record.outcome.reward) != record.final_measure.scalar_reward {
         return Err(ReplayError::InvalidRecord);
     }
 
     validate_value_target(record.outcome.value_target, data_mode)?;
 
-    match &record.outcome.reference {
-        Some(reference) => {
-            if data_mode.is_single_vanilla() {
-                return Err(ReplayError::InvalidRecord);
-            }
-            if !reference.reward.is_finite() {
-                return Err(ReplayError::InvalidRecord);
-            }
-
-            let reward_sign = sign_target(record.outcome.learner_reward, reference.reward);
-            let valid = if data_mode.is_graded() {
-                match (reward_sign, record.outcome.value_target) {
-                    (sign, Some(target)) if sign > 0.0 => target > 0.0,
-                    (sign, Some(target)) if sign < 0.0 => target < 0.0,
-                    (0.0, Some(_)) => true,
-                    _ => false,
-                }
-            } else {
-                match reward_sign {
-                    // Exact ties are coin-flipped to a hard +/-1 at projection
-                    // (random tie-break); either sign is a valid tie label.
-                    0.0 => matches!(record.outcome.value_target, Some(-1.0 | 1.0)),
-                    expected => record.outcome.value_target == Some(expected),
-                }
-            };
-            if !valid {
-                return Err(ReplayError::InvalidRecord);
-            }
-        }
-        None => {
-            let valid = if data_mode.is_symmetric_selfplay() {
-                (!record.outcome.stopped || data_mode.symmetric_stop_enabled())
-                    && matches!(record.outcome.value_target, Some(-1.0 | 0.0 | 1.0))
-                    && (!data_mode.symmetric_stop_enabled()
-                        || record.outcome.stopped
-                            == record.steps.last().is_some_and(|step| {
-                                matches!(step.action, PortableSearchActionRef::Stop { .. })
-                            }))
-            } else if data_mode.is_single_vanilla() {
-                record.outcome.value_target == Some(record.outcome.learner_reward)
-            } else {
-                record.outcome.value_target.is_none()
-            };
-            if !valid {
-                return Err(ReplayError::InvalidRecord);
-            }
-        }
+    if record.outcome.legacy_reference.is_some() {
+        return Err(ReplayError::InvalidRecord);
+    }
+    let valid = if data_mode.is_symmetric_selfplay() {
+        (!record.outcome.stopped || data_mode.symmetric_stop_enabled())
+            && matches!(record.outcome.value_target, Some(-1.0 | 0.0 | 1.0))
+            && (!data_mode.symmetric_stop_enabled()
+                || record.outcome.stopped
+                    == record.steps.last().is_some_and(|step| {
+                        matches!(step.action, PortableSearchActionRef::Stop { .. })
+                    }))
+    } else {
+        record.outcome.value_target.is_none()
+    };
+    if !valid {
+        return Err(ReplayError::InvalidRecord);
     }
 
     Ok(())
@@ -336,7 +316,7 @@ fn validate_row(
         || row.final_measure != record.final_measure
         || row.search_config_hash != record.search_config_hash
         || row.value_target != record.outcome.value_target
-        || row.reward_target != Some(record.outcome.learner_reward)
+        || row.reward_target != Some(record.outcome.reward)
     {
         return Err(ReplayError::InvalidRecord);
     }
@@ -396,42 +376,10 @@ fn validate_horizon_value_targets(
 }
 
 fn validate_value_target(value: Option<f32>, data_mode: ReplayDataMode) -> ReplayResult<()> {
-    if data_mode.is_single_vanilla() {
-        return match value {
-            Some(value) if value.is_finite() => Ok(()),
-            _ => Err(ReplayError::InvalidRecord),
-        };
+    match (value, data_mode.is_symmetric_selfplay()) {
+        (Some(value), true) if value == -1.0 || value == 0.0 || value == 1.0 => Ok(()),
+        (Some(value), false) if value == -1.0 || value == 1.0 => Ok(()),
+        (Some(_), _) => Err(ReplayError::InvalidRecord),
+        (None, _) => Ok(()),
     }
-    match (
-        value,
-        data_mode.is_graded(),
-        data_mode.is_symmetric_selfplay(),
-    ) {
-        (Some(value), false, true) if value == -1.0 || value == 0.0 || value == 1.0 => Ok(()),
-        (Some(value), false, false) if value == -1.0 || value == 1.0 => Ok(()),
-        (Some(value), true, false) if value.is_finite() && (-1.0..=1.0).contains(&value) => Ok(()),
-        (Some(_), _, _) => Err(ReplayError::InvalidRecord),
-        (None, _, _) => Ok(()),
-    }
-}
-
-fn sign_target(learner: f32, reference: f32) -> f32 {
-    if learner > reference {
-        1.0
-    } else if learner < reference {
-        -1.0
-    } else {
-        0.0
-    }
-}
-
-/// Static facts about the fixed root graph of a single-graph run,
-/// probed once at selfplay startup. Telemetry: consumed by the trainer
-/// through the sample-service handshake.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct ReplayRootInfo {
-    pub cost: f32,
-    pub node_count: u32,
-    pub edge_count: u32,
-    pub candidate_count: u32,
 }

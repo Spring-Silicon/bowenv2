@@ -1,8 +1,5 @@
 use crate::error::{ReplayError, ReplayResult};
-use crate::keys::{
-    CF_EPISODES, CF_POLICY_ROW_INDEX, CF_ROW_INDEX, CF_ROWS, CF_VALUE_ROW_INDEX, episode_key,
-    row_index_key, row_key,
-};
+use crate::keys::{CF_EPISODES, CF_ROW_INDEX, CF_ROWS, episode_key, row_index_key, row_key};
 use crate::records::{ReplayEpisodeRecord, ReplayRow, StoredReplayRow};
 use rocksdb::{DB, WriteBatch};
 
@@ -10,8 +7,6 @@ use rocksdb::{DB, WriteBatch};
 pub(crate) struct AppendSequences {
     pub next_episode: u64,
     pub next_row: u64,
-    pub next_policy_row: u64,
-    pub next_value_row: u64,
 }
 
 pub(crate) struct EpisodeAppend<'a> {
@@ -28,8 +23,6 @@ pub(crate) fn stage_episodes(
     let episodes_cf = cf(db, CF_EPISODES)?;
     let rows_cf = cf(db, CF_ROWS)?;
     let row_index = cf(db, CF_ROW_INDEX)?;
-    let policy_row_index = cf(db, CF_POLICY_ROW_INDEX)?;
-    let value_row_index = cf(db, CF_VALUE_ROW_INDEX)?;
 
     for episode in episodes {
         batch.put_cf(
@@ -50,25 +43,6 @@ pub(crate) fn stage_episodes(
                 key.as_slice(),
             );
             sequences.next_row = increment(sequences.next_row, "row sequence overflow")?;
-
-            if row.policy_target.iter().any(|target| *target > 0.0) {
-                batch.put_cf(
-                    &policy_row_index,
-                    row_index_key(sequences.next_policy_row),
-                    key.as_slice(),
-                );
-                sequences.next_policy_row =
-                    increment(sequences.next_policy_row, "policy row sequence overflow")?;
-            }
-            if row.value_target.is_some() {
-                batch.put_cf(
-                    &value_row_index,
-                    row_index_key(sequences.next_value_row),
-                    key.as_slice(),
-                );
-                sequences.next_value_row =
-                    increment(sequences.next_value_row, "value row sequence overflow")?;
-            }
         }
         sequences.next_episode = increment(sequences.next_episode, "episode id overflow")?;
     }

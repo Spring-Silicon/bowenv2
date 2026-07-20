@@ -2,10 +2,6 @@ pub(crate) fn root_seed(seed: u64, root_step: u32) -> u64 {
     seed ^ 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(u64::from(root_step) + 1)
 }
 
-pub(crate) fn sample_unit_gumbels(count: usize, rng: &mut SearchRng) -> Vec<f32> {
-    (0..count).map(|_| -(-rng.unit().ln()).ln()).collect()
-}
-
 pub(crate) struct SearchRng {
     state: u64,
 }

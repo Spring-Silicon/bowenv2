@@ -6,13 +6,11 @@ use gz_engine::{
 use std::num::NonZeroUsize;
 
 pub type GumbelHandleBatch<G, C> = crate::mcts::types::MctsHandleBatch<G, C>;
-pub type GumbelOpponentContext = crate::mcts::types::MctsOpponentContext;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GumbelValueMode {
     #[default]
-    Competitive,
-    SingleVanilla,
+    SingleAgent,
     SymmetricSelfplay,
 }
 
@@ -47,8 +45,7 @@ pub struct GumbelMctsConfig {
     /// part of the search config hash.
     pub export_position: bool,
     /// Mask STOP out of node priors/logits wherever a rewrite exists
-    /// (STOP-only nodes keep it). Policy rollouts preserve the caller's
-    /// setting. Part of the search config hash.
+    /// (STOP-only nodes keep it). Part of the search config hash.
     pub mask_stop: bool,
     /// Mask any action whose applied child is the current root or a
     /// prior root of this episode (whittlezero's no_backtrack): the
@@ -57,9 +54,7 @@ pub struct GumbelMctsConfig {
     /// Within-simulation cycles are already handled by the descent seen
     /// set. Part of the search config hash.
     pub no_backtrack: bool,
-    /// Controls how completed Q values are interpreted by Gumbel search.
-    /// Single Vanilla normalizes them with fresh per-root running bounds and
-    /// treats the search horizon as a value-predicted terminal boundary.
+    /// Selects the episode semantics and search-config namespace.
     pub value_mode: GumbelValueMode,
     pub candidate_options: CandidateOptions,
     pub measure_options: MeasureOptions,
@@ -67,7 +62,6 @@ pub struct GumbelMctsConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct GumbelEpisodeContext {
-    pub opponent: Option<GumbelOpponentContext>,
     /// Mixed into the root Gumbel RNG so episodes sharing a root explore
     /// differently. Zero (the default) preserves the historical seeding;
     /// drivers derive it from the episode id.
@@ -80,7 +74,6 @@ pub struct GumbelSearchContext {
     pub budget_fraction: f32,
     pub budget_step: f32,
     pub selection_temperature: f32,
-    pub opponent: Option<GumbelOpponentContext>,
     pub noise_seed: u64,
     /// See [`GumbelMctsConfig::export_position`]; consulted only when
     /// exporting eval position contexts, never for search internals.
@@ -94,7 +87,6 @@ impl Default for GumbelSearchContext {
             budget_fraction: 1.0,
             budget_step: 0.0,
             selection_temperature: 0.0,
-            opponent: None,
             noise_seed: 0,
             export_position: true,
         }
@@ -146,7 +138,6 @@ pub struct GumbelEpisode<G, C> {
     pub final_measure: MeasureResult<G>,
     pub stop_reason: GumbelStopReason,
     pub search_config_hash: SearchConfigHash,
-    pub competitive: Option<Box<GumbelCompetitiveTrace<G, C>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,18 +164,6 @@ impl GumbelPlayer {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct GumbelCompetitiveTrace<G, C> {
-    pub learner_player: GumbelPlayer,
-    pub opponent_root: G,
-    pub opponent_final_graph: G,
-    pub opponent_root_context: ReplayGraphContext,
-    pub opponent_final_context: ReplayGraphContext,
-    pub opponent_steps: Vec<GumbelStep<G, C>>,
-    pub opponent_final_measure: MeasureResult<G>,
-    pub opponent_stop_reason: GumbelStopReason,
-}
-
 impl<G: PartialEq, C: PartialEq> PartialEq for GumbelEpisode<G, C> {
     fn eq(&self, other: &Self) -> bool {
         self.root_context == other.root_context
@@ -194,31 +173,6 @@ impl<G: PartialEq, C: PartialEq> PartialEq for GumbelEpisode<G, C> {
             && measure_result_eq(&self.final_measure, &other.final_measure)
             && self.stop_reason == other.stop_reason
             && self.search_config_hash == other.search_config_hash
-            && competitive_trace_eq(self.competitive.as_deref(), other.competitive.as_deref())
-    }
-}
-
-fn competitive_trace_eq<G, C>(
-    left: Option<&GumbelCompetitiveTrace<G, C>>,
-    right: Option<&GumbelCompetitiveTrace<G, C>>,
-) -> bool
-where
-    G: PartialEq,
-    C: PartialEq,
-{
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => {
-            left.learner_player == right.learner_player
-                && left.opponent_root == right.opponent_root
-                && left.opponent_final_graph == right.opponent_final_graph
-                && left.opponent_root_context == right.opponent_root_context
-                && left.opponent_final_context == right.opponent_final_context
-                && left.opponent_steps == right.opponent_steps
-                && measure_result_eq(&left.opponent_final_measure, &right.opponent_final_measure)
-                && left.opponent_stop_reason == right.opponent_stop_reason
-        }
-        _ => false,
     }
 }
 

@@ -2,7 +2,7 @@
 # table supplies shared schema knobs only; no selfplay process is launched.
 
 [arch]
-name = "gz-graph-v1"
+name = "gz-graph-v2"
 dim = 128
 layers = 4
 heads = 4
@@ -11,16 +11,23 @@ dropout = 0.1
 activation = "gelu"
 aggregation = "attention"
 global_tokens = 1
+state_input = "joint-board"
 trunk = "exphormer"
 sage_layers = 3
 policy_head = "pointer"
-value_input = "pair"
+value_input = "single"
 value_activation = "tanh"
 subject_encoding = "mean"
-position_encoding = "shared"
+position_encoding = "remaining_budget"
 action_encoding = "kind_prior"
 profile = "graphzero"
 value_hidden = 0
+value_head = "scalar"
+value_bins = 101
+value_min = -1.0
+value_max = 1.0
+value_sigma_ratio = 0.75
+auxiliary_heads = "none"
 
 [trainer]
 optimizer = "adamw"
@@ -53,7 +60,6 @@ prefetch = true
 max_reuse = 0.0
 reuse_gate_interval = 1
 reuse_gate_episodes = 0
-value_mirror = false
 resume = false
 init_checkpoint = ""
 

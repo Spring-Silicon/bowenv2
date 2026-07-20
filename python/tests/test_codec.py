@@ -53,8 +53,6 @@ def test_offset_arithmetic_and_zero_copy_with_attrs() -> None:
     assert view.opponent_reward.tolist() == [0.5, -0.25]
     assert view.opponent_present.tolist() == [1, 1]
     assert view.opponent_state_present.tolist() == [1, 1]
-    assert view.opponent_trajectory_id.tolist() == [7, 7]
-    assert view.opponent_row.tolist() == [2, 3]
     assert view.opponent_node_count.tolist() == [1, 2]
     assert view.opponent_node_tokens.tolist() == [[5, 0, 0], [2, 1, 0]]
     assert view.opponent_edge_count.tolist() == [0, 1]
@@ -191,8 +189,6 @@ def make_batch(attr_dim: int, schema_hash: bytes = SCHEMA_HASH, capacity: int = 
     out[layout["opponent_present"] + 1] = 1
     out[layout["opponent_state_present"]] = 1
     out[layout["opponent_state_present"] + 1] = 1
-    _u64(out, layout["opponent_trajectory_id"], [7, 7])
-    _u32(out, layout["opponent_row"], [2, 3])
     _u32(out, layout["opponent_node_count"], [1, 2])
     _u16(out, layout["opponent_node_tokens"], [5, 0, 0, 2, 1, 0])
     if d:
@@ -225,8 +221,7 @@ def _layout(b: int, n: int, e: int, a: int, s: int, d: int) -> dict[str, int]:
         ("opponent_reward", b * 2),
         ("opponent_present", b),
         ("opponent_state_present", b),
-        ("opponent_trajectory_id", b * 8),
-        ("opponent_row", b * 4),
+        ("reserved_reference", b * 12),
         ("opponent_node_count", b * 4),
         ("opponent_node_tokens", b * n * 2),
         ("opponent_node_attrs", b * n * d * 2),
@@ -267,11 +262,6 @@ def _u16(out: bytearray, offset: int, values: list[int]) -> None:
 def _u32(out: bytearray, offset: int, values: list[int]) -> None:
     for index, value in enumerate(values):
         struct.pack_into("<I", out, offset + index * 4, value)
-
-
-def _u64(out: bytearray, offset: int, values: list[int]) -> None:
-    for index, value in enumerate(values):
-        struct.pack_into("<Q", out, offset + index * 8, value)
 
 
 def _f32(out: bytearray, offset: int, values: list[float]) -> None:

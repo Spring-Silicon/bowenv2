@@ -1,6 +1,8 @@
 # Mid-Episode Subtree Release Implementation Spec
 
-Status: implemented (2026-07-06); review notes in the landing commit
+Status: historical implementation record (implemented 2026-07-06). The
+rationale below describes the pre-change working set; current code drains dead
+handles during search.
 
 Purpose: bound the selfplay working set by the CARRIED search tree
 instead of the episode's full creation history. Today every graph and
@@ -24,7 +26,7 @@ the measured numbers). Contract wins; report conflicts.
 Read before starting:
 
 ```text
-crates/gz-search/src/gumbel.rs      GumbelEpisodeTask.track_created_handles,
+crates/gz-search/src/{gumbel,mcts}/ Gumbel task handle tracking,
                                     compact_subtree / reused_child_task
                                     (the carried-set computation),
                                     GumbelEpisode.created_* ownership

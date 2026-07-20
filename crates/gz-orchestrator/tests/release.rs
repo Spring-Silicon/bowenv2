@@ -9,7 +9,7 @@ use gz_orchestrator::{
     CountedRoots, RootSource, SerialGumbelOrchestrator, ThreadedGumbelOrchestrator,
     ThreadedOrchestratorConfig, WorkerId,
 };
-use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
+use gz_search::{GumbelMcts, GumbelMctsConfig};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -200,9 +200,7 @@ fn serial_orchestrator_releases_completed_episode_handles() {
     let mut orchestrator =
         SerialGumbelOrchestrator::new(WorkerId::new(0), engine, PickCandidate, search());
 
-    let episode = orchestrator
-        .run_from_root(GumbelEpisodeContext::default())
-        .unwrap();
+    let episode = orchestrator.run_from_root().unwrap();
 
     assert_eq!(episode.episode.created_graphs, vec![1]);
     assert_eq!(episode.episode.created_candidates, Vec::<u8>::new());
@@ -227,12 +225,9 @@ fn threaded_orchestrator_releases_each_completed_episode() {
     );
 
     let run = orchestrator
-        .run(
-            vec![CountedRoots::new(2, |engine: &mut ReleaseEngine| {
-                Ok(engine.root())
-            })],
-            GumbelEpisodeContext::default(),
-        )
+        .run(vec![CountedRoots::new(2, |engine: &mut ReleaseEngine| {
+            Ok(engine.root())
+        })])
         .unwrap();
 
     assert_eq!(run.lanes[0].episodes.len(), 2);
@@ -265,10 +260,7 @@ fn threaded_orchestrator_releases_owned_episode_root() {
     );
 
     let run = orchestrator
-        .run(
-            vec![OwnedRoot { remaining: true }],
-            GumbelEpisodeContext::default(),
-        )
+        .run(vec![OwnedRoot { remaining: true }])
         .unwrap();
 
     assert_eq!(run.lanes[0].episodes[0].episode.created_graphs, vec![0, 1]);
@@ -290,7 +282,7 @@ fn search() -> GumbelMcts {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: gz_search::GumbelValueMode::Competitive,
+        value_mode: gz_search::GumbelValueMode::SingleAgent,
         candidate_options: CandidateOptions::default(),
         measure_options: measure_options(),
     })

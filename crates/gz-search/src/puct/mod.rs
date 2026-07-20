@@ -4,8 +4,8 @@ mod types;
 
 pub use task::{PuctEpisodeTask, PuctRootTask};
 pub use types::{
-    PuctEpisode, PuctEpisodeContext, PuctHandleBatch, PuctMctsConfig, PuctOpponentContext,
-    PuctRootResult, PuctRootStats, PuctSearchContext, PuctStep, PuctStopReason,
+    PuctEpisode, PuctEpisodeContext, PuctHandleBatch, PuctMctsConfig, PuctRootResult,
+    PuctRootStats, PuctSearchContext, PuctStep, PuctStopReason,
 };
 
 use crate::mcts::driver::{run_episode, run_root};

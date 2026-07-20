@@ -18,9 +18,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device")
     parser.add_argument("--max-batch", type=int, default=1024)
     parser.add_argument("--no-compile", action="store_true")
-    parser.add_argument("--policy-only", action="store_true")
-    parser.add_argument("--require-state-input", choices=["single-graph", "joint-board"])
-    parser.add_argument("--require-value-input", choices=["single", "scalar", "pair"])
     parser.add_argument("--poll-interval", type=float, default=10.0)
     args = parser.parse_args(argv)
     log = setup("gz.evaluator")
@@ -37,9 +34,6 @@ def main(argv: list[str] | None = None) -> int:
                 compile_model=not args.no_compile,
                 max_batch=args.max_batch,
                 poll_interval=args.poll_interval,
-                policy_only=args.policy_only,
-                required_state_input=args.require_state_input,
-                required_value_input=args.require_value_input,
             )
         else:
             backend = StubBackend()

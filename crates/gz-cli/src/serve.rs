@@ -2,16 +2,16 @@ use gz_features::{
     ENCODING_VERSION, FeatureCollator, FeatureRow, FeatureSchema, RowTargets, decode_feature_row,
     encode_feature_schema_config, encode_training_targets, validate_feature_row_header,
 };
-use gz_replay::{ReplayError, ReplayStore, SampleConfig, SampleKind};
+use gz_replay::{ReplayError, ReplayStore, SampleConfig};
 use std::io::{ErrorKind, Read, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const SAMPLE_PROTOCOL_VERSION: u32 = 10;
+pub const SAMPLE_PROTOCOL_VERSION: u32 = 11;
 
-const HELLO_ACK_FIXED_LEN: usize = 176;
+const HELLO_ACK_FIXED_LEN: usize = 160;
 
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const FRAME_HELLO: u8 = 1;
@@ -255,10 +255,6 @@ impl ReplaySampleSession {
         let value_sign_late_ema = value_sign_late_ema.unwrap_or(-1.0);
         let best_cost = self.store.best_cost().unwrap_or(0.0);
         let symmetric = self.store.symmetric_selfplay_metrics();
-        let root_info = self
-            .store
-            .root_info()
-            .map_err(|_| (ERROR_ENCODING, "corrupt root info"))?;
         let counters = self.store.counters();
         let mut payload = Vec::with_capacity(HELLO_ACK_FIXED_LEN + schema_config.len());
         payload.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
@@ -273,19 +269,13 @@ impl ReplaySampleSession {
         payload.extend_from_slice(&(win_ema as f32).to_le_bytes());
         payload.extend_from_slice(&(latency_ema as f32).to_le_bytes());
         payload.extend_from_slice(&(best_cost as f32).to_le_bytes());
-        payload.extend_from_slice(&u32::from(root_info.is_some()).to_le_bytes());
-        let root = root_info.unwrap_or(gz_replay::ReplayRootInfo {
-            cost: 0.0,
-            node_count: 0,
-            edge_count: 0,
-            candidate_count: 0,
-        });
-        payload.extend_from_slice(&root.cost.to_le_bytes());
-        payload.extend_from_slice(&root.node_count.to_le_bytes());
-        payload.extend_from_slice(&root.edge_count.to_le_bytes());
-        payload.extend_from_slice(&root.candidate_count.to_le_bytes());
-        payload.extend_from_slice(&counters.produced_policy_rows.to_le_bytes());
-        payload.extend_from_slice(&counters.produced_value_rows.to_le_bytes());
+        // Reserved fixed-root telemetry slots. Generated-root training always
+        // reports absent while preserving the sample-protocol layout.
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_f32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
         payload.extend_from_slice(&(value_sign_early_ema as f32).to_le_bytes());
         payload.extend_from_slice(&(value_sign_late_ema as f32).to_le_bytes());
         payload.extend_from_slice(&u32::from(symmetric.is_some()).to_le_bytes());
@@ -317,32 +307,23 @@ impl ReplaySampleSession {
         batch_buf: &mut Vec<u8>,
         target_buf: &mut Vec<u8>,
     ) -> Result<(), (u32, &'static str)> {
-        if payload.len() != 24 {
+        if payload.len() != 20 {
             return Err((ERROR_PROTOCOL, "bad SAMPLE length"));
         }
         let batch = u32::from_le_bytes(payload[0..4].try_into().expect("len checked")) as usize;
-        let kind = match u32::from_le_bytes(payload[4..8].try_into().expect("len checked")) {
-            0 => SampleKind::Any,
-            1 => SampleKind::Policy,
-            2 => SampleKind::Value,
-            _ => return Err((ERROR_BAD_REQUEST, "invalid SAMPLE kind")),
-        };
-        let window = u64::from_le_bytes(payload[8..16].try_into().expect("len checked"));
-        let seed = u64::from_le_bytes(payload[16..24].try_into().expect("len checked"));
+        let window = u64::from_le_bytes(payload[4..12].try_into().expect("len checked"));
+        let seed = u64::from_le_bytes(payload[12..20].try_into().expect("len checked"));
         if batch == 0 || batch > self.max_batch.get() || window == 0 {
             return Err((ERROR_BAD_REQUEST, "invalid SAMPLE request"));
         }
 
         let rows = self
             .store
-            .sample_rows_kind(
-                SampleConfig {
-                    batch: NonZeroUsize::new(batch).expect("batch checked"),
-                    window_rows: NonZeroU64::new(window).expect("window checked"),
-                    seed,
-                },
-                kind,
-            )
+            .sample_rows(SampleConfig {
+                batch: NonZeroUsize::new(batch).expect("batch checked"),
+                window_rows: NonZeroU64::new(window).expect("window checked"),
+                seed,
+            })
             .map_err(sample_error)?;
         let mut feature_rows = Vec::<FeatureRow>::with_capacity(rows.len());
         let mut targets = Vec::<RowTargets>::with_capacity(rows.len());

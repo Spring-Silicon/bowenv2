@@ -29,51 +29,6 @@ pub fn beam_search_config_hash(
     SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
-pub fn random_search_config_hash(
-    max_steps: usize,
-    seed: u64,
-    candidate_options: CandidateOptions,
-    measure_options: MeasureOptions,
-) -> SearchConfigHash {
-    let mut hasher = blake3::Hasher::new();
-    update_chunk(&mut hasher, b"gz-search-random-v1");
-    update_u64(&mut hasher, max_steps as u64);
-    update_u64(&mut hasher, seed);
-    update_candidate_options(&mut hasher, candidate_options);
-    update_measure_options(&mut hasher, measure_options);
-    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
-}
-
-pub fn policy_rollout_config_hash(
-    max_steps: usize,
-    seed: u64,
-    mask_stop: bool,
-    no_backtrack: bool,
-    candidate_options: CandidateOptions,
-    measure_options: MeasureOptions,
-) -> SearchConfigHash {
-    let mut hasher = blake3::Hasher::new();
-    update_chunk(&mut hasher, b"gz-search-categorical-policy-v1");
-    update_u64(&mut hasher, max_steps as u64);
-    update_u64(&mut hasher, seed);
-    update_bool(&mut hasher, mask_stop);
-    update_bool(&mut hasher, no_backtrack);
-    update_candidate_options(&mut hasher, candidate_options);
-    update_measure_options(&mut hasher, measure_options);
-    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
-}
-
-pub fn sampled_tree_search_config_hash(
-    base: SearchConfigHash,
-    reference_mask_stop: bool,
-) -> SearchConfigHash {
-    let mut hasher = blake3::Hasher::new();
-    update_chunk(&mut hasher, b"gz-search-gumbel-sampled-tree-v1");
-    update_chunk(&mut hasher, base.as_bytes());
-    update_bool(&mut hasher, reference_mask_stop);
-    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
-}
-
 pub fn symmetric_selfplay_search_config_hash(base: SearchConfigHash) -> SearchConfigHash {
     let mut hasher = blake3::Hasher::new();
     // v2: retired players preserve their true rewrite count, and corrected
@@ -131,16 +86,13 @@ pub fn gumbel_search_config_hash(
     //     relative to the carried visit baseline. tree_reuse=false keeps
     //     the v7 namespace because fresh-tree semantics did not change.
     match value_mode {
-        GumbelValueMode::SingleVanilla => {
-            update_chunk(&mut hasher, b"gz-search-gumbel-mcts-single-vanilla-v1");
-        }
         GumbelValueMode::SymmetricSelfplay => {
             update_chunk(&mut hasher, b"gz-search-gumbel-mcts-symmetric-selfplay-v2");
         }
-        GumbelValueMode::Competitive if tree_reuse => {
+        GumbelValueMode::SingleAgent if tree_reuse => {
             update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v8");
         }
-        GumbelValueMode::Competitive => {
+        GumbelValueMode::SingleAgent => {
             update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v7");
         }
     }

@@ -123,12 +123,11 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
         ack = sampler.wait_until_ready(
             distill.states,
             alive_check=lambda: check_child(serve, "replay-serve"),
-            policy_rows=True,
         )
-        if ack.produced_rows != distill.states or ack.produced_policy_rows != distill.states:
+        if ack.produced_rows != distill.states:
             raise RuntimeError(
                 "distillation replay row count does not match distill.states: "
-                f"rows={ack.produced_rows} policy_rows={ack.produced_policy_rows}"
+                f"rows={ack.produced_rows}"
             )
 
         model_seed, data_seed = _resolved_trainer_seeds(config.trainer)
@@ -164,7 +163,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
             sampler.max_batch,
             config.trainer.device,
         )
-        loop = TrainerLoop(model, trainer_loop_config(config.trainer, data_seed))
+        loop = TrainerLoop(model, trainer_loop_config(config.trainer))
         window = PerfWindow()
         if config.trainer.prefetch:
             prefetcher = SamplePrefetcher(
@@ -218,7 +217,6 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
                     config.trainer.batch,
                     min(config.trainer.window_rows, distill.states),
                     step_seed(data_seed, step),
-                    kind="policy",
                 )
             train_started = time.perf_counter()
             training_batch = stager.copy(samples.batch, samples.targets)
@@ -242,7 +240,6 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
                     "label_mean": step_metrics.label_mean,
                     "learner_win_rate": step_metrics.learner_win_rate,
                     "produced_rows": distill.states,
-                    "produced_policy_rows": distill.states,
                     "policy_reuse": (step + 1) * config.trainer.batch / distill.states,
                     **window.drain(distill.states, distill.states),
                 }

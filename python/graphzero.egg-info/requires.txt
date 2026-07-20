@@ -1,5 +1,0 @@
-numpy>=1.26
-
-[torch]
-torch>=2.9
-safetensors

@@ -3,7 +3,7 @@ use gz_engine::{
     CandidateOptions, MeasureOptions, MeasureResult, ModelVersion, PortableSearchActionRef,
     ReplayGraphContext, SearchConfigHash, SearchStepRef,
 };
-use gz_eval::{EvalOpponentContext, EvalPositionContext};
+use gz_eval::EvalPositionContext;
 use std::num::NonZeroUsize;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -23,7 +23,6 @@ pub(crate) struct MctsConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct MctsEpisodeContext {
-    pub opponent: Option<MctsOpponentContext>,
     pub noise_seed: u64,
 }
 
@@ -33,7 +32,6 @@ pub struct MctsSearchContext {
     pub budget_fraction: f32,
     pub budget_step: f32,
     pub selection_temperature: f32,
-    pub opponent: Option<MctsOpponentContext>,
     pub noise_seed: u64,
     pub export_position: bool,
 }
@@ -45,7 +43,6 @@ impl Default for MctsSearchContext {
             budget_fraction: 1.0,
             budget_step: 0.0,
             selection_temperature: 0.0,
-            opponent: None,
             noise_seed: 0,
             export_position: true,
         }
@@ -54,16 +51,12 @@ impl Default for MctsSearchContext {
 
 impl MctsSearchContext {
     pub(crate) fn position(self, leaf_depth: usize) -> EvalPositionContext {
-        let opponent = self
-            .opponent
-            .map(|opponent| opponent.aligned_to(u64::from(self.root_step) + leaf_depth as u64));
         if !self.export_position {
             return EvalPositionContext {
                 root_step: 0,
                 leaf_depth: 0,
                 budget_fraction: 0.0,
                 budget_step: 0.0,
-                opponent,
             };
         }
 
@@ -72,26 +65,6 @@ impl MctsSearchContext {
             leaf_depth: leaf_depth as u32,
             budget_fraction: self.budget_fraction,
             budget_step: self.budget_step,
-            opponent,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MctsOpponentContext {
-    pub trajectory_id: u64,
-    pub row_count: u32,
-    pub final_reward: f32,
-}
-
-impl MctsOpponentContext {
-    #[must_use]
-    pub fn aligned_to(self, step: u64) -> EvalOpponentContext {
-        EvalOpponentContext {
-            trajectory_id: self.trajectory_id,
-            row_count: self.row_count,
-            final_reward: self.final_reward,
-            row: step.min(u64::from(self.row_count.saturating_sub(1))) as u32,
         }
     }
 }

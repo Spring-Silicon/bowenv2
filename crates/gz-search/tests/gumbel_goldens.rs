@@ -7,8 +7,8 @@ use gz_engine::{
 };
 use gz_eval::{EvalOutput, EvalRequest, EvalResult, Evaluator};
 use gz_search::{
-    GumbelEpisode, GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext,
-    GumbelRootResult, GumbelRootStats, GumbelSearchContext, GumbelStopReason, GumbelValueMode,
+    GumbelEpisode, GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelRootResult,
+    GumbelRootStats, GumbelSearchContext, GumbelStopReason, GumbelValueMode,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -79,7 +79,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: GumbelValueMode::Competitive,
+        value_mode: GumbelValueMode::SingleAgent,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: measure_options(),
     }
@@ -204,35 +204,6 @@ fn g2_temperature_episode_golden() {
         "g2",
         &episode_fingerprint(&episode),
         "52316d06970ea16295f50d2ae8ebf29286cf3058d42e7c96b18609a2f6202c80",
-    );
-}
-
-#[test]
-fn g3_opponent_stop_reeval_episode_golden() {
-    let mut engine = TestEngine::new().candidates(0, []).reward(0, 0.0);
-    let mut evaluator = RecordedEvaluator::default().row(0, [0.0], 0.25);
-    let search = GumbelMcts::new(config(1));
-
-    let episode = search
-        .run(
-            &mut engine,
-            &mut evaluator,
-            0,
-            GumbelEpisodeContext {
-                opponent: Some(GumbelOpponentContext {
-                    trajectory_id: 11,
-                    row_count: 4,
-                    final_reward: 0.0,
-                }),
-                noise_seed: 0,
-            },
-        )
-        .unwrap();
-
-    assert_fingerprint(
-        "g3",
-        &episode_fingerprint(&episode),
-        "32cc252d7cc2065f022c1e22c564ea9201dd7e3d8c7ea748fe44c1ee6efb70ba",
     );
 }
 

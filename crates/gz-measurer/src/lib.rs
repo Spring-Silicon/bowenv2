@@ -1,23 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! Central reference snapshots and replay projection.
+//! Measured symmetric selfplay projection into replay rows.
 
 mod project;
-mod registry;
 mod service;
 
 pub use project::{
-    CompletedEpisodeArtifact, CompletedEpisodeStep, MeasurerError, ProjectedReference,
-    ProjectionMode, ValueTargetConfig, episode_reward, horizon_value_targets, outcome_target,
-    project_episode, project_episode_with_value_target, sign_target,
-};
-pub use registry::{
-    ArenaGateEvent, ArenaGateRegistry, ArenaRolloutClaim, EpisodeRolloutClaim, GateEvent,
-    PendingChallenge, PolicyModel, ReferenceRegistry, ReferenceSnapshot, ReferenceStep,
-    RolloutOutcome,
+    CompletedEpisodeArtifact, CompletedEpisodeStep, MeasurerError, episode_reward,
+    horizon_value_targets, project_episode,
 };
 pub use service::{
-    MeasureLedgerSnapshot, MeasuredCompetitiveGame, MeasuredEpisode, MeasuredSymmetricGame,
-    MeasurerAdmission, MeasurerAdmissionStatus, MeasurerLaneSummary, MeasurerRunSummary,
-    MeasurerStats, ReplayMeasurer,
+    MeasureLedgerSnapshot, MeasuredSymmetricGame, MeasurerAdmission, MeasurerAdmissionStatus,
+    MeasurerLaneSummary, MeasurerRunSummary, MeasurerStats, ReplayMeasurer,
 };

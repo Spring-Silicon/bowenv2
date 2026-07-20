@@ -108,8 +108,7 @@ wiring only (reviewer check: no admission/parking/release logic
 outside the runner)
 byte-identical stores and counters vs the pre-refactor commit on all
 four paths; batch episode equality oracles untouched
-opponent rollout tests pass unchanged (priority admission, interception,
-version tracking)
+model-lease and hot-swap tests pass unchanged
 replay-path memory: per-lane retention is O(1) in episodes
 a replay append failure surfaces its ReplayError kind in the error
 message (test: fail an append via a closed store or schema mismatch

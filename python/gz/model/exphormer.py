@@ -15,7 +15,7 @@ from gz.codec import BatchView, FeatureSchemaConfig
 
 @dataclass(frozen=True, slots=True)
 class ArchConfig:
-    name: str = "gz-graph-v1"
+    name: str = "gz-graph-v2"
     dim: int = 128
     layers: int = 4
     heads: int = 4
@@ -24,14 +24,14 @@ class ArchConfig:
     activation: str = "gelu"
     aggregation: str = "attention"
     global_tokens: int = 1
-    state_input: str = "single-graph"
+    state_input: str = "joint-board"
     value_input: str = "single"
-    policy_head: str = "mlp"
+    policy_head: str = "pointer"
     trunk: str = "exphormer"
     sage_layers: int = 3
-    value_activation: str = "logit"
+    value_activation: str = "tanh"
     subject_encoding: str = "mean"
-    position_encoding: str = "shared"
+    position_encoding: str = "remaining_budget"
     action_encoding: str = "kind_prior"
     profile: str = "graphzero"
     value_hidden: int = 0
@@ -43,86 +43,39 @@ class ArchConfig:
     auxiliary_heads: str = "none"
 
     def __post_init__(self) -> None:
-        if self.name not in {"gz-graph-v1", "gz-graph-v2"}:
-            raise ValueError("unsupported graph arch name")
         if self.dim <= 0 or self.layers <= 0 or self.heads <= 0 or self.ffn_dim <= 0:
             raise ValueError("arch dimensions must be positive")
         if self.dim % self.heads != 0:
             raise ValueError("dim must be divisible by heads")
         if self.dropout < 0.0 or self.dropout >= 1.0:
             raise ValueError("dropout out of range")
-        if self.activation not in {"gelu", "relu"}:
-            raise ValueError("unsupported activation")
-        if self.aggregation not in {"attention", "gine"}:
-            raise ValueError("unsupported aggregation")
-        if self.global_tokens <= 0:
-            raise ValueError("global_tokens must be positive")
-        if self.state_input not in {"single-graph", "joint-board"}:
-            raise ValueError("unsupported state_input")
-        if self.value_input not in {"single", "scalar", "pair"}:
-            raise ValueError("unsupported value_input")
-        if self.state_input == "joint-board" and self.value_input != "single":
-            raise ValueError("joint-board state_input requires value_input = 'single'")
-        if self.state_input == "joint-board" and self.position_encoding == "policy_budget":
-            raise ValueError("joint-board state_input does not support policy_budget encoding")
-        if self.policy_head not in {"mlp", "pointer"}:
-            raise ValueError("unsupported policy_head")
-        if self.trunk not in {"exphormer", "sage"}:
-            raise ValueError("unsupported trunk")
-        if self.sage_layers <= 0:
-            raise ValueError("sage_layers must be positive")
-        if self.value_activation not in {"logit", "tanh"}:
-            raise ValueError("unsupported value_activation")
-        if self.subject_encoding not in {"mean", "match"}:
-            raise ValueError("unsupported subject_encoding")
-        if self.position_encoding not in {"shared", "policy_budget", "remaining_budget"}:
-            raise ValueError("unsupported position_encoding")
-        if self.action_encoding not in {"kind_prior", "candidate_only"}:
-            raise ValueError("unsupported action_encoding")
-        if self.profile not in {"graphzero", "whittlezero"}:
-            raise ValueError("unsupported profile")
-        if self.value_hidden < 0:
-            raise ValueError("value_hidden must be non-negative")
-        if self.value_head not in {"scalar", "hl_gauss"}:
-            raise ValueError("unsupported value_head")
-        if self.value_bins <= 1:
-            raise ValueError("value_bins must be greater than one")
-        if not math.isfinite(self.value_min) or not math.isfinite(self.value_max):
-            raise ValueError("value support must be finite")
-        if self.value_max <= self.value_min:
-            raise ValueError("value_max must be greater than value_min")
-        if not math.isfinite(self.value_sigma_ratio) or self.value_sigma_ratio <= 0.0:
-            raise ValueError("value_sigma_ratio must be finite and positive")
+        fixed = {
+            "name": "gz-graph-v2",
+            "activation": "gelu",
+            "aggregation": "attention",
+            "global_tokens": 1,
+            "state_input": "joint-board",
+            "value_input": "single",
+            "policy_head": "pointer",
+            "trunk": "exphormer",
+            "sage_layers": 3,
+            "value_activation": "tanh",
+            "subject_encoding": "mean",
+            "position_encoding": "remaining_budget",
+            "action_encoding": "kind_prior",
+            "profile": "graphzero",
+            "value_hidden": 0,
+            "value_head": "scalar",
+            "value_bins": 101,
+            "value_min": -1.0,
+            "value_max": 1.0,
+            "value_sigma_ratio": 0.75,
+        }
+        for field, expected in fixed.items():
+            if getattr(self, field) != expected:
+                raise ValueError(f"{field} must be {expected!r}")
         if self.auxiliary_heads not in {"none", "v8-v32-score"}:
             raise ValueError("unsupported auxiliary_heads")
-        if self.auxiliary_heads == "v8-v32-score" and (
-            self.state_input != "joint-board"
-            or self.value_input != "single"
-            or self.value_head != "scalar"
-            or self.value_activation != "tanh"
-        ):
-            raise ValueError(
-                "v8-v32-score auxiliary heads require joint-board scalar/tanh values"
-            )
-        if self.position_encoding == "remaining_budget" and self.name != "gz-graph-v2":
-            raise ValueError("remaining_budget position encoding requires gz-graph-v2")
-        if self.name == "gz-graph-v2" and (
-            self.profile != "graphzero"
-            or self.trunk != "exphormer"
-            or self.policy_head != "pointer"
-            or self.position_encoding != "remaining_budget"
-        ):
-            raise ValueError("gz-graph-v2 requires the GraphZero Exphormer pointer architecture")
-        if self.profile == "whittlezero" and (
-            self.name != "gz-graph-v1"
-            or self.trunk != "sage"
-            or self.global_tokens != 1
-            or self.policy_head != "pointer"
-            or self.subject_encoding != "match"
-            or self.position_encoding != "policy_budget"
-            or self.action_encoding != "candidate_only"
-        ):
-            raise ValueError("whittlezero profile requires the legacy pointer architecture")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -193,27 +146,8 @@ class ArchConfig:
             "value_sigma_ratio",
             "auxiliary_heads",
         }
-        optional = {
-            "value_input",
-            "state_input",
-            "policy_head",
-            "trunk",
-            "sage_layers",
-            "value_activation",
-            "subject_encoding",
-            "position_encoding",
-            "action_encoding",
-            "profile",
-            "value_hidden",
-            "value_head",
-            "value_bins",
-            "value_min",
-            "value_max",
-            "value_sigma_ratio",
-            "auxiliary_heads",
-        }
         keys = set(value)
-        if not (fields - optional <= keys <= fields):
+        if keys != fields:
             raise ValueError("arch config fields mismatch")
         return cls(
             name=_str(value, "name"),
@@ -225,23 +159,23 @@ class ArchConfig:
             activation=_str(value, "activation"),
             aggregation=_str(value, "aggregation"),
             global_tokens=_int(value, "global_tokens"),
-            state_input=_str(value, "state_input", "single-graph"),
-            value_input=_str(value, "value_input", "single"),
-            policy_head=_str(value, "policy_head", "mlp"),
-            trunk=_str(value, "trunk", "exphormer"),
-            sage_layers=_int(value, "sage_layers", 3),
-            value_activation=_str(value, "value_activation", "logit"),
-            subject_encoding=_str(value, "subject_encoding", "mean"),
-            position_encoding=_str(value, "position_encoding", "shared"),
-            action_encoding=_str(value, "action_encoding", "kind_prior"),
-            profile=_str(value, "profile", "graphzero"),
-            value_hidden=_int(value, "value_hidden", 0),
-            value_head=_str(value, "value_head", "scalar"),
-            value_bins=_int(value, "value_bins", 101),
-            value_min=_float(value, "value_min", -1.0),
-            value_max=_float(value, "value_max", 1.0),
-            value_sigma_ratio=_float(value, "value_sigma_ratio", 0.75),
-            auxiliary_heads=_str(value, "auxiliary_heads", "none"),
+            state_input=_str(value, "state_input"),
+            value_input=_str(value, "value_input"),
+            policy_head=_str(value, "policy_head"),
+            trunk=_str(value, "trunk"),
+            sage_layers=_int(value, "sage_layers"),
+            value_activation=_str(value, "value_activation"),
+            subject_encoding=_str(value, "subject_encoding"),
+            position_encoding=_str(value, "position_encoding"),
+            action_encoding=_str(value, "action_encoding"),
+            profile=_str(value, "profile"),
+            value_hidden=_int(value, "value_hidden"),
+            value_head=_str(value, "value_head"),
+            value_bins=_int(value, "value_bins"),
+            value_min=_float(value, "value_min"),
+            value_max=_float(value, "value_max"),
+            value_sigma_ratio=_float(value, "value_sigma_ratio"),
+            auxiliary_heads=_str(value, "auxiliary_heads"),
         )
 
 
@@ -259,8 +193,6 @@ class GraphBatchTensors(NamedTuple):
     subject_count: object
     action_subjects: object
     position: object
-    opponent_reward: object
-    opponent_present: object
     opponent_state_present: object
     opponent_node_count: object
     opponent_node_tokens: object
@@ -292,14 +224,7 @@ def initialize_policy(model: object, mode: str) -> None:
         return
     if mode != "neutral":
         raise ValueError(f"unsupported policy initializer: {mode}")
-    if model.arch.policy_head != "pointer":
-        raise ValueError("neutral policy initialization requires a pointer head")
-    key = (
-        model.policy.policy_attention.key
-        if model.arch.profile == "whittlezero"
-        else model.policy.pointer_key
-    )
-    _torch().nn.init.zeros_(key.weight)
+    _torch().nn.init.zeros_(model.policy.pointer_key.weight)
 
 
 def initialize_value(model: object, mode: str) -> None:
@@ -310,13 +235,6 @@ def initialize_value(model: object, mode: str) -> None:
     output = model.value[-1]
     for parameter in output.parameters():
         _torch().nn.init.zeros_(parameter)
-
-
-def build_pair_serving_models(model: object) -> tuple[object, object]:
-    if model.arch.value_input != "pair":
-        raise ValueError("pair serving models require a pair value head")
-    serving_class, opponent_class = _pair_serving_model_classes()
-    return serving_class(model).eval(), opponent_class(model).eval()
 
 
 def tensors_from_batch(view: BatchView, device: str | object, pinned_staging: bool = True) -> GraphBatchTensors:
@@ -361,8 +279,6 @@ class BatchStager:
         self.subject_count = _StagedTensor((b, a), index, self.device, self.pin, transfer_stream)
         self.action_subjects = _StagedTensor((b, a, s), index, self.device, self.pin, transfer_stream)
         self.position = _StagedTensor((b, 4), torch.float32, self.device, self.pin, transfer_stream)
-        self.opponent_reward = _StagedTensor((b,), torch.float32, self.device, self.pin, transfer_stream)
-        self.opponent_present = _StagedTensor((b,), torch.float32, self.device, self.pin, transfer_stream)
         self.opponent_state_present = _StagedTensor((b,), torch.float32, self.device, self.pin, transfer_stream)
         self.opponent_node_count = _StagedTensor((b,), index, self.device, self.pin, transfer_stream)
         self.opponent_node_tokens = _StagedTensor((b, n), index, self.device, self.pin, transfer_stream)
@@ -391,7 +307,7 @@ class BatchStager:
         )
         return cls(schema, view.batch_capacity, device, pinned_staging)
 
-    def copy(self, view: BatchView, *, copy_opponent: bool = True) -> GraphBatchTensors:
+    def copy(self, view: BatchView) -> GraphBatchTensors:
         self._check_view(view)
         self.node_count.copy(view.node_count)
         self.node_tokens.copy(view.node_tokens)
@@ -409,21 +325,18 @@ class BatchStager:
         self.subject_count.copy(view.subject_count)
         self.action_subjects.copy(view.action_subjects)
         self.position.copy(view.position)
-        self.opponent_reward.copy(view.opponent_reward)
-        self.opponent_present.copy(view.opponent_present)
         self.opponent_state_present.copy(view.opponent_state_present)
-        if copy_opponent:
-            self.opponent_node_count.copy(view.opponent_node_count)
-            self.opponent_node_tokens.copy(view.opponent_node_tokens)
-            if view.opponent_node_attrs is None:
-                self.opponent_node_attrs.zero_()
-            else:
-                self.opponent_node_attrs.copy(view.opponent_node_attrs)
-            self.opponent_edge_count.copy(view.opponent_edge_count)
-            self.opponent_edge_src.copy(view.opponent_edge_src)
-            self.opponent_edge_dst.copy(view.opponent_edge_dst)
-            self.opponent_edge_type.copy(view.opponent_edge_type)
-            self.opponent_position.copy(view.opponent_position)
+        self.opponent_node_count.copy(view.opponent_node_count)
+        self.opponent_node_tokens.copy(view.opponent_node_tokens)
+        if view.opponent_node_attrs is None:
+            self.opponent_node_attrs.zero_()
+        else:
+            self.opponent_node_attrs.copy(view.opponent_node_attrs)
+        self.opponent_edge_count.copy(view.opponent_edge_count)
+        self.opponent_edge_src.copy(view.opponent_edge_src)
+        self.opponent_edge_dst.copy(view.opponent_edge_dst)
+        self.opponent_edge_type.copy(view.opponent_edge_type)
+        self.opponent_position.copy(view.opponent_position)
         self._record_ready()
         return self.tensors()
 
@@ -443,8 +356,6 @@ class BatchStager:
         self.subject_count.zero_()
         self.action_subjects.fill_(0xFFFF)
         self.position.zero_()
-        self.opponent_reward.zero_()
-        self.opponent_present.zero_()
         self.opponent_state_present.zero_()
         self.opponent_node_count.zero_()
         self.opponent_node_tokens.zero_()
@@ -478,8 +389,6 @@ class BatchStager:
             subject_count=self.subject_count.device_tensor,
             action_subjects=self.action_subjects.device_tensor,
             position=self.position.device_tensor,
-            opponent_reward=self.opponent_reward.device_tensor,
-            opponent_present=self.opponent_present.device_tensor,
             opponent_state_present=self.opponent_state_present.device_tensor,
             opponent_node_count=self.opponent_node_count.device_tensor,
             opponent_node_tokens=self.opponent_node_tokens.device_tensor,
@@ -521,8 +430,6 @@ class BatchStager:
             self.subject_count,
             self.action_subjects,
             self.position,
-            self.opponent_reward,
-            self.opponent_present,
             self.opponent_state_present,
             self.opponent_node_count,
             self.opponent_node_tokens,
@@ -575,112 +482,45 @@ class _StagedTensor:
 def _model_class():
     torch = _torch()
     nn = torch.nn
-    functional = torch.nn.functional
 
     class GraphModel(nn.Module):
         def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
             super().__init__()
             self.schema = schema
             self.arch = arch
-            if arch.position_encoding == "policy_budget":
-                position_dim = 1
-            elif arch.position_encoding == "remaining_budget":
-                position_dim = 2
-            else:
-                position_dim = 4
-            if arch.state_input == "joint-board":
-                position_dim *= 2
-            if arch.profile == "whittlezero":
-                if schema.name != "whittle-v2" or schema.node_attr_dim != 3:
-                    raise ValueError("whittlezero profile requires the whittle-v2 feature schema")
-                # Match WhittleNet construction order so a shared torch seed
-                # produces the same initialized policy.
-                self.position_proj = nn.Linear(position_dim, arch.dim)
-                self.node_proj = nn.Linear(16, arch.dim)
-                self.node_embedding = None
-                self.attr_proj = None
-            else:
-                self.node_embedding = nn.Embedding(schema.node_vocab_size, arch.dim, padding_idx=0)
-                self.attr_proj = nn.Linear(schema.node_attr_dim, arch.dim, bias=False) if schema.node_attr_dim else None
-                self.position_proj = nn.Linear(position_dim, arch.dim)
-                self.node_proj = None
-            self.board_role_embedding = (
-                nn.Embedding(2, arch.dim) if arch.state_input == "joint-board" else None
+            self.node_embedding = nn.Embedding(
+                schema.node_vocab_size,
+                arch.dim,
+                padding_idx=0,
             )
-            if arch.trunk == "sage":
-                self.sage = nn.ModuleList([DirectionalSageLayer(arch) for _ in range(arch.sage_layers)])
-                self.global_tokens = nn.Parameter(torch.zeros(arch.global_tokens, arch.dim))
-                if arch.profile == "whittlezero":
-                    layer = nn.TransformerEncoderLayer(
-                        d_model=arch.dim,
-                        nhead=arch.heads,
-                        dim_feedforward=arch.ffn_dim,
-                        dropout=arch.dropout,
-                        batch_first=True,
-                        norm_first=True,
-                    )
-                    self.transformer = nn.TransformerEncoder(layer, num_layers=arch.layers)
-                    self.layers = None
-                else:
-                    self.transformer = None
-                    self.layers = nn.ModuleList([TransformerBlock(arch) for _ in range(arch.layers)])
-            else:
-                self.sage = None
-                self.transformer = None
-                self.global_tokens = nn.Parameter(torch.zeros(arch.global_tokens, arch.dim))
-                self.layers = nn.ModuleList([GraphLayer(schema, arch) for _ in range(arch.layers)])
-            if arch.name == "gz-graph-v2":
-                self.node_output_norm = nn.LayerNorm(arch.dim)
-                self.global_output_norm = nn.LayerNorm(arch.dim)
-            else:
-                self.node_output_norm = None
-                self.global_output_norm = None
-            if arch.action_encoding == "candidate_only":
-                self.kind_embedding = nn.Embedding(schema.action_kind_vocab_size - 2, arch.dim)
-            else:
-                self.kind_embedding = nn.Embedding(schema.action_kind_vocab_size, arch.dim, padding_idx=0)
-            if arch.subject_encoding == "match":
-                self.match = MatchAttention(schema, arch)
-            else:
-                self.match = None
-            action_feat_dim = _action_feat_dim(arch)
-            if arch.policy_head == "pointer":
-                self.policy = (
-                    WhittlePointerPolicyHead(arch, action_feat_dim)
-                    if arch.profile == "whittlezero"
-                    else PointerPolicyHead(arch, action_feat_dim)
-                )
-            else:
-                self.policy = _mlp(nn, action_feat_dim, arch.ffn_dim, 1, arch.activation, arch.dropout)
-            if arch.profile == "whittlezero":
-                hidden = arch.value_hidden or 256
-                # WhittleNet retains this legacy head even when its TSP pointer
-                # emits STOP directly. Keeping it preserves initialization and
-                # optimizer parity.
-                self.stop = nn.Sequential(nn.Linear(arch.dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
-            else:
-                self.stop = None
+            self.attr_proj = (
+                nn.Linear(schema.node_attr_dim, arch.dim, bias=False)
+                if schema.node_attr_dim
+                else None
+            )
+            self.position_proj = nn.Linear(4, arch.dim)
+            self.board_role_embedding = nn.Embedding(2, arch.dim)
+            self.global_tokens = nn.Parameter(torch.zeros(1, arch.dim))
+            self.layers = nn.ModuleList(
+                [GraphLayer(schema, arch) for _ in range(arch.layers)]
+            )
+            self.node_output_norm = nn.LayerNorm(arch.dim)
+            self.global_output_norm = nn.LayerNorm(arch.dim)
+            self.kind_embedding = nn.Embedding(
+                schema.action_kind_vocab_size,
+                arch.dim,
+                padding_idx=0,
+            )
+            self.policy = PointerPolicyHead(arch, _action_feat_dim(arch))
+            self.value = _mlp(
+                nn,
+                arch.dim,
+                arch.ffn_dim,
+                1,
+                arch.activation,
+                arch.dropout,
+            )
             value_dim = arch.dim
-            if arch.value_input == "scalar":
-                value_dim += 2
-            elif arch.value_input == "pair":
-                value_dim *= 2
-            if arch.profile == "whittlezero":
-                hidden = arch.value_hidden or 256
-                self.value = nn.Sequential(
-                    nn.Linear(value_dim, hidden),
-                    nn.ReLU(),
-                    nn.Linear(hidden, arch.value_bins if arch.value_head == "hl_gauss" else 1),
-                )
-            else:
-                self.value = _mlp(
-                    nn,
-                    value_dim,
-                    arch.value_hidden or arch.ffn_dim,
-                    arch.value_bins if arch.value_head == "hl_gauss" else 1,
-                    arch.activation,
-                    arch.dropout,
-                )
             if arch.auxiliary_heads == "v8-v32-score":
                 auxiliary_hidden = arch.value_hidden or arch.ffn_dim
                 self.horizon_value = _mlp(
@@ -702,41 +542,17 @@ def _model_class():
             else:
                 self.horizon_value = None
                 self.terminal_score = None
-            if arch.value_head == "hl_gauss":
-                edges = torch.linspace(
-                    arch.value_min,
-                    arch.value_max,
-                    arch.value_bins + 1,
-                    dtype=torch.float32,
-                )
-                centers = (edges[:-1] + edges[1:]) * 0.5
-                self.register_buffer("value_bin_edges", edges, persistent=False)
-                self.register_buffer("value_bin_centers", centers, persistent=False)
-            else:
-                self.register_buffer("value_bin_edges", torch.empty(0), persistent=False)
-                self.register_buffer("value_bin_centers", torch.empty(0), persistent=False)
 
         def forward(
             self,
             batch: GraphBatchTensors,
-            value_flip: object = None,
-            value_mirror: bool = False,
             value_trunk_grad_scale: float = 1.0,
         ):
             graph, node_roles = self._model_graph(batch)
             h, g_readout, node_mask = self._encode_graph(graph, node_roles)
-            opponent_readout = None
-            if self.arch.value_input == "pair":
-                opponent_readout = self.opponent_readout(batch)
-            return self._forward_heads(
-                batch,
-                h,
-                g_readout,
-                node_mask,
-                opponent_readout,
-                value_flip,
-                value_mirror,
-                value_trunk_grad_scale,
+            return (
+                self._value_output(g_readout, value_trunk_grad_scale),
+                self._policy_logits(batch, h, g_readout, node_mask),
             )
 
         def policy_logits(self, batch: GraphBatchTensors):
@@ -747,48 +563,11 @@ def _model_class():
         def value_only(
             self,
             batch: GraphBatchTensors,
-            value_flip: object = None,
-            value_mirror: bool = False,
             value_trunk_grad_scale: float = 1.0,
         ):
-            if self.arch.state_input == "joint-board":
-                if value_flip is not None or value_mirror:
-                    raise ValueError("joint-board value does not support pair flipping or mirroring")
-                graph, node_roles = self._model_graph(batch)
-                _, g_readout, _ = self._encode_graph(graph, node_roles)
-                return self._value_output(
-                    batch,
-                    g_readout,
-                    None,
-                    None,
-                    False,
-                    value_trunk_grad_scale,
-                )
-            if self.arch.value_input != "pair":
-                _, g_readout, _ = self._encode_graph(_self_graph(batch))
-                return self._value_output(
-                    batch,
-                    g_readout,
-                    None,
-                    None,
-                    False,
-                    value_trunk_grad_scale,
-                )
-
-            own = _self_graph(batch)
-            opponent = _opponent_graph(batch)
-            if value_flip is not None:
-                own, opponent = _orient_graph_pair(torch, own, opponent, value_flip)
-            pair_capacity = batch.node_count.shape[0]
-            _, pair_readout, _ = self._encode_graph(_concat_graphs(torch, own, opponent))
-            return self._value_output(
-                batch,
-                pair_readout[:pair_capacity],
-                pair_readout[pair_capacity:],
-                None,
-                value_mirror,
-                value_trunk_grad_scale,
-            )
+            graph, node_roles = self._model_graph(batch)
+            _, g_readout, _ = self._encode_graph(graph, node_roles)
+            return self._value_output(g_readout, value_trunk_grad_scale)
 
         def training_forward(
             self,
@@ -816,134 +595,44 @@ def _model_class():
                 g_readout,
             )
 
-        def forward_with_opponent(self, batch: GraphBatchTensors, opponent_readout: object):
-            if self.arch.state_input == "joint-board":
-                raise ValueError("joint-board serving requires raw opponent tensors")
-            graph = _self_graph(batch)
-            h, g_readout, node_mask = self._encode_graph(graph)
-            return self._forward_heads(
-                batch,
-                h,
-                g_readout,
-                node_mask,
-                opponent_readout,
-                None,
-                False,
-                1.0,
-            )
-
-        def opponent_readout(self, batch: GraphBatchTensors):
-            if self.arch.state_input == "joint-board":
-                raise ValueError("joint-board models do not expose a separate opponent readout")
-            _, readout, _ = self._encode_graph(_opponent_graph(batch))
-            return readout
-
         def _model_graph(self, batch: GraphBatchTensors):
-            if self.arch.state_input == "joint-board":
-                return _joint_board_graph(torch, batch)
-            return _self_graph(batch), None
-
-        def _forward_heads(
-            self,
-            batch: GraphBatchTensors,
-            h: object,
-            g_readout: object,
-            node_mask: object,
-            opponent_readout: object,
-            value_flip: object,
-            value_mirror: bool,
-            value_trunk_grad_scale: float,
-        ):
-            logits = self._policy_logits(batch, h, g_readout, node_mask)
-            value_raw = self._value_output(
-                batch,
-                g_readout,
-                opponent_readout,
-                value_flip,
-                value_mirror,
-                value_trunk_grad_scale,
-            )
-            return value_raw, logits
+            return _joint_board_graph(torch, batch)
 
         def _policy_logits(self, batch, h, g_readout, node_mask):
-            policy_readout = g_readout
-            if self.arch.position_encoding == "policy_budget":
-                policy_readout = policy_readout + self.position_proj(batch.position[:, 2:3])
-            if self.arch.action_encoding == "candidate_only":
-                is_candidate = batch.action_kind >= 2
-                kind_index = (batch.action_kind - 2).clamp(0, self.kind_embedding.num_embeddings - 1)
-                kind = self.kind_embedding(kind_index) * is_candidate.unsqueeze(-1)
-            else:
-                kind = self.kind_embedding(batch.action_kind.clamp(0, self.schema.action_kind_vocab_size - 1))
-            if self.match is not None:
-                subject_feat = self.match(h, node_mask, batch.action_subjects, batch.subject_count, kind)
-            else:
-                subject_feat = _subject_pool(torch, h, node_mask, batch.action_subjects, batch.subject_count)
-            readout = policy_readout.unsqueeze(1).expand(-1, batch.action_kind.shape[1], -1)
-            action_parts = (kind, subject_feat, readout)
-            if self.arch.action_encoding == "kind_prior":
-                action_parts = (kind, batch.action_prior.unsqueeze(-1), subject_feat, readout)
-            action_feat = torch.cat(action_parts, dim=-1)
-            if self.arch.policy_head == "pointer":
-                action_index = torch.arange(action_feat.shape[1], device=action_feat.device)
-                action_mask = action_index.unsqueeze(0) < batch.action_count.unsqueeze(1)
-                logits = self.policy(policy_readout, action_feat, action_mask)
-            else:
-                logits = self.policy(action_feat).squeeze(-1)
-
-            return logits
+            kind = self.kind_embedding(
+                batch.action_kind.clamp(0, self.schema.action_kind_vocab_size - 1)
+            )
+            subject_feat = _subject_pool(
+                torch,
+                h,
+                node_mask,
+                batch.action_subjects,
+                batch.subject_count,
+            )
+            readout = g_readout.unsqueeze(1).expand(
+                -1,
+                batch.action_kind.shape[1],
+                -1,
+            )
+            action_feat = torch.cat(
+                (kind, batch.action_prior.unsqueeze(-1), subject_feat, readout),
+                dim=-1,
+            )
+            action_index = torch.arange(action_feat.shape[1], device=action_feat.device)
+            action_mask = action_index.unsqueeze(0) < batch.action_count.unsqueeze(1)
+            return self.policy(g_readout, action_feat, action_mask)
 
         def _value_output(
             self,
-            batch,
             g_readout,
-            opponent_readout,
-            value_flip,
-            value_mirror,
             value_trunk_grad_scale,
         ):
-            g_readout = _scale_gradient(g_readout, value_trunk_grad_scale)
-            value_input = g_readout
-            mirrored_input = None
-            if self.arch.value_input == "scalar":
-                opponent = torch.stack((batch.opponent_reward, batch.opponent_present), dim=-1).to(g_readout.dtype)
-                value_input = torch.cat((g_readout, opponent), dim=-1)
-            elif self.arch.value_input == "pair":
-                opponent_readout = _scale_gradient(
-                    opponent_readout,
-                    value_trunk_grad_scale,
-                )
-                present = (batch.opponent_state_present > 0).unsqueeze(-1)
-                opponent_readout = torch.where(present, opponent_readout, torch.zeros_like(opponent_readout))
-                if value_flip is not None:
-                    flip = value_flip.to(torch.bool).unsqueeze(-1) & present
-                    left = torch.where(flip, opponent_readout, g_readout)
-                    right = torch.where(flip, g_readout, opponent_readout)
-                    value_input = torch.cat((left, right), dim=-1)
-                else:
-                    value_input = torch.cat((g_readout, opponent_readout), dim=-1)
-                if value_mirror:
-                    # whittlezero's mirrored emission, realized at train
-                    # time: the swapped orientation of every pair as a
-                    # second value example (target -z). The trunk readouts
-                    # are shared; only the value MLP runs twice.
-                    mirrored_input = torch.cat((opponent_readout, g_readout), dim=-1)
-            value_raw = self._value_head_output(value_input)
-            if mirrored_input is not None:
-                mirrored_raw = self._value_head_output(mirrored_input)
-                return torch.stack((value_raw, mirrored_raw))
-            return value_raw
+            return self._value_head_output(
+                _scale_gradient(g_readout, value_trunk_grad_scale)
+            )
 
         def _value_head_output(self, value_input):
-            value_raw = self.value(value_input)
-            if self.arch.value_head == "hl_gauss":
-                return value_raw
-            value_raw = value_raw.squeeze(-1)
-            if self.arch.value_activation == "tanh":
-                # whittlezero's bounded value head: the serving-side search
-                # and the MSE training target share the [-1, 1] scale.
-                value_raw = torch.tanh(value_raw)
-            return value_raw
+            return torch.tanh(self.value(value_input).squeeze(-1))
 
         def _training_value_outputs(self, g_readout, value_trunk_grad_scale):
             if self.horizon_value is None or self.terminal_score is None:
@@ -955,98 +644,37 @@ def _model_class():
             return value_raw, horizon_raw, score_raw
 
         def decode_value(self, value_raw):
-            if self.arch.value_head != "hl_gauss":
-                return value_raw
-            probabilities = torch.softmax(value_raw.float(), dim=-1)
-            centers = self.value_bin_centers.to(
-                device=probabilities.device,
-                dtype=probabilities.dtype,
-            )
-            return (probabilities * centers).sum(dim=-1)
+            return value_raw
 
         def _encode_graph(self, graph: GraphStateTensors, node_roles: object = None):
             b, n = graph.node_tokens.shape
             device = graph.node_tokens.device
             node_index = torch.arange(n, device=device)
             node_mask = node_index.unsqueeze(0) < graph.node_count.unsqueeze(1)
-            if self.arch.profile == "whittlezero":
-                h = self.node_proj(_whittle_node_features(torch, graph, node_mask))
-            else:
-                h = self.node_embedding(graph.node_tokens.clamp(0, self.schema.node_vocab_size - 1))
-                if self.attr_proj is not None:
-                    h = h + self.attr_proj(graph.node_attrs)
-            if self.board_role_embedding is not None:
-                if node_roles is None:
-                    raise ValueError("joint-board graph is missing node roles")
-                h = h + self.board_role_embedding(node_roles)
+            h = self.node_embedding(
+                graph.node_tokens.clamp(0, self.schema.node_vocab_size - 1)
+            )
+            if self.attr_proj is not None:
+                h = h + self.attr_proj(graph.node_attrs)
+            if node_roles is None:
+                raise ValueError("joint-board graph is missing node roles")
+            h = h + self.board_role_embedding(node_roles)
             h = h * node_mask.unsqueeze(-1)
 
             g = self.global_tokens.unsqueeze(0).expand(b, -1, -1)
-            if self.arch.position_encoding == "shared":
-                g = g + self.position_proj(graph.position).unsqueeze(1)
-            elif self.arch.position_encoding == "remaining_budget":
-                position = (
-                    _joint_remaining_budget_position(torch, graph.position)
-                    if self.arch.state_input == "joint-board"
-                    else _remaining_budget_position(torch, graph.position)
-                )
-                g = g + self.position_proj(position).unsqueeze(1)
-            if self.sage is not None:
-                for layer in self.sage:
-                    h = layer(h, graph, node_mask)
-                seq = torch.cat((g, h), dim=1)
-                ones = node_mask.new_ones((b, g.shape[1]))
-                seq_mask = torch.cat((ones, node_mask), dim=1)
-                if self.transformer is not None:
-                    seq = self.transformer(seq, src_key_padding_mask=~seq_mask)
-                else:
-                    for layer in self.layers:
-                        seq = layer(seq, seq_mask)
-                g = seq[:, : g.shape[1]]
-                h = seq[:, g.shape[1] :] * node_mask.unsqueeze(-1)
-            else:
-                for layer in self.layers:
-                    h, g = layer(h, g, graph, node_mask)
+            position = _joint_remaining_budget_position(torch, graph.position)
+            g = g + self.position_proj(position).unsqueeze(1)
+            for layer in self.layers:
+                h, g = layer(h, g, graph, node_mask)
 
-            if self.node_output_norm is not None:
-                h = self.node_output_norm(h) * node_mask.unsqueeze(-1)
-                g = self.global_output_norm(g)
+            h = self.node_output_norm(h) * node_mask.unsqueeze(-1)
+            g = self.global_output_norm(g)
 
             return h, g.mean(dim=1), node_mask
 
-    class MatchAttention(nn.Module):
-        # whittlezero's policy_match_attention: the candidate's subject
-        # nodes keep their pattern roles. Slot embeddings are added to the
-        # gathered subject embeddings, the kind/rule embedding queries a
-        # single-head attention over them, and the candidate contributes
-        # [match root, attended] instead of an order-blind mean -- absorb,
-        # distribute, and consensus candidates over the same node set with
-        # different role assignments stop aliasing.
-        def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
-            super().__init__()
-            self.slot_embedding = nn.Embedding(max(1, schema.max_subjects), arch.dim)
-            self.query = nn.Linear(arch.dim, arch.dim, bias=False)
-            self.key = nn.Linear(arch.dim, arch.dim, bias=False)
-            self.value = nn.Linear(arch.dim, arch.dim, bias=False)
-
-        def forward(self, h, node_mask, action_subjects, subject_count, kind):
-            gathered, valid = _gather_subjects(torch, h, node_mask, action_subjects, subject_count)
-            root_valid = valid[:, :, 0].unsqueeze(-1)
-            root = torch.where(root_valid, gathered[:, :, 0, :], torch.zeros_like(gathered[:, :, 0, :]))
-            slots = torch.arange(gathered.shape[2], device=h.device)
-            keyed = gathered + self.slot_embedding(slots).view(1, 1, gathered.shape[2], -1)
-            query = self.query(kind).unsqueeze(2)
-            scores = (query * self.key(keyed)).sum(dim=-1) / math.sqrt(keyed.shape[-1])
-            scores = scores.masked_fill(~valid, -1.0e9)
-            weights = torch.softmax(scores, dim=2)
-            attended = (weights.unsqueeze(-1) * self.value(keyed)).sum(dim=2)
-            has_match = valid.any(dim=2, keepdim=True)
-            attended = torch.where(has_match, attended, torch.zeros_like(attended))
-            return torch.cat((root, attended), dim=-1)
-
     class PointerPolicyHead(nn.Module):
-        # whittlezero's tsp_pointer scorer: a multi-head glimpse over the
-        # action tokens refines the graph readout into a board query, and
+        # A multi-head glimpse over the action tokens refines the graph
+        # readout into a board query, and
         # a single-head dot product against the same tokens produces the
         # logits, tanh-bounded to +/-CLIP. Scores are relative across the
         # action set; the per-candidate MLP scores each action in
@@ -1067,12 +695,8 @@ def _model_class():
                 _activation_module(nn, arch.activation),
                 nn.Linear(arch.ffn_dim, dim),
             )
-            if arch.name == "gz-graph-v2":
-                self.pointer_board_norm = nn.LayerNorm(dim)
-                self.pointer_token_norm = nn.LayerNorm(dim)
-            else:
-                self.pointer_board_norm = None
-                self.pointer_token_norm = None
+            self.pointer_board_norm = nn.LayerNorm(dim)
+            self.pointer_token_norm = nn.LayerNorm(dim)
             self.pointer_key = nn.Linear(dim, dim, bias=False)
 
         def forward(self, readout, action_feat, action_mask):
@@ -1090,106 +714,10 @@ def _model_class():
             board = torch.einsum("bha,bahs->bhs", torch.softmax(scores, dim=-1), values)
             board = self.glimpse_unify(board.reshape(b, dim))
             board = board + self.board_ffn(board)
-            if self.pointer_board_norm is not None:
-                board = self.pointer_board_norm(board)
-                tokens = self.pointer_token_norm(tokens)
+            board = self.pointer_board_norm(board)
+            tokens = self.pointer_token_norm(tokens)
             raw = torch.einsum("bd,bad->ba", board, self.pointer_key(tokens)) / math.sqrt(dim)
             return self.CLIP * torch.tanh(raw)
-
-    class SingleQueryAttention(nn.Module):
-        def __init__(self, dim: int, heads: int, *, project_query: bool) -> None:
-            super().__init__()
-            self.heads = heads
-            self.split = dim // heads
-            self.key = nn.Linear(dim, dim, bias=False)
-            self.value = nn.Linear(dim, dim, bias=False)
-            self.query = nn.Linear(dim, dim, bias=False) if project_query else None
-            self.unify = nn.Linear(dim, dim)
-
-        def forward(self, query, tokens, mask):
-            b, a, d = tokens.shape
-            if self.query is not None:
-                query = self.query(query)
-            query = query.view(b, self.heads, self.split)
-            keys = self.key(tokens).view(b, a, self.heads, self.split)
-            values = self.value(tokens).view(b, a, self.heads, self.split)
-            raw = torch.einsum("bhd,bahd->bha", query, keys) / math.sqrt(self.split)
-            valid = mask.unsqueeze(1)
-            masked = raw.masked_fill(~valid, -1.0e9)
-            masked = torch.where(valid.any(dim=-1, keepdim=True), masked, torch.zeros_like(masked))
-            weights = torch.softmax(masked, dim=-1) * valid.to(raw.dtype)
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
-            out = torch.einsum("bha,bahd->bhd", weights, values).reshape(b, d)
-            return self.unify(out), raw
-
-    class WhittlePointerPolicyHead(nn.Module):
-        CLIP = 10.0
-
-        def __init__(self, arch: ArchConfig, action_feat_dim: int) -> None:
-            super().__init__()
-            self.token_proj = nn.Linear(action_feat_dim, arch.dim)
-            self.board_attention = SingleQueryAttention(arch.dim, arch.heads, project_query=True)
-            self.board_ffn = nn.Sequential(
-                nn.Linear(arch.dim, arch.ffn_dim),
-                nn.GELU(),
-                nn.Linear(arch.ffn_dim, arch.dim),
-            )
-            self.policy_attention = SingleQueryAttention(arch.dim, 1, project_query=False)
-
-        def forward(self, readout, action_feat, action_mask):
-            tokens = self.token_proj(action_feat)
-            board, _ = self.board_attention(readout, tokens, action_mask)
-            board = board + self.board_ffn(board)
-            _, raw = self.policy_attention(board, tokens, action_mask)
-            return self.CLIP * torch.tanh(raw[:, 0, :])
-
-    class DirectionalSageLayer(nn.Module):
-        # whittlezero's DirectionalSAGELayer (model/graphsage.py) over gz
-        # edge lists: sigmoid messages from each edge endpoint, max-pooled
-        # per direction via scatter-amax, combined with the node state and
-        # L2-normalized. Edge types are ignored, matching the original.
-        # Sigmoid messages are strictly positive, so a zeros-initialized
-        # amax scatter reproduces the original's masked-max-else-zero.
-        def __init__(self, arch: ArchConfig) -> None:
-            super().__init__()
-            self.real_edges_only = arch.profile == "whittlezero"
-            self.src_msg = nn.Linear(arch.dim, arch.dim)
-            self.dst_msg = nn.Linear(arch.dim, arch.dim)
-            self.combine = nn.Linear(arch.dim * 3, arch.dim)
-
-        def forward(self, h, graph: GraphStateTensors, node_mask):
-            b, n, d = h.shape
-            src, dst, mask = _valid_edges(torch, graph, node_mask)
-            if self.real_edges_only:
-                mask = mask & (graph.edge_type < 2)
-            weight = mask.unsqueeze(-1).to(h.dtype)
-            fwd = torch.sigmoid(self.src_msg(_gather_nodes(torch, h, src))) * weight
-            rev = torch.sigmoid(self.dst_msg(_gather_nodes(torch, h, dst))) * weight
-            fwd_agg = torch.zeros((b, n, d), dtype=h.dtype, device=h.device)
-            fwd_agg.scatter_reduce_(1, dst.unsqueeze(-1).expand(-1, -1, d), fwd, reduce="amax", include_self=True)
-            rev_agg = torch.zeros((b, n, d), dtype=h.dtype, device=h.device)
-            rev_agg.scatter_reduce_(1, src.unsqueeze(-1).expand(-1, -1, d), rev, reduce="amax", include_self=True)
-            out = torch.relu(self.combine(torch.cat((h, fwd_agg, rev_agg), dim=-1)))
-            out = functional.normalize(out, p=2.0, dim=-1, eps=1e-8)
-            return out * node_mask.unsqueeze(-1)
-
-    class TransformerBlock(nn.Module):
-        # Pre-norm encoder block (whittlezero's build_transformer_encoder
-        # with norm_first=True), run over [global tokens | nodes] with the
-        # padded nodes masked out of the keys.
-        def __init__(self, arch: ArchConfig) -> None:
-            super().__init__()
-            self.norm_attn = nn.LayerNorm(arch.dim)
-            self.norm_ffn = nn.LayerNorm(arch.dim)
-            self.attn = DenseAttention(arch)
-            self.drop = nn.Dropout(arch.dropout)
-            self.ffn = _mlp(nn, arch.dim, arch.ffn_dim, arch.dim, arch.activation, arch.dropout)
-
-        def forward(self, seq, seq_mask):
-            x = self.norm_attn(seq)
-            seq = seq + self.drop(self.attn(x, x, seq_mask))
-            seq = seq + self.ffn(self.norm_ffn(seq))
-            return seq
 
     class GraphLayer(nn.Module):
         def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
@@ -1201,7 +729,7 @@ def _model_class():
             self.norm_read_g = nn.LayerNorm(arch.dim)
             self.norm_ffn_h = nn.LayerNorm(arch.dim)
             self.norm_ffn_g = nn.LayerNorm(arch.dim)
-            self.edge = EdgeAttention(schema, arch) if arch.aggregation == "attention" else EdgeGine(schema, arch)
+            self.edge = EdgeAttention(schema, arch)
             self.exchange = DenseAttention(arch)
             self.read = DenseAttention(arch)
             self.ffn_h = _mlp(nn, arch.dim, arch.ffn_dim, arch.dim, arch.activation, arch.dropout)
@@ -1254,25 +782,6 @@ def _model_class():
             out = out / denom.clamp_min(1.0e-6).unsqueeze(-1)
             return self.o_proj(out.reshape(b, n, d))
 
-    class EdgeGine(nn.Module):
-        def __init__(self, schema: FeatureSchemaConfig, arch: ArchConfig) -> None:
-            super().__init__()
-            self.edge_type_count = schema.edge_type_count
-            self.k_proj = nn.Linear(arch.dim, arch.dim, bias=False)
-            self.edge_embedding = nn.Embedding(max(1, 2 * schema.edge_type_count), arch.dim)
-            self.eps = nn.Parameter(torch.zeros(()))
-            self.out = _mlp(nn, arch.dim, arch.ffn_dim, arch.dim, arch.activation, arch.dropout)
-            self.activation = _activation(functional, arch.activation)
-
-        def forward(self, h, graph: GraphStateTensors, node_mask):
-            b, n, d = h.shape
-            src, dst, typ, mask = _mirrored_edges(torch, graph, node_mask, self.edge_type_count)
-            src_h = _gather_nodes(torch, self.k_proj(h), src)
-            msg = self.activation(src_h + self.edge_embedding(typ)) * mask.unsqueeze(-1).to(h.dtype)
-            out = torch.zeros((b, n, d), dtype=h.dtype, device=h.device)
-            out.scatter_add_(1, dst.unsqueeze(-1).expand(-1, -1, d), msg)
-            return self.out((1.0 + self.eps) * h + out)
-
     class DenseAttention(nn.Module):
         def __init__(self, arch: ArchConfig) -> None:
             super().__init__()
@@ -1297,29 +806,6 @@ def _model_class():
             return self.o(out)
 
     return GraphModel
-
-
-@lru_cache(maxsize=1)
-def _pair_serving_model_classes():
-    nn = _torch().nn
-
-    class PairServingModel(nn.Module):
-        def __init__(self, model: object) -> None:
-            super().__init__()
-            self.model = model
-
-        def forward(self, batch: GraphBatchTensors, opponent_readout: object):
-            return self.model.forward_with_opponent(batch, opponent_readout)
-
-    class OpponentReadoutModel(nn.Module):
-        def __init__(self, model: object) -> None:
-            super().__init__()
-            self.model = model
-
-        def forward(self, batch: GraphBatchTensors):
-            return self.model.opponent_readout(batch)
-
-    return PairServingModel, OpponentReadoutModel
 
 
 def _remaining_budget_position(torch: object, position: object):
@@ -1411,79 +897,6 @@ def _joint_board_graph(torch: object, batch: GraphBatchTensors):
     return graph, node_roles
 
 
-def _self_graph(batch: GraphBatchTensors) -> GraphStateTensors:
-    return GraphStateTensors(
-        node_count=batch.node_count,
-        node_tokens=batch.node_tokens,
-        node_attrs=batch.node_attrs,
-        edge_count=batch.edge_count,
-        edge_src=batch.edge_src,
-        edge_dst=batch.edge_dst,
-        edge_type=batch.edge_type,
-        position=batch.position,
-    )
-
-
-def _opponent_graph(batch: GraphBatchTensors) -> GraphStateTensors:
-    return GraphStateTensors(
-        node_count=batch.opponent_node_count,
-        node_tokens=batch.opponent_node_tokens,
-        node_attrs=batch.opponent_node_attrs,
-        edge_count=batch.opponent_edge_count,
-        edge_src=batch.opponent_edge_src,
-        edge_dst=batch.opponent_edge_dst,
-        edge_type=batch.opponent_edge_type,
-        position=batch.opponent_position,
-    )
-
-
-def _orient_graph_pair(
-    torch: object,
-    own: GraphStateTensors,
-    opponent: GraphStateTensors,
-    flip: object,
-) -> tuple[GraphStateTensors, GraphStateTensors]:
-    def select(left: object, right: object) -> object:
-        mask = flip.reshape((flip.shape[0],) + (1,) * (left.ndim - 1))
-        return torch.where(mask, right, left)
-
-    return (
-        GraphStateTensors(*(select(left, right) for left, right in zip(own, opponent, strict=True))),
-        GraphStateTensors(*(select(right, left) for left, right in zip(own, opponent, strict=True))),
-    )
-
-
-def _concat_graphs(
-    torch: object,
-    left: GraphStateTensors,
-    right: GraphStateTensors,
-) -> GraphStateTensors:
-    return GraphStateTensors(
-        *(torch.cat((left_value, right_value), dim=0) for left_value, right_value in zip(left, right, strict=True))
-    )
-
-
-def _valid_edges(torch: object, graph: GraphStateTensors, node_mask: object):
-    e = graph.edge_src.shape[1]
-    edge_index = torch.arange(e, device=graph.edge_src.device)
-    mask = edge_index.unsqueeze(0) < graph.edge_count.unsqueeze(1)
-    mask = mask & (graph.edge_src < graph.node_count.unsqueeze(1))
-    mask = mask & (graph.edge_dst < graph.node_count.unsqueeze(1))
-    dummy = torch.arange(e, dtype=graph.edge_src.dtype, device=graph.edge_src.device)
-    dummy = (dummy % node_mask.shape[1]).unsqueeze(0)
-    src = (
-        torch.where(mask, graph.edge_src, dummy)
-        .clamp(0, node_mask.shape[1] - 1)
-        .to(torch.int64)
-    )
-    dst = (
-        torch.where(mask, graph.edge_dst, dummy)
-        .clamp(0, node_mask.shape[1] - 1)
-        .to(torch.int64)
-    )
-    return src, dst, mask
-
-
 def _mirrored_edges(
     torch: object,
     graph: GraphStateTensors,
@@ -1527,30 +940,8 @@ def _gather_nodes(torch: object, h: object, index: object):
     return torch.gather(h, 1, index.unsqueeze(-1).expand(-1, -1, d))
 
 
-def _whittle_node_features(torch: object, graph: GraphStateTensors, node_mask: object):
-    tokens = graph.node_tokens.to(torch.int64)
-    op = torch.zeros_like(tokens)
-    op = torch.where(tokens == 17, 1, op)
-    op = torch.where(tokens == 18, 2, op)
-    op = torch.where(tokens == 20, 3, op)
-    op = torch.where(tokens == 21, 4, op)
-    op = torch.where(tokens == 19, 5, op)
-    op = torch.where(tokens == 22, 6, op)
-    op_features = torch.nn.functional.one_hot(op, num_classes=7).to(graph.node_attrs.dtype)
-
-    input_mask = (tokens >= 1) & (tokens <= 6)
-    input_slots = torch.nn.functional.one_hot((tokens - 1).clamp(0, 5), num_classes=6)
-    input_slots = input_slots.to(graph.node_attrs.dtype) * input_mask.unsqueeze(-1)
-    features = torch.cat((op_features, input_slots, graph.node_attrs), dim=-1)
-    return features * node_mask.unsqueeze(-1)
-
-
 def _action_feat_dim(arch: ArchConfig) -> int:
-    # kind + subject encoding + readout; match mode contributes [root,
-    # attended] where mean mode contributes one pooled block.
-    subject_dim = arch.dim * 2 if arch.subject_encoding == "match" else arch.dim
-    prior_dim = 1 if arch.action_encoding == "kind_prior" else 0
-    return arch.dim * 2 + subject_dim + prior_dim
+    return arch.dim * 3 + 1
 
 
 def _gather_subjects(
@@ -1598,14 +989,6 @@ def _activation_module(nn: object, activation: str):
         return nn.GELU()
     if activation == "relu":
         return nn.ReLU()
-    raise ValueError("unsupported activation")
-
-
-def _activation(functional: object, activation: str):
-    if activation == "gelu":
-        return functional.gelu
-    if activation == "relu":
-        return functional.relu
     raise ValueError("unsupported activation")
 
 

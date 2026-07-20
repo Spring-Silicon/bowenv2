@@ -11,7 +11,7 @@ from gz.codec import BatchView, OutputEncoder
 from gz.checkpoints import CheckpointSource, DirectorySource, ResolvedCheckpoint
 from gz.common.tags import ModelVersion
 from gz.model import build
-from gz.model.exphormer import ArchConfig, BatchStager, build_pair_serving_models
+from gz.model.exphormer import ArchConfig, BatchStager
 from gz.model.stub import STUB_MODEL_VERSION, stub
 from gz.proto import ERROR_CAPACITY, ERROR_PROTOCOL, ERROR_SCHEMA, Hello, ProtocolError
 
@@ -153,16 +153,6 @@ class _ServingSlot:
     manifest: object
     runner: object
     model_version: ModelVersion
-    # Whether the model's value output is already bounded. Logit heads
-    # need the serve-side tanh -- BCE trains P(win) = sigmoid(2x), so
-    # E[z] = tanh(x) is the calibrated search value -- but tanh heads
-    # are bounded at the model and a second tanh double-compresses.
-    value_bounded: bool = False
-    value_bin_centers: object = None
-    opponent_runner: object = None
-    opponent_dim: int = 0
-    policy_only: bool = False
-    raw_opponent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,10 +162,6 @@ class StagedEval:
     ready_event: object
     row_count: int
     action_counts: object
-    opponent_trajectory_id: object
-    opponent_row: object
-    opponent_state_present: object
-    opponent_cached: bool
     encoder: OutputEncoder
 
 
@@ -201,7 +187,6 @@ class PendingEval:
 
 PIPELINE_DEPTH = 3
 HOST_SLOTS = PIPELINE_DEPTH
-MAX_OPPONENT_CACHE_ROWS = 4096
 
 
 class TorchBackend:
@@ -214,9 +199,6 @@ class TorchBackend:
         compile_mode: str = "reduce-overhead",
         max_batch: int = 1024,
         poll_interval: float = 10.0,
-        policy_only: bool = False,
-        required_state_input: str | None = None,
-        required_value_input: str | None = None,
     ) -> None:
         torch = _torch()
         self.source = DirectorySource(source) if isinstance(source, (str, Path)) else source
@@ -225,9 +207,6 @@ class TorchBackend:
         self.compile_mode = compile_mode
         self.max_batch = max_batch
         self.poll_interval = poll_interval
-        self.policy_only = policy_only
-        self.required_state_input = required_state_input
-        self.required_value_input = required_value_input
         self.resolved = self.source.resolve_latest()
         self._active = self._build_slot(self.resolved)
         self._active_generation = INITIAL_MODEL_GENERATION
@@ -255,8 +234,6 @@ class TorchBackend:
         self._loader_started = False
         self._stop_polling = threading.Event()
         self._timings = EvalTimingStats()
-        self._opponent_cache: dict[tuple[str, int, int], object] = {}
-        self._opponent_cache_blocks: list[object] = []
 
     def handshake(self, hello: Hello) -> ModelVersion:
         if hello.feature_schema_hash != self._active.manifest.feature_schema_hash:
@@ -300,7 +277,6 @@ class TorchBackend:
             for _ in range(HOST_SLOTS)
             )
             self._slot_index = 0
-        self._clear_opponent_cache()
         self._warm_slot(self._active, self.stager, WARMUP_RUNS)
         if self.poll_interval > 0.0:
             self._start_loader()
@@ -341,7 +317,6 @@ class TorchBackend:
         with self._pending_lock:
             self._resident_versions.add(version_key)
             self._adopting_version = None
-        self._clear_opponent_cache()
         torch = _torch()
         allocated = (
             torch.cuda.memory_allocated(self.device) if self.device.type == "cuda" else 0
@@ -374,7 +349,6 @@ class TorchBackend:
         del self._slots_by_version[version_key]
         with self._pending_lock:
             self._resident_versions.discard(version_key)
-        self._clear_opponent_cache()
 
     def eval(self, view: BatchView, model_version: ModelVersion | None = None) -> EvalResult:
         return self.finish(self.launch(self.stage(view, model_version)))
@@ -394,17 +368,7 @@ class TorchBackend:
         stager = self._stagers[self._stage_index]
         self._stage_index = (self._stage_index + 1) % len(self._stagers)
         active = self._serving_slot(model_version)
-        opponent_cached = self._opponent_rows_cached(
-            active,
-            view.opponent_trajectory_id[: view.row_count],
-            view.opponent_row[: view.row_count],
-            view.opponent_state_present[: view.row_count],
-        )
-        tensors = stager.copy(
-            view,
-            copy_opponent=active.raw_opponent
-            or (active.opponent_runner is not None and not opponent_cached),
-        )
+        tensors = stager.copy(view)
         action_counts = view.action_count[: view.row_count].copy()
         self._timings.record_stage(time.perf_counter() - started)
         # The encoder rides with the batch: finish() runs after the NEXT
@@ -415,10 +379,6 @@ class TorchBackend:
             ready_event=stager.ready_event,
             row_count=view.row_count,
             action_counts=action_counts,
-            opponent_trajectory_id=view.opponent_trajectory_id[: view.row_count].copy(),
-            opponent_row=view.opponent_row[: view.row_count].copy(),
-            opponent_state_present=view.opponent_state_present[: view.row_count].copy(),
-            opponent_cached=opponent_cached,
             encoder=self._encoder,
         )
 
@@ -426,25 +386,13 @@ class TorchBackend:
         active = staged.serving
         started = time.perf_counter()
         self._wait_for_stage(staged.ready_event)
-        if active.policy_only:
-            logits = self._run_policy_runner(active.runner, staged.tensors)
-            value_raw = logits.new_zeros(logits.shape[0])
-        else:
-            opponent_readout = self._opponent_readout(active, staged)
-            if opponent_readout is None:
-                value_raw, logits = self._run_runner(active.runner, staged.tensors)
-            else:
-                value_raw, logits = self._run_runner(
-                    active.runner,
-                    staged.tensors,
-                    opponent_readout,
-                )
+        value_raw, logits = self._run_runner(active.runner, staged.tensors)
         if not self._host_slots:
             self._timings.record_launch(time.perf_counter() - started)
             return PendingEval(
                 model_version=active.model_version,
                 slot=None,
-                value_raw=self._serve_value(active, value_raw),
+                value_raw=value_raw,
                 logits=logits,
                 row_count=staged.row_count,
                 action_counts=staged.action_counts,
@@ -458,7 +406,7 @@ class TorchBackend:
         # the event marks when the pinned copies are complete.
         with torch.inference_mode():
             rows = staged.row_count
-            slot.values[:rows].copy_(self._serve_value(active, value_raw)[:rows].float(), non_blocking=True)
+            slot.values[:rows].copy_(value_raw[:rows].float(), non_blocking=True)
             slot.logits[:rows].copy_(logits[:rows].float(), non_blocking=True)
         slot.event.record()
         self._timings.record_launch(time.perf_counter() - started)
@@ -518,20 +466,6 @@ class TorchBackend:
             payload=payload,
         )
 
-    def _serve_value(self, slot: _ServingSlot, value_raw: object) -> object:
-        if slot.value_bin_centers is not None:
-            torch = _torch()
-            probabilities = torch.softmax(value_raw.float(), dim=-1)
-            centers = slot.value_bin_centers.to(
-                device=probabilities.device,
-                dtype=probabilities.dtype,
-            )
-            return (probabilities * centers).sum(dim=-1)
-        if slot.value_bounded:
-            return value_raw
-        torch = _torch()
-        return torch.tanh(value_raw)
-
     def _serving_slot(self, model_version: ModelVersion | None) -> _ServingSlot:
         if model_version is None:
             return self._active
@@ -545,87 +479,6 @@ class TorchBackend:
             return
         torch = _torch()
         torch.cuda.current_stream(self.device).wait_event(ready_event)
-
-    def _opponent_rows_cached(
-        self,
-        slot: _ServingSlot,
-        trajectory_ids: object,
-        rows: object,
-        present: object,
-    ) -> bool:
-        if slot.opponent_runner is None:
-            return False
-        version = slot.model_version.hex()
-        for trajectory_id, row, state_present in zip(trajectory_ids, rows, present):
-            if not state_present:
-                continue
-            trajectory_id = int(trajectory_id)
-            if trajectory_id == 0:
-                return False
-            if (version, trajectory_id, int(row)) not in self._opponent_cache:
-                return False
-        return True
-
-    def _opponent_readout(self, slot: _ServingSlot, staged: StagedEval) -> object:
-        if slot.opponent_runner is None:
-            return None
-        if staged.opponent_cached:
-            return self._cached_opponent_readout(slot, staged)
-        readout = self._run_opponent_runner(slot.opponent_runner, staged.tensors)
-        self._cache_opponent_readout(slot, staged, readout)
-        return readout
-
-    def _cached_opponent_readout(self, slot: _ServingSlot, staged: StagedEval) -> object:
-        torch = _torch()
-        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        zero = torch.zeros(slot.opponent_dim, dtype=dtype, device=self.device)
-        version = slot.model_version.hex()
-        rows = []
-        for index in range(staged.tensors.node_count.shape[0]):
-            if index >= staged.row_count or not staged.opponent_state_present[index]:
-                rows.append(zero)
-                continue
-            key = (
-                version,
-                int(staged.opponent_trajectory_id[index]),
-                int(staged.opponent_row[index]),
-            )
-            rows.append(self._opponent_cache[key])
-        return torch.stack(rows)
-
-    def _cache_opponent_readout(
-        self,
-        slot: _ServingSlot,
-        staged: StagedEval,
-        readout: object,
-    ) -> None:
-        version = slot.model_version.hex()
-        new_rows: dict[tuple[str, int, int], int] = {}
-        for index in range(staged.row_count):
-            if not staged.opponent_state_present[index]:
-                continue
-            trajectory_id = int(staged.opponent_trajectory_id[index])
-            if trajectory_id == 0:
-                continue
-            key = (version, trajectory_id, int(staged.opponent_row[index]))
-            if key not in self._opponent_cache and key not in new_rows:
-                new_rows[key] = index
-        if not new_rows:
-            return
-        if len(new_rows) > MAX_OPPONENT_CACHE_ROWS:
-            return
-        if len(self._opponent_cache) + len(new_rows) > MAX_OPPONENT_CACHE_ROWS:
-            self._clear_opponent_cache()
-        torch = _torch()
-        indexes = torch.tensor(tuple(new_rows.values()), dtype=torch.int64, device=self.device)
-        block = readout.detach().index_select(0, indexes).clone()
-        self._opponent_cache_blocks.append(block)
-        for block_index, key in enumerate(new_rows):
-            self._opponent_cache[key] = block[block_index]
-
-    def _clear_opponent_cache(self) -> None:
-        self._opponent_cache.clear()
-        self._opponent_cache_blocks.clear()
 
     def _start_loader(self) -> None:
         if self._loader_started:
@@ -684,65 +537,28 @@ class TorchBackend:
         arch = ArchConfig.from_dict(resolved.manifest.arch_config)
         if arch.name != resolved.manifest.arch_name:
             raise ValueError("manifest arch name mismatch")
-        if self.required_state_input is not None and arch.state_input != self.required_state_input:
-            raise ValueError(
-                f"checkpoint state_input must be {self.required_state_input!r}, got {arch.state_input!r}"
-            )
-        if self.required_value_input is not None and arch.value_input != self.required_value_input:
-            raise ValueError(
-                f"checkpoint value_input must be {self.required_value_input!r}, got {arch.value_input!r}"
-            )
         model = build(resolved.manifest.feature_schema, arch)
         from gz.checkpoints.weights import load_state_dict
 
         model.load_state_dict(load_state_dict(resolved.weights_path))
         model.to(self.device)
         model.eval()
-        value_bin_centers = (
-            model.value_bin_centers
-            if arch.value_head == "hl_gauss"
-            else None
-        )
-        torch = _torch()
-        opponent_runner = None
-        serving_model = model.policy_logits if self.policy_only else model
-        if not self.policy_only and arch.value_input == "pair":
-            serving_model, opponent_model = build_pair_serving_models(model)
-            opponent_runner = (
-                torch.compile(opponent_model, fullgraph=True, mode=self.compile_mode)
-                if self.compile_model
-                else opponent_model
-            )
         runner = (
-            torch.compile(serving_model, fullgraph=True, mode=self.compile_mode)
+            _torch().compile(model, fullgraph=True, mode=self.compile_mode)
             if self.compile_model
-            else serving_model
+            else model
         )
         return _ServingSlot(
             manifest=resolved.manifest,
             runner=runner,
             model_version=resolved.manifest.model_version,
-            value_bounded=self.policy_only
-            or arch.value_head == "hl_gauss"
-            or arch.value_activation == "tanh",
-            value_bin_centers=None if self.policy_only else value_bin_centers,
-            opponent_runner=opponent_runner,
-            opponent_dim=arch.dim if opponent_runner is not None else 0,
-            policy_only=self.policy_only,
-            raw_opponent=arch.state_input == "joint-board",
         )
 
     def _warm_slot(self, slot: _ServingSlot, stager: BatchStager, count: int) -> None:
         for _ in range(count):
             tensors = stager.dummy()
             self._wait_for_stage(stager.ready_event)
-            if slot.policy_only:
-                self._run_policy_runner(slot.runner, tensors)
-            elif slot.opponent_runner is None:
-                self._run_runner(slot.runner, tensors)
-            else:
-                opponent_readout = self._run_opponent_runner(slot.opponent_runner, tensors)
-                self._run_runner(slot.runner, tensors, opponent_readout)
+            self._run_runner(slot.runner, tensors)
             if self.device.type == "cuda":
                 _torch().cuda.current_stream(self.device).synchronize()
 
@@ -750,33 +566,7 @@ class TorchBackend:
         self,
         runner: object,
         tensors: object,
-        opponent_readout: object = None,
     ) -> tuple[object, object]:
-        torch = _torch()
-        with torch.inference_mode():
-            if self.device.type == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    if opponent_readout is None:
-                        return runner(tensors)
-                    return runner(tensors, opponent_readout)
-            if opponent_readout is None:
-                return runner(tensors)
-            return runner(tensors, opponent_readout)
-
-    def _run_opponent_runner(self, runner: object, tensors: object) -> object:
-        torch = _torch()
-        with torch.inference_mode():
-            if self.device.type == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    readout = runner(tensors)
-            else:
-                readout = runner(tensors)
-            # Compiled CUDA-graph outputs are static replay buffers. The
-            # serving graph and cache need an owned readout that survives
-            # the opponent runner's next replay.
-            return readout.clone()
-
-    def _run_policy_runner(self, runner: object, tensors: object) -> object:
         torch = _torch()
         with torch.inference_mode():
             if self.device.type == "cuda":

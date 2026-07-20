@@ -8,14 +8,6 @@ pub trait RootSource<E: GraphEngine> {
     fn episode_roots_are_owned(&self) -> bool {
         false
     }
-
-    /// The single root every episode shares, for sources that have one
-    /// (fixed-root mode). Opponent rollouts replay from it without
-    /// consuming the episode budget. None for per-episode roots.
-    fn fixed_root(&mut self, engine: &mut E) -> EngineResult<Option<E::Graph>> {
-        let _ = engine;
-        Ok(None)
-    }
 }
 
 impl<E, F> RootSource<E> for F

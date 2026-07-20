@@ -1,9 +1,7 @@
 mod common;
 
 use common::{episode_with_feature_rows, episode_with_rows, feature_schema_config, measure};
-use gz_replay::{
-    ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig, SampleKind,
-};
+use gz_replay::{ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 
 #[test]
@@ -19,7 +17,7 @@ fn append_then_read_back_episode() {
 }
 
 #[test]
-fn competitive_pair_is_atomic_and_counts_as_one_game() {
+fn episode_pair_is_atomic_and_counts_as_one_game() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
     let (primary_record, primary_rows) = episode_with_rows(2);
@@ -120,27 +118,7 @@ fn symmetric_metrics_track_both_seats_and_survive_reopen() {
 }
 
 #[test]
-fn sampled_tree_rejects_two_trajectory_replay() {
-    let dir = common::temp_dir();
-    let store = ReplayStore::open(dir.path()).unwrap();
-    store.ensure_data_mode(ReplayDataMode::SampledTree).unwrap();
-    let (primary_record, primary_rows) = episode_with_rows(1);
-    let (secondary_record, secondary_rows) = episode_with_rows(4);
-
-    assert_eq!(
-        store
-            .append_episode_pair(
-                (&primary_record, &primary_rows),
-                (&secondary_record, &secondary_rows),
-            )
-            .unwrap_err(),
-        ReplayError::InvalidRecord
-    );
-    assert_eq!(store.counters().produced_rows, 0);
-}
-
-#[test]
-fn rejected_competitive_pair_writes_neither_record() {
+fn rejected_episode_pair_writes_neither_record() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
     let (primary_record, primary_rows) = episode_with_rows(1);
@@ -162,33 +140,14 @@ fn rejected_competitive_pair_writes_neither_record() {
 }
 
 #[test]
-fn replay_data_mode_prevents_standard_and_sampled_tree_mixing() {
-    let dir = common::temp_dir();
-    let store = ReplayStore::open(dir.path()).unwrap();
-    store.ensure_data_mode(ReplayDataMode::SampledTree).unwrap();
-    store.ensure_data_mode(ReplayDataMode::SampledTree).unwrap();
-    assert_eq!(
-        store
-            .ensure_data_mode(ReplayDataMode::Standard)
-            .unwrap_err(),
-        ReplayError::DataModeMismatch
-    );
-    drop(store);
-    let reopened = ReplayStore::open(dir.path()).unwrap();
-    assert_eq!(
-        reopened
-            .ensure_data_mode(ReplayDataMode::Standard)
-            .unwrap_err(),
-        ReplayError::DataModeMismatch
-    );
-
+fn replay_data_mode_prevents_standard_and_symmetric_mixing() {
     let legacy_dir = common::temp_dir();
     let legacy = ReplayStore::open(legacy_dir.path()).unwrap();
     let (record, rows) = episode_with_rows(1);
     legacy.append_episode(&record, &rows).unwrap();
     assert_eq!(
         legacy
-            .ensure_data_mode(ReplayDataMode::SampledTree)
+            .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
             .unwrap_err(),
         ReplayError::DataModeMismatch
     );
@@ -211,109 +170,6 @@ fn replay_data_mode_prevents_standard_and_sampled_tree_mixing() {
         reopened.data_mode().unwrap(),
         ReplayDataMode::SymmetricSelfplay
     );
-}
-
-#[test]
-fn single_vanilla_mode_requires_raw_reward_targets_without_references() {
-    let dir = common::temp_dir();
-    let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_data_mode(ReplayDataMode::SingleVanilla)
-        .unwrap();
-    let (mut record, mut rows) = episode_with_rows(2);
-    record.outcome.reference = None;
-    record.outcome.value_target = Some(record.outcome.learner_reward);
-    for row in &mut rows {
-        row.value_target = Some(record.outcome.learner_reward);
-    }
-
-    store.append_episode(&record, &rows).unwrap();
-    assert_eq!(store.counters().produced_value_rows, 2);
-    assert_eq!(store.win_rate_ema(), None);
-
-    let mut wrong_record = record.clone();
-    let mut wrong_rows = rows.clone();
-    wrong_record.outcome.value_target = Some(4.0);
-    for row in &mut wrong_rows {
-        row.value_target = Some(4.0);
-    }
-    assert_eq!(
-        store
-            .append_episode(&wrong_record, &wrong_rows)
-            .unwrap_err(),
-        ReplayError::InvalidRecord
-    );
-
-    assert_eq!(
-        store
-            .append_episode_pair((&record, &rows), (&record, &rows))
-            .unwrap_err(),
-        ReplayError::InvalidRecord
-    );
-    drop(store);
-
-    let reopened = ReplayStore::open(dir.path()).unwrap();
-    assert_eq!(reopened.data_mode().unwrap(), ReplayDataMode::SingleVanilla);
-    assert_eq!(
-        reopened
-            .ensure_data_mode(ReplayDataMode::Standard)
-            .unwrap_err(),
-        ReplayError::DataModeMismatch
-    );
-}
-
-#[test]
-fn graded_data_mode_accepts_fractional_targets_and_isolates_reward_scale() {
-    let dir = common::temp_dir();
-    let store = ReplayStore::open(dir.path()).unwrap();
-    let mode = ReplayDataMode::graded(false, 0.1).unwrap();
-    store.ensure_data_mode(mode).unwrap();
-    let (mut record, mut rows) = episode_with_rows(1);
-    record.outcome.value_target = Some(0.5);
-    rows[0].value_target = Some(0.5);
-
-    store.append_episode(&record, &rows).unwrap();
-    assert_eq!(
-        store
-            .ensure_data_mode(ReplayDataMode::graded(false, 0.2).unwrap())
-            .unwrap_err(),
-        ReplayError::DataModeMismatch
-    );
-    assert_eq!(
-        store
-            .ensure_data_mode(ReplayDataMode::graded(true, 0.1).unwrap())
-            .unwrap_err(),
-        ReplayError::DataModeMismatch
-    );
-    drop(store);
-
-    let reopened = ReplayStore::open(dir.path()).unwrap();
-    reopened.ensure_data_mode(mode).unwrap();
-    assert_eq!(
-        reopened
-            .ensure_data_mode(ReplayDataMode::Standard)
-            .unwrap_err(),
-        ReplayError::DataModeMismatch
-    );
-}
-
-#[test]
-fn graded_data_mode_rejects_non_finite_out_of_range_and_wrong_sign_targets() {
-    let dir = common::temp_dir();
-    let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_data_mode(ReplayDataMode::graded(false, 0.1).unwrap())
-        .unwrap();
-
-    for target in [f32::NAN, f32::INFINITY, -1.1, 1.1, -0.5] {
-        let (mut record, mut rows) = episode_with_rows(1);
-        record.outcome.value_target = Some(target);
-        rows[0].value_target = Some(target);
-        assert_eq!(
-            store.append_episode(&record, &rows).unwrap_err(),
-            ReplayError::InvalidRecord
-        );
-    }
 }
 
 #[test]
@@ -381,45 +237,26 @@ fn admission_rejects_invalid_row_shapes() {
 }
 
 #[test]
-fn value_target_validation_accepts_hard_signs_only() {
+fn symmetric_value_target_validation_accepts_only_minus_one_zero_or_one() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
+    store
+        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
+        .unwrap();
+    let draw = symmetric_episode(1, -5.0, 0.0);
+    store
+        .append_episode_pair((&draw.0, &draw.1), (&draw.0, &draw.1))
+        .unwrap();
 
-    // Exact tie (learner_reward == reference reward): coin-flipped to a
-    // hard sign at projection, so either +/-1 appends and 0.0 rejects.
-    let (mut tie_record, mut tie_rows) = episode_with_rows(1);
-    tie_record.outcome.value_target = Some(1.0);
-    tie_record.outcome.reference.as_mut().unwrap().reward = 5.0;
-    tie_rows[0].value_target = Some(1.0);
-    assert_eq!(
-        store.append_episode(&tie_record, &tie_rows).unwrap(),
-        ReplayEpisodeId::new(0)
-    );
-
-    let (mut zero_record, mut zero_rows) = episode_with_rows(1);
-    zero_record.outcome.value_target = Some(0.0);
-    zero_record.outcome.reference.as_mut().unwrap().reward = 5.0;
-    zero_rows[0].value_target = Some(0.0);
-    assert_eq!(
-        store.append_episode(&zero_record, &zero_rows).unwrap_err(),
-        ReplayError::InvalidRecord
-    );
-
-    let (mut loss_record, mut loss_rows) = episode_with_rows(1);
-    loss_record.outcome.value_target = Some(-1.0);
-    loss_record.outcome.reference.as_mut().unwrap().reward = 6.0;
-    loss_rows[0].value_target = Some(-1.0);
-    assert_eq!(
-        store.append_episode(&loss_record, &loss_rows).unwrap(),
-        ReplayEpisodeId::new(1)
-    );
-
-    let (mut invalid_record, mut invalid_rows) = episode_with_rows(1);
+    let (mut invalid_record, mut invalid_rows) = symmetric_episode(1, -5.0, 1.0);
     invalid_record.outcome.value_target = Some(0.5);
     invalid_rows[0].value_target = Some(0.5);
     assert_eq!(
         store
-            .append_episode(&invalid_record, &invalid_rows)
+            .append_episode_pair(
+                (&invalid_record, &invalid_rows),
+                (&invalid_record, &invalid_rows),
+            )
             .unwrap_err(),
         ReplayError::InvalidRecord
     );
@@ -657,37 +494,28 @@ fn retention_deletes_old_episodes_and_clamps_sampling() {
         store.append_episode(&record, &rows).unwrap();
     }
 
-    let counters = store.counters();
-    assert_eq!(counters.produced_rows, 80);
-    assert_eq!(counters.produced_policy_rows, 40);
-    assert_eq!(counters.produced_value_rows, 80);
+    assert_eq!(store.counters().produced_rows, 80);
     // Old episodes are gone; recent ones remain.
     assert!(store.episode(ReplayEpisodeId::new(0)).unwrap().is_none());
     assert!(store.episode(ReplayEpisodeId::new(19)).unwrap().is_some());
 
     // Sampling a huge window never touches deleted rows.
     for seed in 0..50 {
-        for kind in [SampleKind::Any, SampleKind::Policy, SampleKind::Value] {
-            let sampled = store
-                .sample_rows_kind(
-                    SampleConfig {
-                        batch: std::num::NonZeroUsize::new(8).unwrap(),
-                        window_rows: std::num::NonZeroU64::new(1_000_000).unwrap(),
-                        seed,
-                    },
-                    kind,
-                )
-                .unwrap();
-            assert_eq!(sampled.len(), 8);
-        }
+        let sampled = store
+            .sample_rows(SampleConfig {
+                batch: std::num::NonZeroUsize::new(8).unwrap(),
+                window_rows: std::num::NonZeroU64::new(1_000_000).unwrap(),
+                seed,
+            })
+            .unwrap();
+        assert_eq!(sampled.len(), 8);
     }
 
     // Floors survive reopen.
     drop(store);
     let reopened = ReplayStore::open_with_retention(dir.path(), Some(20)).unwrap();
     assert!(reopened.episode(ReplayEpisodeId::new(0)).unwrap().is_none());
-    assert_eq!(reopened.counters().produced_policy_rows, 40);
-    assert_eq!(reopened.counters().produced_value_rows, 80);
+    assert_eq!(reopened.counters().produced_rows, 80);
     let sampled = reopened
         .sample_rows(SampleConfig {
             batch: std::num::NonZeroUsize::new(8).unwrap(),
@@ -711,7 +539,7 @@ fn outcome_emas_track_recent_episodes() {
     store.append_episode(&record, &rows).unwrap();
 
     let (cost, len, stop) = store.outcome_emas().unwrap();
-    assert!((cost - f64::from(-record.outcome.learner_reward)).abs() < 1e-9);
+    assert!((cost - f64::from(-record.outcome.reward)).abs() < 1e-9);
     assert!((len - 2.0).abs() < 1e-9);
     assert!((stop - f64::from(u8::from(record.outcome.stopped))).abs() < 1e-9);
 
@@ -729,7 +557,7 @@ fn terminal_cost_telemetry_survives_reopen() {
     let store = ReplayStore::open(dir.path()).unwrap();
     let (record, rows) = episode_with_rows(2);
     store.append_episode(&record, &rows).unwrap();
-    let expected_cost = f64::from(-record.outcome.learner_reward);
+    let expected_cost = f64::from(-record.outcome.reward);
     assert_eq!(store.outcome_emas().unwrap().0, expected_cost);
     assert_eq!(store.best_cost(), Some(expected_cost));
 
@@ -741,7 +569,7 @@ fn terminal_cost_telemetry_survives_reopen() {
     let (mut next_record, mut next_rows) = episode_with_rows(2);
     let next_measure = measure(Some(7.0), true, true);
     next_record.final_measure = next_measure.clone();
-    next_record.outcome.learner_reward = 7.0;
+    next_record.outcome.reward = 7.0;
     for row in &mut next_rows {
         row.final_measure = next_measure.clone();
         row.reward_target = Some(7.0);
@@ -779,29 +607,22 @@ fn win_rate_ema_distinguishes_all_loss_from_unseeded() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
     assert!(store.win_rate_ema().is_none());
-
-    // Unlabeled episodes leave the EMA unseeded.
-    let (mut record, mut rows) = episode_with_rows(1);
-    record.outcome.value_target = None;
-    record.outcome.reference = None;
-    rows[0].value_target = None;
-    store.append_episode(&record, &rows).unwrap();
-    assert!(store.win_rate_ema().is_none());
+    store
+        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
+        .unwrap();
 
     // A labeled loss seeds an honest 0.0 rate, distinct from unseeded.
-    let (mut record, mut rows) = episode_with_rows(1);
-    record.outcome.value_target = Some(-1.0);
-    record.outcome.reference.as_mut().unwrap().reward = 5.0;
-    rows[0].value_target = Some(-1.0);
-    store.append_episode(&record, &rows).unwrap();
+    let loss = symmetric_episode(1, -6.0, -1.0);
+    let win = symmetric_episode(1, -5.0, 1.0);
+    store
+        .append_episode_pair((&loss.0, &loss.1), (&win.0, &win.1))
+        .unwrap();
     assert!((store.win_rate_ema().unwrap() - 0.0).abs() < 1e-9);
 
     // A win moves it by the EMA weight.
-    let (mut record, mut rows) = episode_with_rows(1);
-    record.outcome.value_target = Some(1.0);
-    record.outcome.reference.as_mut().unwrap().reward = 5.0;
-    rows[0].value_target = Some(1.0);
-    store.append_episode(&record, &rows).unwrap();
+    store
+        .append_episode_pair((&win.0, &win.1), (&loss.0, &loss.1))
+        .unwrap();
     assert!((store.win_rate_ema().unwrap() - 0.01).abs() < 1e-9);
 }
 
@@ -828,8 +649,7 @@ fn symmetric_episode(
     let (mut record, mut rows) = episode_with_rows(row_count);
     let final_measure = measure(Some(reward), true, true);
     record.final_measure = final_measure.clone();
-    record.outcome.reference = None;
-    record.outcome.learner_reward = reward;
+    record.outcome.reward = reward;
     record.outcome.value_target = Some(value_target);
     record.outcome.stopped = false;
     for row in &mut rows {

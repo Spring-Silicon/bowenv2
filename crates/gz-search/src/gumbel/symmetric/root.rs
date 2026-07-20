@@ -8,8 +8,8 @@ use super::super::{
 };
 use crate::support::{internal, step_ref};
 use crate::work::{
-    ApplyWork, EngineIdentity, EvalModel, EvalOpponentWork, EvalWork, ExpandResult, ExpandWork,
-    MeasureWork, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
+    ApplyWork, EngineIdentity, EvalOpponentWork, EvalWork, ExpandResult, ExpandWork, MeasureWork,
+    SearchPoll, SearchWork, SearchWorkResult, WorkToken,
 };
 use crate::{SearchAction, SearchCandidateSummary};
 use gz_engine::{
@@ -488,7 +488,6 @@ where
                 .collect(),
             request: request.clone(),
             measure_options: self.config.measure_options,
-            model: EvalModel::Episode,
             opponent: Some(Box::new(EvalOpponentWork {
                 graph: board.graphs[opponent.index()],
                 position: self.board_position(board, opponent),
@@ -1160,7 +1159,6 @@ where
                         .collect(),
                     request: request.clone(),
                     measure_options: self.config.measure_options,
-                    model: EvalModel::Episode,
                     opponent: Some(Box::new(EvalOpponentWork {
                         graph: board.graphs[opponent.index()],
                         position: self.board_position(board, opponent),
@@ -2109,7 +2107,6 @@ where
                 leaf_depth: 0,
                 budget_fraction: 0.0,
                 budget_step: 0.0,
-                opponent: None,
             };
         }
         EvalPositionContext {
@@ -2117,7 +2114,6 @@ where
             leaf_depth: 0,
             budget_fraction: super::super::schedule::budget_fraction(self.config.max_steps, step),
             budget_step: 1.0 / self.config.max_steps.max(1) as f32,
-            opponent: None,
         }
     }
 

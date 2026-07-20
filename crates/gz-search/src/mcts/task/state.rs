@@ -20,6 +20,8 @@ pub(super) enum RootTaskState<G, C, R> {
     Done,
 }
 
+// Keeping node expansion inline avoids an allocation on every evaluation handoff.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum PendingRootWork<G, C, R> {
     ExpandNode {
         token: WorkToken,
@@ -39,11 +41,6 @@ pub(super) enum PendingRootWork<G, C, R> {
         run: RunState<R>,
         action: usize,
     },
-    StopEval {
-        token: WorkToken,
-        run: RunState<R>,
-        request: EvalRequest,
-    },
 }
 
 impl<G, C, R> PendingRootWork<G, C, R> {
@@ -51,8 +48,7 @@ impl<G, C, R> PendingRootWork<G, C, R> {
         match self {
             Self::ExpandNode { token, .. }
             | Self::EvalNode { token, .. }
-            | Self::Apply { token, .. }
-            | Self::StopEval { token, .. } => *token,
+            | Self::Apply { token, .. } => *token,
         }
     }
 }

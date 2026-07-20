@@ -5,7 +5,7 @@ use common::{TestEngine, measure_options};
 use gz_engine::{CandidateOptions, GraphEngine, ModelVersion, PortableSearchActionRef};
 use gz_eval::EvalOutput;
 use gz_search::{
-    EngineIdentity, EvalModel, ExpandResult, ExpandedCandidate, GumbelEpisodeContext, GumbelMcts,
+    EngineIdentity, ExpandResult, ExpandedCandidate, GumbelEpisodeContext, GumbelMcts,
     GumbelMctsConfig, GumbelPlayer, GumbelValueMode, SearchPoll, SearchWork, SearchWorkResult,
     SymmetricEpisode, SymmetricSelfplayEpisodeTask,
 };
@@ -141,10 +141,7 @@ fn drive_with_reuse_options(
         &search,
         EngineIdentity::from_engine(&engine),
         0,
-        GumbelEpisodeContext {
-            noise_seed: 17,
-            opponent: None,
-        },
+        GumbelEpisodeContext { noise_seed: 17 },
         wave_batching,
     );
     let mut evals = 0;
@@ -185,7 +182,6 @@ fn drive_with_reuse_options(
                         engine.measure(work.graph, work.options).unwrap(),
                     )),
                     SearchWork::Eval(work) => {
-                        assert_eq!(work.model, EvalModel::Episode);
                         assert!(work.opponent.is_some());
                         evals += 1;
                         pending_evals.push((token, work));
@@ -496,10 +492,7 @@ fn resumed_position_uses_requested_pair_state_and_player() {
         [false, false],
         GumbelPlayer::Two,
         [HashSet::new(), HashSet::new()],
-        GumbelEpisodeContext {
-            noise_seed: 17,
-            opponent: None,
-        },
+        GumbelEpisodeContext { noise_seed: 17 },
     );
 
     let SearchPoll::Work(SearchWork::Expand(work)) = task.poll().unwrap() else {
@@ -735,10 +728,7 @@ fn speculative_apply_handles_are_returned_when_search_is_aborted() {
         &search,
         EngineIdentity::from_engine(&engine),
         0,
-        GumbelEpisodeContext {
-            noise_seed: 17,
-            opponent: None,
-        },
+        GumbelEpisodeContext { noise_seed: 17 },
         true,
     );
     let mut speculative_applies = 0;
@@ -1068,10 +1058,7 @@ fn aborting_a_promoted_tree_returns_every_retained_handle() {
         &search,
         EngineIdentity::from_engine(&engine),
         0,
-        GumbelEpisodeContext {
-            noise_seed: 17,
-            opponent: None,
-        },
+        GumbelEpisodeContext { noise_seed: 17 },
         false,
     );
     let mut created_graphs = Vec::new();

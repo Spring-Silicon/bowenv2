@@ -4,8 +4,8 @@ use common::{TestEngine, measure_options};
 use gz_engine::ModelVersion;
 use gz_eval::{EvalOutput, EvalRequest, EvalResult, Evaluator};
 use gz_search::{
-    GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext, GumbelSearchContext,
-    GumbelStopReason, GumbelValueMode, SearchAction, considered_visit_sequence,
+    GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelSearchContext, GumbelStopReason,
+    GumbelValueMode, SearchAction, considered_visit_sequence,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -78,7 +78,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: GumbelValueMode::Competitive,
+        value_mode: GumbelValueMode::SingleAgent,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: measure_options(),
     }
@@ -177,113 +177,6 @@ fn stop_is_selected_through_eval_policy_and_never_applied() {
     assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
     assert!(matches!(episode.steps[0].action, SearchAction::Stop));
     assert!(engine.apply_calls.is_empty());
-}
-
-#[test]
-fn policy_rollout_preserves_base_stop_mask_setting() {
-    for mask_stop in [false, true] {
-        let mut engine = TestEngine::new()
-            .candidates(0, [1])
-            .candidates(20, [])
-            .apply(0, 1, 20)
-            .reward(20, 20.0);
-        let mut evaluator =
-            RecordedEvaluator::default()
-                .row(0, [-10.0, 10.0], 0.0)
-                .row(20, [0.0], 0.0);
-        let mut base_config = config(3);
-        base_config.mask_stop = mask_stop;
-        let search = GumbelMcts::new(base_config).policy_rollout();
-
-        assert_eq!(search.config().mask_stop, mask_stop);
-
-        let episode = search
-            .run(
-                &mut engine,
-                &mut evaluator,
-                0,
-                GumbelEpisodeContext::default(),
-            )
-            .unwrap();
-
-        if mask_stop {
-            assert!(matches!(
-                episode.steps[0].action,
-                SearchAction::Candidate(1)
-            ));
-            assert_eq!(engine.apply_calls, vec![(0, 1)]);
-            assert_eq!(episode.final_graph, 20);
-        } else {
-            assert!(matches!(episode.steps[0].action, SearchAction::Stop));
-            assert!(engine.apply_calls.is_empty());
-            assert_eq!(episode.final_graph, 0);
-        }
-        assert_eq!(episode.stop_reason, GumbelStopReason::SelectedStop);
-    }
-}
-
-#[test]
-fn policy_rollout_can_override_base_stop_mask_setting() {
-    let mut base_config = config(3);
-    base_config.mask_stop = false;
-    let search = GumbelMcts::new(base_config)
-        .with_policy_rollout_mask_stop(true)
-        .policy_rollout();
-
-    assert!(search.config().mask_stop);
-}
-
-#[test]
-fn policy_sample_rollout_is_categorical_top_one_without_tree_reuse() {
-    let mut base_config = config(7);
-    base_config.mask_stop = true;
-    base_config.no_backtrack = true;
-    base_config.tree_reuse = true;
-    let search = GumbelMcts::new(base_config).policy_sample_rollout();
-    let sampled = search.config();
-
-    assert_eq!(sampled.simulations, NonZeroUsize::MIN);
-    assert_eq!(sampled.max_considered_actions, NonZeroUsize::MIN);
-    assert_eq!(sampled.gumbel_scale, 1.0);
-    assert_eq!(sampled.gumbel_noise_overlap, -1.0);
-    assert!(!sampled.tree_reuse);
-    assert!(!sampled.no_backtrack);
-    assert!(sampled.mask_stop);
-}
-
-#[test]
-fn policy_sample_rollout_noise_seeds_produce_distinct_policy_actions() {
-    let search = GumbelMcts::new(config(1)).policy_sample_rollout();
-    let mut selected = std::collections::HashSet::new();
-
-    for noise_seed in 1..=32 {
-        let mut engine = TestEngine::new()
-            .candidates(0, [1, 2])
-            .candidates(20, [])
-            .candidates(30, [])
-            .apply(0, 1, 20)
-            .apply(0, 2, 30)
-            .reward(20, 20.0)
-            .reward(30, 30.0);
-        let mut evaluator = RecordedEvaluator::default()
-            .row(0, [0.0, 0.0, -100.0], 0.0)
-            .row(20, [0.0], 0.0)
-            .row(30, [0.0], 0.0);
-        let episode = search
-            .run(
-                &mut engine,
-                &mut evaluator,
-                0,
-                GumbelEpisodeContext {
-                    noise_seed,
-                    opponent: None,
-                },
-            )
-            .unwrap();
-        selected.insert(episode.steps[0].selected_action);
-    }
-
-    assert_eq!(selected.len(), 2);
 }
 
 #[test]
@@ -403,37 +296,6 @@ fn search_config_hash_changes_when_seed_changes() {
         GumbelMcts::new(reuse).search_config_hash(),
         GumbelMcts::new(config(1)).search_config_hash()
     );
-}
-
-#[test]
-fn opponent_context_uses_same_index_alignment_and_stop_terminal_row() {
-    let mut engine = TestEngine::new().candidates(0, []).reward(0, 0.0);
-    let mut evaluator = RecordedEvaluator::default().row(0, [0.0], 0.0);
-    let search = GumbelMcts::new(config(1));
-
-    let result = search
-        .search_root(
-            &mut engine,
-            &mut evaluator,
-            0,
-            GumbelSearchContext {
-                root_step: 1,
-                opponent: Some(GumbelOpponentContext {
-                    trajectory_id: 9,
-                    row_count: 4,
-                    final_reward: -2.0,
-                }),
-                ..GumbelSearchContext::default()
-            },
-        )
-        .unwrap();
-
-    assert!(matches!(result.selected_action, SearchAction::Stop));
-    assert_eq!(evaluator.requests.len(), 2);
-    assert_eq!(evaluator.requests[0].position.leaf_depth, 0);
-    assert_eq!(evaluator.requests[0].position.opponent_row(), Some(1));
-    assert_eq!(evaluator.requests[1].position.leaf_depth, 2);
-    assert_eq!(evaluator.requests[1].position.opponent_row(), Some(3));
 }
 
 #[test]
@@ -627,23 +489,6 @@ fn no_backtrack_collapses_to_stop_when_every_rewrite_revisits() {
 }
 
 #[test]
-fn opponent_context_aligns_to_leaf_time_and_clamps_to_horizon() {
-    let opponent = GumbelOpponentContext {
-        trajectory_id: 9,
-        row_count: 4,
-        final_reward: -104.0,
-    };
-    assert_eq!(opponent.aligned_to(1).row, 1);
-    assert_eq!(opponent.aligned_to(64).row, 3, "clamped to the last row");
-    let empty = GumbelOpponentContext {
-        trajectory_id: 9,
-        row_count: 0,
-        final_reward: 0.0,
-    };
-    assert_eq!(empty.aligned_to(5).row, 0);
-}
-
-#[test]
 fn tree_reuse_preserves_decisions_with_fewer_evals_on_stable_fixture() {
     // On this stable fixture, shifted-tree reuse saves evals while preserving
     // the selected path. This guards deterministic orchestration parity; the
@@ -778,80 +623,4 @@ fn tree_reuse_carries_shifted_root_ledgers() {
         fresh_episode.steps[1].root_search_value,
         reuse_episode.steps[1].root_search_value
     );
-}
-
-#[test]
-fn single_vanilla_uses_a_predicted_horizon_and_measures_once() {
-    let mut engine = TestEngine::new()
-        .candidates(0, [1])
-        .candidates(10, [2])
-        .candidates(20, [])
-        .apply(0, 1, 10)
-        .apply(10, 2, 20)
-        .reward(10, -10.0);
-    let mut evaluator = RecordedEvaluator::default()
-        .row(0, [8.0, -8.0], -20.0)
-        .row(10, [8.0, -8.0], -10.0)
-        .row(20, [0.0], -1.0);
-    let mut cfg = config(1);
-    cfg.simulations = NonZeroUsize::new(8).unwrap();
-    cfg.max_considered_actions = NonZeroUsize::new(2).unwrap();
-    cfg.value_mode = GumbelValueMode::SingleVanilla;
-
-    let episode = GumbelMcts::new(cfg)
-        .run(
-            &mut engine,
-            &mut evaluator,
-            0,
-            GumbelEpisodeContext::default(),
-        )
-        .unwrap();
-
-    assert_eq!(episode.final_graph, 10);
-    assert_eq!(engine.measure_calls, vec![10]);
-    let evaluated_graphs = evaluator
-        .requests
-        .iter()
-        .map(|request| request.context.graph.graph_hash.as_bytes()[0])
-        .collect::<Vec<_>>();
-    assert_eq!(evaluated_graphs, vec![0, 10]);
-}
-
-#[test]
-fn single_vanilla_policy_is_invariant_to_positive_affine_values() {
-    fn run(root_value: f32, left_value: f32, right_value: f32) -> Vec<f32> {
-        let mut engine = TestEngine::new()
-            .candidates(0, [1, 2])
-            .candidates(10, [])
-            .candidates(20, [])
-            .apply(0, 1, 10)
-            .apply(0, 2, 20);
-        let mut evaluator = RecordedEvaluator::default()
-            .row(0, [0.2, 0.1, -2.0], root_value)
-            .row(10, [0.0], left_value)
-            .row(20, [0.0], right_value);
-        let mut cfg = config(1);
-        cfg.simulations = NonZeroUsize::new(12).unwrap();
-        cfg.max_considered_actions = NonZeroUsize::new(3).unwrap();
-        cfg.value_mode = GumbelValueMode::SingleVanilla;
-
-        GumbelMcts::new(cfg)
-            .run(
-                &mut engine,
-                &mut evaluator,
-                0,
-                GumbelEpisodeContext::default(),
-            )
-            .unwrap()
-            .steps[0]
-            .policy_target
-            .clone()
-    }
-
-    let original = run(-5.0, -4.0, -2.0);
-    let transformed = run(50.0, 60.0, 80.0);
-    assert_eq!(original.len(), transformed.len());
-    for (left, right) in original.iter().zip(transformed) {
-        assert!((left - right).abs() < 1e-6, "{left} != {right}");
-    }
 }

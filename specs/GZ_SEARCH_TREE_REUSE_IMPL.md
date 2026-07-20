@@ -18,7 +18,7 @@ Contract wins; report conflicts.
 Read before starting:
 
 ```text
-crates/gz-search/src/gumbel.rs      (everything happens here)
+crates/gz-search/src/{gumbel,mcts}/ (search/task/tree implementation)
   GumbelEpisodeTask::poll           Root Done arm — where reuse hooks in
   GumbelEpisodeTask::new_root_task  the fresh-tree path being bypassed
   GumbelRootTask::new / poll        EmitNodeExpand -> EmitNodeEval ->
@@ -201,7 +201,7 @@ target/release/graphzero selfplay --replay-dir /tmp/gz-reuse-bench \
   --episodes 512 --lanes 2 --workers-per-lane 16 --simulations 64 \
   --max-steps 64 --max-batch 32 --evaluator torch \
   --checkpoint-dir <abs path to a version_0-only dir> \
-  --eval-device cuda:0 --python-dir python --reference self-average
+  --eval-device cuda:0 --python-dir python
 ```
 
 run with --tree-reuse false then true (same seed), idle GPUs (check

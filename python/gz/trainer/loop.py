@@ -16,7 +16,6 @@ from gz.trainer.diagnostics import (
     snapshot_parameter_metrics as _snapshot_parameter_metrics,
 )
 from gz.trainer.optim import build_optimizer
-from gz.trainer.sampler import step_seed
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,10 +39,6 @@ class LoopConfig:
     momentum: float = 0.95
     nesterov: bool = True
     ns_steps: int = 5
-    run_seed: int = 0
-    # Train both orientations of pair-value data with targets z and -z.
-    value_mirror: bool = False
-    value_objective: str = "competitive"
     mask_stop_loss: bool = False
     compile_model: bool = False
     compile_mode: str = "default"
@@ -208,8 +203,6 @@ class TrainerLoop:
         separate_value_batch = self.config.value_weight != 0.0 and value_batch is not None
         if separate_value_batch:
             value_batch = _trim_to_row_count(value_batch)
-            pair_mode = getattr(getattr(self.model, "arch", None), "value_input", None) == "pair"
-            mirror = pair_mode and self.config.value_mirror
             with torch.autocast(
                 device_type=self.device_type,
                 dtype=torch.bfloat16,
@@ -239,17 +232,9 @@ class TrainerLoop:
                         value_batch.features,
                         value_trunk_grad_scale=self.config.value_trunk_grad_scale,
                     )
-                elif mirror:
-                    value_raw = self._value_only(
-                        value_batch.features,
-                        value_flip=None,
-                        value_mirror=True,
-                        value_trunk_grad_scale=self.config.value_trunk_grad_scale,
-                    )
                 else:
                     value_raw = self._value_only(
                         value_batch.features,
-                        value_flip=None,
                         value_trunk_grad_scale=self.config.value_trunk_grad_scale,
                     )
                 value = value_batch.value
@@ -269,42 +254,15 @@ class TrainerLoop:
                         value_batch,
                         self.config,
                     )
-                elif mirror:
-                    canonical, mirrored = value_raw[0], value_raw[1]
-                    value_loss = value_head_loss(
-                        self.model,
-                        canonical,
-                        value,
-                        value_batch.value_valid,
-                        value_batch.row_count,
-                        objective=self.config.value_objective,
-                    )
-                    present = getattr(value_batch.features, "opponent_state_present", None)
-                    if present is not None:
-                        mirrored_valid = value_batch.value_valid * (present > 0).to(
-                            value_batch.value_valid.dtype
-                        )
-                        value_loss = 0.5 * value_loss + 0.5 * value_head_loss(
-                            self.model,
-                            mirrored,
-                            -value,
-                            mirrored_valid,
-                            value_batch.row_count,
-                            objective=self.config.value_objective,
-                        )
-                    value_raw = canonical
-                    value_final_loss = value_loss
                 else:
                     value_loss = value_head_loss(
-                        self.model,
                         value_raw,
                         value,
                         value_batch.value_valid,
                         value_batch.row_count,
-                        objective=self.config.value_objective,
                     )
                     value_final_loss = value_loss
-                value_prediction = decode_value_output(self.model, value_raw)
+                value_prediction = value_raw
             if self._auxiliary_tasks and with_metrics:
                 readout_gradient_tensors = _readout_gradient_tensors(
                     torch,
@@ -348,20 +306,7 @@ class TrainerLoop:
                     )
                     value_loss = logits.sum() * 0.0
                 else:
-                    pair_mode = (
-                        getattr(getattr(self.model, "arch", None), "value_input", None)
-                        == "pair"
-                    )
                     value_batch = batch
-                    mirror = self.config.value_mirror and pair_mode
-                    value_flip = None
-                    if pair_mode and not mirror:
-                        value_flip = pair_value_flip(
-                            torch,
-                            value_batch,
-                            self.config.run_seed,
-                            self.step_index,
-                        )
                     if self._auxiliary_tasks:
                         assert self._training_forward is not None
                         value_raw, horizon_raw, score_raw, logits, value_readout = (
@@ -375,8 +320,6 @@ class TrainerLoop:
                     else:
                         value_raw, logits = self._model_forward(
                             batch.features,
-                            value_flip=value_flip,
-                            value_mirror=mirror,
                             value_trunk_grad_scale=self.config.value_trunk_grad_scale,
                         )
                     policy_loss = policy_ce_loss(
@@ -404,47 +347,16 @@ class TrainerLoop:
                             value_batch,
                             self.config,
                         )
-                    elif mirror:
-                        # whittlezero's mirrored stream: every pair trains both
-                        # orientations (targets z and -z); the swapped example is
-                        # masked to rows that actually carry an opponent state.
-                        canonical, mirrored = value_raw[0], value_raw[1]
-                        value_loss = value_head_loss(
-                            self.model,
-                            canonical,
-                            value_batch.value,
-                            value_batch.value_valid,
-                            value_batch.row_count,
-                            objective=self.config.value_objective,
-                        )
-                        present = getattr(value_batch.features, "opponent_state_present", None)
-                        if present is not None:
-                            mirrored_valid = value_batch.value_valid * (present > 0).to(
-                                value_batch.value_valid.dtype
-                            )
-                            value_loss = 0.5 * value_loss + 0.5 * value_head_loss(
-                                self.model,
-                                mirrored,
-                                -value_batch.value,
-                                mirrored_valid,
-                                value_batch.row_count,
-                                objective=self.config.value_objective,
-                            )
-                        value_raw = canonical
-                        value = value_batch.value
-                        value_final_loss = value_loss
                     else:
-                        value = flipped_value_targets(torch, value_batch.value, value_flip)
+                        value = value_batch.value
                         value_loss = value_head_loss(
-                            self.model,
                             value_raw,
                             value,
                             value_batch.value_valid,
                             value_batch.row_count,
-                            objective=self.config.value_objective,
                         )
                         value_final_loss = value_loss
-                    value_prediction = decode_value_output(self.model, value_raw)
+                    value_prediction = value_raw
                 loss = policy_loss + self.config.value_weight * value_loss
             if (
                 self._auxiliary_tasks
@@ -618,26 +530,8 @@ def policy_ce_loss(
     return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
 
 
-def value_bce_loss(value_raw: object, value: object, value_valid: object, row_count: int) -> object:
-    torch = _torch()
-    functional = torch.nn.functional
-    row_mask = _row_mask(torch, row_count, value_raw.shape[0], value_raw.device)
-    valid = row_mask & (value_valid > 0)
-    weight = valid.to(value_raw.dtype)
-    # Fully tensorized: a data-dependent host branch here would synchronize
-    # the CUDA stream between the forward pass and backward, stalling the
-    # GPU mid-step. Invalid rows may carry arbitrary label bytes, so their
-    # targets are zeroed before the pointwise loss and their terms weighted
-    # out; zero valid rows yields loss 0 with finite gradients.
-    target = torch.where(valid, (value + 1.0) * 0.5, torch.zeros_like(value))
-    per_row = functional.binary_cross_entropy_with_logits(
-        2.0 * value_raw, target, reduction="none"
-    )
-    return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
-
-
 def value_mse_loss(value_raw: object, value: object, value_valid: object, row_count: int) -> object:
-    # Fully tensorized masked MSE for bounded graded labels or raw rewards.
+    # Fully tensorized masked MSE for bounded sign and auxiliary labels.
     torch = _torch()
     row_mask = _row_mask(torch, row_count, value_raw.shape[0], value_raw.device)
     valid = row_mask & (value_valid > 0)
@@ -647,69 +541,13 @@ def value_mse_loss(value_raw: object, value: object, value_valid: object, row_co
     return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
 
 
-def hl_gauss_target_probs(
-    target: object,
-    bin_edges: object,
-    sigma: float,
-) -> object:
-    torch = _torch()
-    if not math.isfinite(sigma) or sigma <= 0.0:
-        raise ValueError("HL-Gauss sigma must be finite and positive")
-    edges = bin_edges.to(device=target.device, dtype=torch.float32)
-    target = target.to(dtype=torch.float32)
-    target = torch.minimum(torch.maximum(target, edges[0]), edges[-1])
-    denominator = math.sqrt(2.0) * sigma
-    cdf = torch.special.erf((edges - target.unsqueeze(-1)) / denominator)
-    normalizer = cdf[..., -1] - cdf[..., 0]
-    probabilities = cdf[..., 1:] - cdf[..., :-1]
-    return probabilities / normalizer.clamp_min(1.0e-12).unsqueeze(-1)
-
-
-def value_hl_gauss_loss(
-    value_logits: object,
-    value: object,
-    value_valid: object,
-    row_count: int,
-    bin_edges: object,
-    sigma: float,
-) -> object:
-    torch = _torch()
-    row_mask = _row_mask(torch, row_count, value_logits.shape[0], value_logits.device)
-    valid = row_mask & (value_valid > 0)
-    target = torch.where(valid, value, torch.zeros_like(value))
-    target_probs = hl_gauss_target_probs(target, bin_edges, sigma)
-    per_row = -(target_probs * torch.log_softmax(value_logits.float(), dim=-1)).sum(dim=-1)
-    weight = valid.to(per_row.dtype)
-    return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
-
-
 def value_head_loss(
-    model: object,
     value_raw: object,
     value: object,
     value_valid: object,
     row_count: int,
-    *,
-    objective: str = "competitive",
 ) -> object:
-    if objective == "terminal_reward":
-        return value_mse_loss(value_raw, value, value_valid, row_count)
-    if objective != "competitive":
-        raise ValueError(f"unknown value objective: {objective}")
-    arch = getattr(model, "arch", None)
-    if getattr(arch, "value_head", "scalar") == "hl_gauss":
-        sigma = arch.value_sigma_ratio * (arch.value_max - arch.value_min) / arch.value_bins
-        return value_hl_gauss_loss(
-            value_raw,
-            value,
-            value_valid,
-            row_count,
-            model.value_bin_edges,
-            sigma,
-        )
-    if getattr(arch, "value_activation", "logit") == "tanh":
-        return value_mse_loss(value_raw, value, value_valid, row_count)
-    return value_bce_loss(value_raw, value, value_valid, row_count)
+    return value_mse_loss(value_raw, value, value_valid, row_count)
 
 
 def auxiliary_task_loss(
@@ -722,12 +560,10 @@ def auxiliary_task_loss(
 ) -> tuple[object, object, object, object, object, object]:
     torch = _torch()
     final_loss = value_head_loss(
-        model,
         value_raw,
         batch.value,
         batch.value_valid,
         batch.row_count,
-        objective=config.value_objective,
     )
     v8_loss = value_mse_loss(
         horizon_raw[:, 0],
@@ -759,12 +595,6 @@ def auxiliary_task_loss(
     return combined, final_loss, v8_loss, v32_loss, score_loss, score_prediction
 
 
-def decode_value_output(model: object, value_raw: object) -> object:
-    if getattr(getattr(model, "arch", None), "value_head", "scalar") == "hl_gauss":
-        return model.decode_value(value_raw)
-    return value_raw
-
-
 def _validate_task_weights(config: LoopConfig) -> None:
     weights = (
         config.value_final_weight,
@@ -776,23 +606,6 @@ def _validate_task_weights(config: LoopConfig) -> None:
         raise ValueError("value task weights must be finite and non-negative")
     if not math.isclose(sum(weights), 1.0, rel_tol=0.0, abs_tol=1.0e-6):
         raise ValueError("value task weights must sum to one")
-
-
-def pair_value_flip(torch: object, batch: TrainingBatch, run_seed: int, step: int) -> object:
-    if getattr(batch.features, "opponent_state_present", None) is None:
-        return None
-    device = batch.value.device
-    generator = torch.Generator(device=device)
-    generator.manual_seed(step_seed(run_seed, step, "value-orientation"))
-    row_mask = _row_mask(torch, batch.row_count, batch.value.shape[0], device)
-    present = batch.features.opponent_state_present > 0
-    return (torch.rand(batch.value.shape, generator=generator, device=device) < 0.5) & row_mask & present
-
-
-def flipped_value_targets(torch: object, value: object, value_flip: object) -> object:
-    if value_flip is None:
-        return value
-    return torch.where(value_flip, -value, value)
 
 
 def lr_at_step(

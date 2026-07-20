@@ -443,7 +443,7 @@ fn build_example(
             true,
         ),
     };
-    let learner_reward = final_measure
+    let reward = final_measure
         .scalar_reward
         .ok_or_else(|| "distillation final graph has no scalar reward".to_owned())?;
     let search_config_hash = reducing_uniform_distill_config_hash(
@@ -492,12 +492,7 @@ fn build_example(
         final_graph: final_context,
         steps: vec![step],
         final_measure: final_measure.clone(),
-        outcome: ReplayOutcome {
-            value_target: None,
-            learner_reward,
-            reference: None,
-            stopped,
-        },
+        outcome: ReplayOutcome::new(None, reward, stopped),
         search_config_hash,
         row_count: 1,
     };
@@ -511,7 +506,7 @@ fn build_example(
         selected_action,
         value_target: None,
         horizon_value_targets: None,
-        reward_target: Some(learner_reward),
+        reward_target: Some(reward),
         final_measure,
         model_version: None,
         search_config_hash,

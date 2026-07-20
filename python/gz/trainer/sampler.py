@@ -17,9 +17,9 @@ from gz.proto import (
     write_frame,
 )
 
-SAMPLE_PROTOCOL_VERSION = 10
+SAMPLE_PROTOCOL_VERSION = 11
 
-HELLO_ACK_FIXED_LEN = 176
+HELLO_ACK_FIXED_LEN = 160
 
 FRAME_HELLO = 1
 FRAME_HELLO_ACK = 2
@@ -61,8 +61,6 @@ class SampleAck:
     feature_schema_hash: FeatureSchemaHash
     max_batch: int
     produced_rows: int
-    produced_policy_rows: int
-    produced_value_rows: int
     episodes: int
     episodes_stopped: int
     episode_cost_ema: float
@@ -74,16 +72,7 @@ class SampleAck:
     episode_latency_ema: float
     best_cost: float
     symmetric_selfplay: SymmetricSelfplayMetrics | None
-    root: RootInfo | None
     feature_schema: FeatureSchemaConfig
-
-
-@dataclass(frozen=True, slots=True)
-class RootInfo:
-    cost: float
-    node_count: int
-    edge_count: int
-    candidate_count: int
 
 
 class SampleClient:
@@ -152,8 +141,6 @@ class SampleClient:
         self,
         min_startup_rows: int,
         alive_check: object = None,
-        *,
-        policy_rows: bool = False,
     ) -> SampleAck:
         deadline = time.monotonic() + self.startup_timeout
         while True:
@@ -161,8 +148,7 @@ class SampleClient:
                 alive_check()
             try:
                 ack = self.connect()
-                available = ack.produced_policy_rows if policy_rows else ack.produced_rows
-                if available >= min_startup_rows:
+                if ack.produced_rows >= min_startup_rows:
                     return ack
             except (OSError, ProtocolError, SampleError):
                 self.close()
@@ -170,12 +156,8 @@ class SampleClient:
                 raise TimeoutError("timed out waiting for replay sample service")
             time.sleep(self.backoff)
 
-    def sample(
-        self, batch: int, window: int, seed: int, *, kind: str = "any"
-    ) -> SampleResult:
-        return self._with_reconnect(
-            lambda: self._sample_connected(batch, window, seed, kind)
-        )
+    def sample(self, batch: int, window: int, seed: int) -> SampleResult:
+        return self._with_reconnect(lambda: self._sample_connected(batch, window, seed))
 
     def refresh(self) -> SampleAck:
         """Re-acks on the live connection for fresh produced_rows."""
@@ -207,22 +189,16 @@ class SampleClient:
         self.ack = decode_ack(payload)
         return self.ack
 
-    def _sample_connected(
-        self, batch: int, window: int, seed: int, kind: str
-    ) -> SampleResult:
+    def _sample_connected(self, batch: int, window: int, seed: int) -> SampleResult:
         if self.sock is None:
             self.connect()
         if batch <= 0 or window <= 0:
             raise ValueError("batch and window must be positive")
-        try:
-            sample_kind = {"any": 0, "policy": 1, "value": 2}[kind]
-        except KeyError as error:
-            raise ValueError(f"unknown sample kind: {kind}") from error
         assert self.sock is not None
         write_frame(
             self.sock,
             FRAME_SAMPLE,
-            struct.pack("<IIQQ", batch, sample_kind, window, seed),
+            struct.pack("<IQQ", batch, window, seed),
         )
         frame_type, payload = read_frame(self.sock, self.read_buf)
         if frame_type == FRAME_ERROR:
@@ -272,16 +248,13 @@ def decode_ack(payload: memoryview) -> SampleAck:
         "<fffff", payload, 64
     )
     best_cost = struct.unpack_from("<f", payload, 84)[0]
-    root_present = struct.unpack_from("<I", payload, 88)[0]
-    root_cost = struct.unpack_from("<f", payload, 92)[0]
-    root_nodes, root_edges, root_candidates = struct.unpack_from("<III", payload, 96)
-    produced_policy_rows = struct.unpack_from("<Q", payload, 108)[0]
-    produced_value_rows = struct.unpack_from("<Q", payload, 116)[0]
-    value_sign_early_ema, value_sign_late_ema = struct.unpack_from("<ff", payload, 124)
-    symmetric_present = struct.unpack_from("<I", payload, 132)[0]
+    if any(payload[88:108]):
+        raise SampleError("sample HELLO_ACK uses retired fixed-root telemetry")
+    value_sign_early_ema, value_sign_late_ema = struct.unpack_from("<ff", payload, 108)
+    symmetric_present = struct.unpack_from("<I", payload, 116)[0]
     if symmetric_present not in (0, 1):
         raise SampleError("sample HELLO_ACK has invalid symmetric metrics flag")
-    symmetric_values = struct.unpack_from("<10f", payload, 136)
+    symmetric_values = struct.unpack_from("<10f", payload, 120)
     symmetric = None
     if symmetric_present:
         (
@@ -312,22 +285,10 @@ def decode_ack(payload: memoryview) -> SampleAck:
             game_len_ema=p1_episode_len_ema + p2_episode_len_ema,
             episode_len_margin_ema=episode_len_margin_ema,
         )
-    root = (
-        RootInfo(
-            cost=root_cost,
-            node_count=root_nodes,
-            edge_count=root_edges,
-            candidate_count=root_candidates,
-        )
-        if root_present
-        else None
-    )
     return SampleAck(
         feature_schema_hash=FeatureSchemaHash.from_bytes(payload[4:36]),
         max_batch=max_batch,
         produced_rows=produced_rows,
-        produced_policy_rows=produced_policy_rows,
-        produced_value_rows=produced_value_rows,
         episodes=episodes,
         episodes_stopped=episodes_stopped,
         episode_cost_ema=cost_ema,
@@ -341,7 +302,6 @@ def decode_ack(payload: memoryview) -> SampleAck:
         episode_latency_ema=latency_ema,
         best_cost=best_cost,
         symmetric_selfplay=symmetric,
-        root=root,
         feature_schema=FeatureSchemaConfig.decode(payload[HELLO_ACK_FIXED_LEN:]),
     )
 

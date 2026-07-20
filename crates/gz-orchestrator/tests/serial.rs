@@ -1,7 +1,7 @@
 use gz_engine_whittle::{WhittleEngine, WhittleEngineConfig};
 use gz_eval::{RandomValueEvaluator, RandomValueEvaluatorConfig};
 use gz_orchestrator::{SerialGumbelOrchestrator, WorkerId};
-use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
+use gz_search::{GumbelMcts, GumbelMctsConfig};
 use std::num::NonZeroUsize;
 
 fn search(engine: &WhittleEngine, tree_reuse: bool) -> GumbelMcts {
@@ -18,7 +18,7 @@ fn search(engine: &WhittleEngine, tree_reuse: bool) -> GumbelMcts {
         tree_reuse,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: gz_search::GumbelValueMode::Competitive,
+        value_mode: gz_search::GumbelValueMode::SingleAgent,
         candidate_options: gz_engine::CandidateOptions::default(),
         export_position: true,
         measure_options: engine.measure_options(),
@@ -42,9 +42,7 @@ fn serial_orchestrator_matches_direct_gumbel_run() {
                 let engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
                 search(&engine, tree_reuse)
             });
-        let serial = orchestrator
-            .run_from_root(GumbelEpisodeContext::default())
-            .unwrap();
+        let serial = orchestrator.run_from_root().unwrap();
 
         let mut direct_engine = WhittleEngine::new(WhittleEngineConfig::default()).unwrap();
         let mut direct_eval = evaluator();
@@ -66,12 +64,8 @@ fn serial_orchestrator_episode_ids_increment() {
     let mut orchestrator =
         SerialGumbelOrchestrator::new(WorkerId::new(1), engine, evaluator(), search);
 
-    let first = orchestrator
-        .run_from_root(GumbelEpisodeContext::default())
-        .unwrap();
-    let second = orchestrator
-        .run_from_root(GumbelEpisodeContext::default())
-        .unwrap();
+    let first = orchestrator.run_from_root().unwrap();
+    let second = orchestrator.run_from_root().unwrap();
 
     assert_eq!(first.episode_id.value(), 0);
     assert_eq!(second.episode_id.value(), 1);

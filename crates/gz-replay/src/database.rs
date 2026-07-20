@@ -1,10 +1,9 @@
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::{
-    CF_EPISODES, CF_META, CF_POLICY_ROW_INDEX, CF_ROW_INDEX, CF_ROWS, CF_VALUE_ROW_INDEX,
-    META_COMPLETED_GAMES, META_CONSUMED_ROWS, META_DATA_MODE, META_FEATURE_SCHEMA,
-    META_NEXT_EPISODE_SEQ, META_PRODUCED_POLICY_ROWS, META_PRODUCED_ROWS, META_PRODUCED_VALUE_ROWS,
-    META_SCHEMA_VERSION, SCHEMA_VERSION, decode_u32, decode_u64, decode_u64_key, encode_u32,
-    encode_u64,
+    CF_EPISODES, CF_LEGACY_POLICY_ROW_INDEX, CF_LEGACY_VALUE_ROW_INDEX, CF_META, CF_ROW_INDEX,
+    CF_ROWS, META_COMPLETED_GAMES, META_CONSUMED_ROWS, META_DATA_MODE, META_FEATURE_SCHEMA,
+    META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_SCHEMA_VERSION, SCHEMA_VERSION, decode_u32,
+    decode_u64, decode_u64_key, encode_u32, encode_u64,
 };
 use crate::store::ReplayDataMode;
 use gz_features::FeatureSchemaConfig;
@@ -99,8 +98,10 @@ pub(crate) fn open_db(path: &Path) -> ReplayResult<DB> {
         ColumnFamilyDescriptor::new(CF_EPISODES, index_cf.clone()),
         ColumnFamilyDescriptor::new(CF_ROWS, value_cf),
         ColumnFamilyDescriptor::new(CF_ROW_INDEX, index_cf.clone()),
-        ColumnFamilyDescriptor::new(CF_POLICY_ROW_INDEX, index_cf.clone()),
-        ColumnFamilyDescriptor::new(CF_VALUE_ROW_INDEX, index_cf),
+        // Schema v8 stores contain these retired indexes. RocksDB requires
+        // every existing column family to be named when opening the database.
+        ColumnFamilyDescriptor::new(CF_LEGACY_POLICY_ROW_INDEX, index_cf.clone()),
+        ColumnFamilyDescriptor::new(CF_LEGACY_VALUE_ROW_INDEX, index_cf),
     ];
     DB::open_cf_descriptors(&options, path, descriptors).map_err(ReplayError::from)
 }
@@ -116,8 +117,6 @@ pub(crate) fn ensure_schema(db: &DB) -> ReplayResult<()> {
             batch.put_cf(&meta, META_NEXT_EPISODE_SEQ, encode_u64(0));
             batch.put_cf(&meta, META_COMPLETED_GAMES, encode_u64(0));
             batch.put_cf(&meta, META_PRODUCED_ROWS, encode_u64(0));
-            batch.put_cf(&meta, META_PRODUCED_POLICY_ROWS, encode_u64(0));
-            batch.put_cf(&meta, META_PRODUCED_VALUE_ROWS, encode_u64(0));
             batch.put_cf(&meta, META_CONSUMED_ROWS, encode_u64(0));
             db.write(batch).map_err(ReplayError::from)
         }
@@ -139,7 +138,7 @@ pub(crate) fn recover_next_row_seq(db: &DB) -> ReplayResult<u64> {
     recover_next_index_seq(db, CF_ROW_INDEX)
 }
 
-pub(crate) fn recover_next_index_seq(db: &DB, index_name: &'static str) -> ReplayResult<u64> {
+fn recover_next_index_seq(db: &DB, index_name: &'static str) -> ReplayResult<u64> {
     let row_index = cf(db, index_name)?;
     let mut iter = db.iterator_cf(&row_index, IteratorMode::End);
     match iter.next().transpose()? {

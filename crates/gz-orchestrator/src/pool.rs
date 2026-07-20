@@ -6,10 +6,8 @@ use gz_engine::{EngineResult, GraphEngine};
 use gz_eval::{EvalOutput, EvalRequest};
 use gz_features::{FeatureExtractor, FeatureRow, PositionFeatures};
 use gz_search::{
-    EngineIdentity, EvalModel, GumbelEpisode, GumbelEpisodeTask, GumbelMcts, PolicyRollout,
-    PolicyRolloutContext, PolicyRolloutEpisode, PolicyRolloutEpisodeTask, SampledTreeEpisodeTask,
-    SearchHandleBatch, SearchPoll, SearchWork, SearchWorkResult, SymmetricEpisode,
-    SymmetricSelfplayEpisodeTask, WorkToken,
+    EngineIdentity, GumbelEpisode, GumbelEpisodeTask, GumbelMcts, SearchHandleBatch, SearchPoll,
+    SearchWork, SearchWorkResult, SymmetricEpisode, SymmetricSelfplayEpisodeTask, WorkToken,
 };
 use std::hash::Hash;
 use std::num::NonZeroUsize;
@@ -25,9 +23,10 @@ pub(crate) struct CompletedTask<G, C> {
     pub episode: CompletedSearchEpisode<G, C>,
 }
 
+// EpisodePoll already boxes this enum; boxing Gumbel again would only add indirection.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CompletedSearchEpisode<G, C> {
     Gumbel(GumbelEpisode<G, C>),
-    PolicyRollout(PolicyRolloutEpisode<G, C>),
     Symmetric(Box<SymmetricEpisode<G, C>>),
 }
 
@@ -36,9 +35,7 @@ type EpisodePoll<G, C> = SearchPoll<G, C, Box<CompletedSearchEpisode<G, C>>>;
 impl<G, C> CompletedTask<G, C> {
     pub(crate) fn into_gumbel(self) -> EngineResult<OrchestratedEpisode<G, C>> {
         let CompletedSearchEpisode::Gumbel(episode) = self.episode else {
-            return Err(internal(
-                "policy rollout completed outside sampled-trajectory mode",
-            ));
+            return Err(internal("symmetric episode completed on the Gumbel path"));
         };
         Ok(OrchestratedEpisode {
             worker_id: self.worker_id,
@@ -57,15 +54,12 @@ pub(crate) struct ParkedEval {
     pub request: EvalRequest,
     pub row: Option<FeatureRow>,
     pub action_count: u32,
-    pub model: EvalModel,
     pub pressure_reserved: bool,
 }
 
 pub(crate) struct Admission<'a> {
     pub search: &'a GumbelMcts,
     pub identity: EngineIdentity,
-    pub context: gz_search::GumbelEpisodeContext,
-    pub sampled_tree: bool,
     pub symmetric_selfplay: bool,
     pub pressure_reserved: bool,
     pub next_episode_id: &'a mut u64,
@@ -104,7 +98,6 @@ struct ParkedEvalState {
     request: Option<EvalRequest>,
     row: Option<FeatureRow>,
     action_count: u32,
-    model: EvalModel,
     sent: bool,
 }
 
@@ -156,12 +149,7 @@ where
     where
         E: GraphEngine<Graph = G, Candidate = C>,
         R: RootSource<E>,
-        F: FnMut(
-            &mut E,
-            EpisodeId,
-            G,
-            gz_search::GumbelEpisodeContext,
-        ) -> EngineResult<gz_search::GumbelEpisodeContext>,
+        F: FnMut(&mut E, EpisodeId, G) -> EngineResult<()>,
     {
         Ok(self
             .admit_limited(engine, roots, admission, usize::MAX, episode_context)?
@@ -179,12 +167,7 @@ where
     where
         E: GraphEngine<Graph = G, Candidate = C>,
         R: RootSource<E>,
-        F: FnMut(
-            &mut E,
-            EpisodeId,
-            G,
-            gz_search::GumbelEpisodeContext,
-        ) -> EngineResult<gz_search::GumbelEpisodeContext>,
+        F: FnMut(&mut E, EpisodeId, G) -> EngineResult<()>,
     {
         if limit == 0 {
             return Ok(AdmissionResult {
@@ -211,15 +194,10 @@ where
 
             let episode_id = EpisodeId::new(*admission.next_episode_id);
             *admission.next_episode_id += 1;
-            let context = episode_context(
-                engine,
-                episode_id,
-                root,
-                gz_search::GumbelEpisodeContext {
-                    noise_seed: crate::root::episode_noise_seed(episode_id.value()),
-                    ..admission.context
-                },
-            )?;
+            episode_context(engine, episode_id, root)?;
+            let context = gz_search::GumbelEpisodeContext {
+                noise_seed: crate::root::episode_noise_seed(episode_id.value()),
+            };
             let mut task = if admission.symmetric_selfplay {
                 EpisodeTask::Symmetric(SymmetricSelfplayEpisodeTask::with_wave_batching(
                     admission.search,
@@ -227,13 +205,6 @@ where
                     root,
                     context,
                     admission.search.symmetric_wave_batching(),
-                ))
-            } else if admission.sampled_tree {
-                EpisodeTask::SampledTree(SampledTreeEpisodeTask::new(
-                    admission.search,
-                    admission.identity,
-                    root,
-                    context,
                 ))
             } else {
                 EpisodeTask::Gumbel(GumbelEpisodeTask::new(
@@ -261,84 +232,14 @@ where
         })
     }
 
-    /// Admits one episode outside the root source -- the opponent rollout
-    /// path. The caller supplies the root, search config, context, and
-    /// episode id. Returns false when no worker slot is idle.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn admit_direct(
-        &mut self,
-        search: &GumbelMcts,
-        identity: EngineIdentity,
-        root: G,
-        context: gz_search::GumbelEpisodeContext,
-        episode_id: EpisodeId,
-        owned_root: bool,
-        pressure_reserved: bool,
-    ) -> bool {
-        for slot in &mut self.slots {
-            if !matches!(slot.state, SlotState::Idle) {
-                continue;
-            }
-
-            let mut task =
-                EpisodeTask::Gumbel(GumbelEpisodeTask::new(search, identity, root, context));
-            if owned_root {
-                task.track_owned_root();
-            }
-            slot.state = SlotState::Running(ActiveEpisode {
-                task,
-                episode_id,
-                evaluations: 0,
-                pressure_reserved,
-            });
-            return true;
-        }
-
-        false
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn admit_direct_policy_rollout(
-        &mut self,
-        search: &PolicyRollout,
-        identity: EngineIdentity,
-        root: G,
-        context: PolicyRolloutContext,
-        episode_id: EpisodeId,
-        owned_root: bool,
-        pressure_reserved: bool,
-    ) -> bool {
-        for slot in &mut self.slots {
-            if !matches!(slot.state, SlotState::Idle) {
-                continue;
-            }
-            let mut task = EpisodeTask::PolicyRollout(PolicyRolloutEpisodeTask::new(
-                search, identity, root, context,
-            ));
-            if owned_root {
-                task.track_owned_root();
-            }
-            slot.state = SlotState::Running(ActiveEpisode {
-                task,
-                episode_id,
-                evaluations: 0,
-                pressure_reserved,
-            });
-            return true;
-        }
-        false
-    }
-
-    pub(crate) fn drive<E, F>(
+    pub(crate) fn drive<E>(
         &mut self,
         engine: &mut E,
         blocked_message: &'static str,
         mut extractor: Option<&mut dyn FeatureExtractor<E>>,
-        mut decorate_row: F,
     ) -> EngineResult<Vec<CompletedTask<G, C>>>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
-        F: FnMut(EpisodeId, u32, &mut FeatureRow),
     {
         let mut completed = Vec::new();
 
@@ -390,10 +291,8 @@ where
                         };
                         let row = match extractor.as_deref_mut() {
                             Some(extractor) => {
-                                let scale = extractor.schema().config().opponent_reward_scale;
                                 let position = position_features(
                                     work.request.position,
-                                    scale,
                                     work.opponent.is_some(),
                                 );
                                 match extractor.extract(
@@ -405,7 +304,7 @@ where
                                     Ok(mut row) => {
                                         if let Some(opponent) = work.opponent.as_deref() {
                                             let opponent_position =
-                                                position_features(opponent.position, scale, false);
+                                                position_features(opponent.position, false);
                                             let opponent_row = extractor
                                                 .extract(
                                                     engine,
@@ -425,34 +324,6 @@ where
                                             };
                                             row.opponent = Some(opponent_state(opponent_row));
                                         }
-                                        // Pair evals attach the opponent state at
-                                        // the row the search aligned to (real root
-                                        // step + leaf depth, advanced to the
-                                        // opponent's horizon for STOP re-evals) --
-                                        // never the request's exported root_step,
-                                        // which export_position zeroes. The task's
-                                        // real step is the fallback for references
-                                        // without per-step states.
-                                        let root_step =
-                                            match u32::try_from(episode.task.step_index()) {
-                                                Ok(root_step) => root_step,
-                                                Err(_) => {
-                                                    release_task_all(engine, &mut episode.task)?;
-                                                    return Err(internal("root step overflow"));
-                                                }
-                                            };
-                                        let opponent_row = work
-                                            .request
-                                            .position
-                                            .opponent_row()
-                                            .unwrap_or(root_step);
-                                        if work.opponent.is_none() {
-                                            decorate_row(
-                                                episode.episode_id,
-                                                opponent_row,
-                                                &mut row,
-                                            );
-                                        }
                                         Some(row)
                                     }
                                     Err(_) => {
@@ -468,7 +339,6 @@ where
                             request: Some(work.request),
                             row,
                             action_count,
-                            model: work.model,
                             sent: false,
                         });
                     }
@@ -521,7 +391,6 @@ where
                     request: request.clone(),
                     row: eval.row.clone(),
                     action_count: eval.action_count,
-                    model: eval.model,
                     pressure_reserved,
                 });
                 pressure_reserved = false;
@@ -550,7 +419,6 @@ where
                     request,
                     row: eval.row.take(),
                     action_count: eval.action_count,
-                    model: eval.model,
                     pressure_reserved,
                 });
                 pressure_reserved = false;
@@ -670,8 +538,6 @@ where
 #[allow(clippy::large_enum_variant)]
 enum EpisodeTask<G, C> {
     Gumbel(GumbelEpisodeTask<G, C>),
-    PolicyRollout(PolicyRolloutEpisodeTask<G, C>),
-    SampledTree(SampledTreeEpisodeTask<G, C>),
     Symmetric(SymmetricSelfplayEpisodeTask<G, C>),
 }
 
@@ -685,12 +551,6 @@ where
             Self::Gumbel(task) => task
                 .poll()?
                 .map_done(|episode| Box::new(CompletedSearchEpisode::Gumbel(episode))),
-            Self::PolicyRollout(task) => task
-                .poll()?
-                .map_done(|episode| Box::new(CompletedSearchEpisode::PolicyRollout(episode))),
-            Self::SampledTree(task) => task
-                .poll()?
-                .map_done(|episode| Box::new(CompletedSearchEpisode::Gumbel(episode))),
             Self::Symmetric(task) => task
                 .poll()?
                 .map_done(|episode| Box::new(CompletedSearchEpisode::Symmetric(Box::new(episode)))),
@@ -700,26 +560,13 @@ where
     fn resume(&mut self, token: WorkToken, result: SearchWorkResult<G, C>) -> EngineResult<()> {
         match self {
             Self::Gumbel(task) => task.resume(token, result),
-            Self::PolicyRollout(task) => task.resume(token, result),
-            Self::SampledTree(task) => task.resume(token, result),
             Self::Symmetric(task) => task.resume(token, result),
-        }
-    }
-
-    fn step_index(&self) -> usize {
-        match self {
-            Self::Gumbel(task) => task.step_index(),
-            Self::PolicyRollout(task) => task.step_index(),
-            Self::SampledTree(task) => task.step_index(),
-            Self::Symmetric(task) => task.step_index(),
         }
     }
 
     fn take_releasable(&mut self) -> SearchHandleBatch<G, C> {
         match self {
             Self::Gumbel(task) => task.take_releasable(),
-            Self::PolicyRollout(task) => task.take_releasable(),
-            Self::SampledTree(task) => task.take_releasable(),
             Self::Symmetric(task) => task.take_releasable(),
         }
     }
@@ -727,8 +574,6 @@ where
     fn track_owned_root(&mut self) {
         match self {
             Self::Gumbel(task) => task.track_owned_root(),
-            Self::PolicyRollout(task) => task.track_owned_root(),
-            Self::SampledTree(task) => task.track_owned_root(),
             Self::Symmetric(task) => task.track_owned_root(),
         }
     }
@@ -736,8 +581,6 @@ where
     fn take_all_handles(&mut self) -> SearchHandleBatch<G, C> {
         match self {
             Self::Gumbel(task) => task.take_all_handles(),
-            Self::PolicyRollout(task) => task.take_all_handles(),
-            Self::SampledTree(task) => task.take_all_handles(),
             Self::Symmetric(task) => task.take_all_handles(),
         }
     }
@@ -758,19 +601,15 @@ where
 
 fn position_features(
     position: gz_eval::EvalPositionContext,
-    opponent_reward_scale: f32,
     dynamic_opponent: bool,
 ) -> PositionFeatures {
-    let opponent = position.opponent;
     PositionFeatures {
         root_step: position.root_step,
         leaf_depth: position.leaf_depth,
         budget_fraction: position.budget_fraction,
         budget_step: position.budget_step,
-        opponent_reward: opponent.map_or(0.0, |opponent| {
-            opponent.final_reward / opponent_reward_scale
-        }),
-        opponent_present: opponent.is_some() || dynamic_opponent,
+        opponent_reward: 0.0,
+        opponent_present: dynamic_opponent,
     }
 }
 

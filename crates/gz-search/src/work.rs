@@ -91,15 +91,7 @@ pub struct EvalWork<G, C> {
     pub candidates: Vec<C>,
     pub request: EvalRequest,
     pub measure_options: MeasureOptions,
-    pub model: EvalModel,
     pub opponent: Option<Box<EvalOpponentWork<G>>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EvalModel {
-    Episode,
-    Current,
-    Incumbent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

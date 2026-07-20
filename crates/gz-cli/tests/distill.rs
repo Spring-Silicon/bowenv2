@@ -65,7 +65,6 @@ fn generated_dataset_contains_unique_measured_policy_only_rows() {
     assert_eq!(summary.states, 3);
     let store = ReplayStore::open(dir.path()).unwrap();
     assert_eq!(store.counters().produced_rows, 3);
-    assert_eq!(store.counters().produced_policy_rows, 3);
     assert_eq!(store.episode_counters().0, 3);
     let sampled = store
         .sample_rows(SampleConfig {

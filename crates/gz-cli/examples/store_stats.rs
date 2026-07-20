@@ -16,25 +16,20 @@ fn main() {
     let start: u64 = args.next().map_or(0, |s| s.parse().expect("start"));
     let end: u64 = args.next().map_or(episodes, |s| s.parse().expect("end"));
 
-    println!("episode\tcost\tlen\tstopped\tlabel\treference_reward");
+    println!("episode\tcost\tlen\tstopped\tlabel");
     for id in start..end.min(episodes) {
         let Ok(Some(record)) = store.episode(ReplayEpisodeId::new(id)) else {
             continue;
         };
         println!(
-            "{id}\t{:.1}\t{}\t{}\t{}\t{}",
-            -record.outcome.learner_reward,
+            "{id}\t{:.1}\t{}\t{}\t{}",
+            -record.outcome.reward,
             record.row_count,
             u8::from(record.outcome.stopped),
             record
                 .outcome
                 .value_target
                 .map_or_else(|| "-".to_owned(), |v| format!("{v:+.0}")),
-            record
-                .outcome
-                .reference
-                .as_ref()
-                .map_or_else(|| "-".to_owned(), |r| format!("{:.1}", -r.reward)),
         );
     }
 }

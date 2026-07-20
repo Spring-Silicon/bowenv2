@@ -1,8 +1,8 @@
+use super::GumbelMctsConfig;
 use super::schedule::{
     GumbelRng, considered_actions, considered_visit_sequence, overlap_noise_scale, root_seed,
     sample_count_action, sample_root_gumbels,
 };
-use super::{GumbelMctsConfig, GumbelValueMode};
 use crate::mcts::math::masked_softmax;
 use crate::mcts::strategy::{MctsStrategy, MctsStrategyState, StrategyRootResult};
 use crate::mcts::tree::{MctsNode, MctsTree};
@@ -25,32 +25,6 @@ pub(crate) struct GumbelRootState {
     baseline_visits: Vec<u32>,
     schedule: Vec<u32>,
     rng: GumbelRng,
-    min_max: MinMaxStats,
-}
-
-#[derive(Default)]
-struct MinMaxStats {
-    minimum: Option<f32>,
-    maximum: Option<f32>,
-}
-
-impl MinMaxStats {
-    fn normalize(&mut self, values: &mut [f32]) {
-        for value in values.iter().copied() {
-            self.minimum = Some(self.minimum.map_or(value, |minimum| minimum.min(value)));
-            self.maximum = Some(self.maximum.map_or(value, |maximum| maximum.max(value)));
-        }
-        let (Some(minimum), Some(maximum)) = (self.minimum, self.maximum) else {
-            return;
-        };
-        if maximum <= minimum {
-            return;
-        }
-        let range = (maximum - minimum).max(1e-8);
-        for value in values {
-            *value = (*value - minimum) / range;
-        }
-    }
 }
 
 impl MctsStrategyState for GumbelStrategy {
@@ -92,7 +66,6 @@ where
             baseline_visits: root.visits.clone(),
             schedule,
             rng,
-            min_max: MinMaxStats::default(),
         }
     }
 
@@ -104,7 +77,7 @@ where
     ) -> Option<usize> {
         let target_visits = *state.schedule.get(simulations)?;
         let node = &tree.nodes[0];
-        let scores = root_scores(node, &state.base_scores, self.config, &mut state.min_max);
+        let scores = root_scores(node, &state.base_scores, self.config);
         state
             .considered
             .iter()
@@ -123,12 +96,12 @@ where
 
     fn select_nonroot(
         &self,
-        state: &mut Self::RootState,
+        _state: &mut Self::RootState,
         tree: &MctsTree<G, C>,
         node_index: usize,
     ) -> usize {
         let node = &tree.nodes[node_index];
-        let policy = improved_policy(node, self.config, &mut state.min_max);
+        let policy = improved_policy(node, self.config);
         let total_visits = node.visits.iter().copied().sum::<u32>() as f32;
         node.unmasked_actions()
             .max_by(|left, right| {
@@ -149,7 +122,7 @@ where
         context: MctsSearchContext,
     ) -> StrategyRootResult {
         let node = &tree.nodes[0];
-        let scores = root_scores(node, &state.base_scores, self.config, &mut state.min_max);
+        let scores = root_scores(node, &state.base_scores, self.config);
         let mut selectable = state
             .considered
             .iter()
@@ -177,7 +150,7 @@ where
         StrategyRootResult {
             selected,
             considered_action_indices: state.considered,
-            policy_target: improved_policy(node, self.config, &mut state.min_max),
+            policy_target: improved_policy(node, self.config),
             root_search_value: search_value(node),
             root_q_max: root_q_max(node),
         }
@@ -200,9 +173,8 @@ fn root_scores<G, C>(
     node: &MctsNode<G, C>,
     base_scores: &[f32],
     config: GumbelMctsConfig,
-    min_max: &mut MinMaxStats,
 ) -> Vec<f32> {
-    let completed_q = search_q(node, config, min_max);
+    let completed_q = completed_q(node);
     let max_visits = node.visits.iter().copied().max().unwrap_or(0) as f32;
     let scale = (config.c_visit + max_visits) * config.c_scale;
     base_scores
@@ -219,12 +191,8 @@ fn root_scores<G, C>(
         .collect()
 }
 
-fn improved_policy<G, C>(
-    node: &MctsNode<G, C>,
-    config: GumbelMctsConfig,
-    min_max: &mut MinMaxStats,
-) -> Vec<f32> {
-    let completed_q = search_q(node, config, min_max);
+fn improved_policy<G, C>(node: &MctsNode<G, C>, config: GumbelMctsConfig) -> Vec<f32> {
+    let completed_q = completed_q(node);
     let max_visits = node.visits.iter().copied().max().unwrap_or(0) as f32;
     let scale = (config.c_visit + max_visits) * config.c_scale;
     let scores = node
@@ -234,18 +202,6 @@ fn improved_policy<G, C>(
         .map(|(logit, q)| logit + scale * q)
         .collect::<Vec<_>>();
     masked_softmax(&scores, &node.masked)
-}
-
-fn search_q<G, C>(
-    node: &MctsNode<G, C>,
-    config: GumbelMctsConfig,
-    min_max: &mut MinMaxStats,
-) -> Vec<f32> {
-    let mut values = completed_q(node);
-    if config.value_mode == GumbelValueMode::SingleVanilla {
-        min_max.normalize(&mut values);
-    }
-    values
 }
 
 fn completed_q<G, C>(node: &MctsNode<G, C>) -> Vec<f32> {

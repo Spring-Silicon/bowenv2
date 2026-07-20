@@ -1,9 +1,0 @@
-extends = "bases/whittle-generated-exphormer-v2-single-vanilla.toml"
-
-[wandb]
-run_name = "whittle-generated-exphormer-v2-single-vanilla-1"
-run_id = "hvghqbem"
-
-[paths]
-run_dir = "runs/whittle-generated-exphormer-v2-single-vanilla-1"
-replay_dir = "/opt/dlami/nvme/graphzero-replay/whittle-generated-exphormer-v2-single-vanilla-1"

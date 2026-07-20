@@ -29,14 +29,12 @@ def test_sample_client_handshake_and_result_owns_frame(tmp_path: Path) -> None:
     client = SampleClient(socket_path, startup_timeout=1.0, backoff=0.01)
     try:
         ack = client.wait_until_ready(1)
-        first = client.sample(1, 2, 99, kind="policy")
+        first = client.sample(1, 2, 99)
         first_node_count = first.batch.node_count.copy()
-        second = client.sample(1, 2, 99, kind="value")
+        second = client.sample(1, 2, 99)
 
         assert ack.feature_schema == schema_config()
         assert ack.feature_schema_hash == FeatureSchemaHash.from_bytes(SCHEMA_HASH)
-        assert ack.produced_policy_rows == 2
-        assert ack.produced_value_rows == 2
         assert ack.value_sign_accuracy_early_ema == 0.75
         assert ack.value_sign_accuracy_late_ema == 0.25
         assert ack.symmetric_selfplay is not None
@@ -86,8 +84,8 @@ def test_decode_ack_rejects_truncated() -> None:
 
 def test_decode_ack_allows_absent_symmetric_metrics() -> None:
     payload = bytearray(ack_payload(3))
-    struct.pack_into("<I", payload, 132, 0)
-    payload[136:176] = bytes(40)
+    struct.pack_into("<I", payload, 116, 0)
+    payload[120:160] = bytes(40)
 
     assert decode_ack(memoryview(payload)).symmetric_selfplay is None
 
@@ -122,7 +120,7 @@ def serve_samples(
                         frame_type, payload = read_frame(conn, bytearray())
                         assert frame_type == 3
                         assert struct.unpack_from("<I", payload, 0)[0] > 0
-                        assert struct.unpack_from("<I", payload, 4)[0] == response_index + 1
+                        assert struct.unpack_from("<Q", payload, 4)[0] == 2
                         batch, targets = responses[response_index]
                         response_index += 1
                         write_frame(conn, 4, struct.pack("<I", len(batch)), batch, targets)
@@ -142,11 +140,7 @@ def ack_payload(produced_rows: int) -> bytes:
         + struct.pack("<Q", 2)
         + struct.pack("<fffff", 87.5, 12.0, 0.25, 0.4, 42.5)
         + struct.pack("<f", 61.0)
-        + struct.pack("<I", 1)
-        + struct.pack("<f", 150.0)
-        + struct.pack("<III", 200, 400, 900)
-        + struct.pack("<Q", produced_rows)
-        + struct.pack("<Q", produced_rows)
+        + bytes(20)
         + struct.pack("<ff", 0.75, 0.25)
         + struct.pack("<I", 1)
         + struct.pack("<10f", 0.4, 0.35, 0.25, 60.0, 62.0, 2.0, 50.0, 80.0, 81.0, 1.0)

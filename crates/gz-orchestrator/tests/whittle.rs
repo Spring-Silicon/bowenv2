@@ -1,7 +1,7 @@
 use gz_engine_whittle::{WhittleEngine, WhittleEngineConfig, WhittleRoot};
 use gz_eval_whittle::WhittleMeasureEvaluator;
 use gz_orchestrator::{SerialGumbelOrchestrator, WorkerId};
-use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
+use gz_search::{GumbelMcts, GumbelMctsConfig};
 use std::num::NonZeroUsize;
 
 const NO_NODE: u32 = u32::MAX;
@@ -16,9 +16,7 @@ fn serial_orchestrator_drives_whittle_measure_evaluator() {
         WhittleMeasureEvaluator::new(),
         gumbel,
     );
-    let serial = orchestrator
-        .run_from_root(GumbelEpisodeContext::default())
-        .unwrap();
+    let serial = orchestrator.run_from_root().unwrap();
 
     let mut direct_engine = and_engine();
     let direct_search = search(&direct_engine);
@@ -47,7 +45,7 @@ fn search(engine: &WhittleEngine) -> GumbelMcts {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
-        value_mode: gz_search::GumbelValueMode::Competitive,
+        value_mode: gz_search::GumbelValueMode::SingleAgent,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: engine.measure_options(),
     })

@@ -40,23 +40,15 @@ where
         }
     }
 
-    pub fn run_from_root(
-        &mut self,
-        context: GumbelEpisodeContext,
-    ) -> EngineResult<SerialEpisode<E::Graph, E::Candidate>> {
+    pub fn run_from_root(&mut self) -> EngineResult<SerialEpisode<E::Graph, E::Candidate>> {
         let root = self.engine.root();
-        self.run(root, context)
+        self.run(root)
     }
 
-    pub fn run(
-        &mut self,
-        root: E::Graph,
-        context: GumbelEpisodeContext,
-    ) -> EngineResult<SerialEpisode<E::Graph, E::Candidate>> {
+    pub fn run(&mut self, root: E::Graph) -> EngineResult<SerialEpisode<E::Graph, E::Candidate>> {
         let identity = EngineIdentity::from_engine(&self.engine);
         let context = GumbelEpisodeContext {
             noise_seed: crate::root::episode_noise_seed(self.next_episode_id),
-            ..context
         };
         let mut task = GumbelEpisodeTask::new(&self.search, identity, root, context);
         let mut evaluations = 0;

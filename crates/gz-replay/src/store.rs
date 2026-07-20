@@ -1,31 +1,26 @@
 use crate::append::{AppendSequences, EpisodeAppend, stage_episodes};
 use crate::database::{
     ensure_schema, open_db, read_data_mode, read_feature_schema, read_meta_u64,
-    recover_next_episode_seq, recover_next_index_seq, recover_next_row_seq, stored_feature_schema,
-    write_meta_u64,
+    recover_next_episode_seq, recover_next_row_seq, stored_feature_schema, write_meta_u64,
 };
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::{
-    CF_EPISODES, CF_META, CF_POLICY_ROW_INDEX, CF_ROW_INDEX, CF_ROWS, CF_VALUE_ROW_INDEX,
-    META_COMPLETED_GAMES, META_CONSUMED_ROWS, META_DATA_MODE, META_DELETED_FLOOR,
-    META_DELETED_POLICY_FLOOR, META_DELETED_VALUE_FLOOR, META_EPISODES_STOPPED,
-    META_FEATURE_SCHEMA, META_NEXT_EPISODE_SEQ, META_PRODUCED_POLICY_ROWS, META_PRODUCED_ROWS,
-    META_PRODUCED_VALUE_ROWS, META_RETAINED_FLOOR, META_RETAINED_POLICY_FLOOR,
-    META_RETAINED_VALUE_FLOOR, META_ROOT_INFO, META_SYMMETRIC_BEST_COST,
+    CF_EPISODES, CF_META, CF_ROW_INDEX, CF_ROWS, META_COMPLETED_GAMES, META_CONSUMED_ROWS,
+    META_DATA_MODE, META_DELETED_FLOOR, META_EPISODES_STOPPED, META_FEATURE_SCHEMA,
+    META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_RETAINED_FLOOR, META_SYMMETRIC_BEST_COST,
     META_SYMMETRIC_COST_MARGIN_EMA, META_SYMMETRIC_DRAW_EMA, META_SYMMETRIC_GAMES,
     META_SYMMETRIC_LEN_MARGIN_EMA, META_SYMMETRIC_P1_COST_EMA, META_SYMMETRIC_P1_LEN_EMA,
     META_SYMMETRIC_P1_WIN_EMA, META_SYMMETRIC_P2_COST_EMA, META_SYMMETRIC_P2_LEN_EMA,
     META_SYMMETRIC_P2_WIN_EMA, META_TERMINAL_COST_BEST, META_TERMINAL_COST_EMA,
-    decode_episode_from_row_key, decode_step_from_row_key, decode_u64_key, encode_u64, episode_key,
-    row_index_key, row_key,
+    decode_episode_from_row_key, decode_step_from_row_key, encode_u64, episode_key, row_index_key,
+    row_key,
 };
 use crate::records::{
-    ReplayEpisodeId, ReplayEpisodeRecord, ReplayRootInfo, ReplayRow, StoredReplayRow,
-    validate_episode,
+    ReplayEpisodeId, ReplayEpisodeRecord, ReplayRow, StoredReplayRow, validate_episode,
 };
-use crate::sample::{ReplayRng, SampleConfig, SampleKind};
+use crate::sample::{ReplayRng, SampleConfig};
 use gz_features::{FeatureSchema, FeatureSchemaConfig};
-use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
+use rocksdb::{DB, WriteBatch};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,13 +34,9 @@ pub struct ReplayStore {
     completed_games: AtomicU64,
     episodes_stopped: AtomicU64,
     produced_rows: AtomicU64,
-    produced_policy_rows: AtomicU64,
-    produced_value_rows: AtomicU64,
     consumed_rows: AtomicU64,
     /// Rows below this sequence may be gone; sampling clamps to it.
     retained_floor: AtomicU64,
-    retained_policy_floor: AtomicU64,
-    retained_value_floor: AtomicU64,
     retain_rows: Option<u64>,
     /// Episode-weighted EMAs over recent appends (decay 0.99), stored as
     /// f64 bits; zero bits = unseeded. Terminal cost persists across reopen.
@@ -170,8 +161,8 @@ impl SymmetricMetricAtoms {
 
         let games = self.games.load(Ordering::Acquire);
         let initialized = games != 0;
-        let p1_cost = -f64::from(primary.0.outcome.learner_reward);
-        let p2_cost = -f64::from(secondary.0.outcome.learner_reward);
+        let p1_cost = -f64::from(primary.0.outcome.reward);
+        let p2_cost = -f64::from(secondary.0.outcome.reward);
         let p1_len = symmetric_rewrite_count(primary.0) as f64;
         let p2_len = symmetric_rewrite_count(secondary.0) as f64;
         Ok(SymmetricMetricState {
@@ -331,8 +322,6 @@ fn next_symmetric_ema_bits(previous: u64, initialized: bool, value: f64) -> u64 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplayCounters {
     pub produced_rows: u64,
-    pub produced_policy_rows: u64,
-    pub produced_value_rows: u64,
     pub consumed_rows: u64,
 }
 
@@ -356,49 +345,11 @@ pub struct SymmetricSelfplayMetrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayDataMode {
     Standard,
-    SampledTree,
-    SingleVanilla,
     SymmetricSelfplay,
-    Graded {
-        sampled_tree: bool,
-        reward_scale_bits: u32,
-    },
     SymmetricSelfplayStop,
 }
 
 impl ReplayDataMode {
-    pub fn graded(sampled_tree: bool, reward_scale: f32) -> ReplayResult<Self> {
-        if !reward_scale.is_finite() || reward_scale <= 0.0 {
-            return Err(ReplayError::InvalidRecord);
-        }
-        Ok(Self::Graded {
-            sampled_tree,
-            reward_scale_bits: reward_scale.to_bits(),
-        })
-    }
-
-    #[must_use]
-    pub const fn is_graded(self) -> bool {
-        matches!(self, Self::Graded { .. })
-    }
-
-    #[must_use]
-    pub const fn is_sampled_tree(self) -> bool {
-        matches!(
-            self,
-            Self::SampledTree
-                | Self::Graded {
-                    sampled_tree: true,
-                    ..
-                }
-        )
-    }
-
-    #[must_use]
-    pub const fn is_single_vanilla(self) -> bool {
-        matches!(self, Self::SingleVanilla)
-    }
-
     #[must_use]
     pub const fn is_symmetric_selfplay(self) -> bool {
         matches!(self, Self::SymmetricSelfplay | Self::SymmetricSelfplayStop)
@@ -412,18 +363,7 @@ impl ReplayDataMode {
     fn bytes(self) -> Vec<u8> {
         match self {
             Self::Standard => b"standard-v1".to_vec(),
-            Self::SampledTree => b"sampled-tree-v1".to_vec(),
-            Self::SingleVanilla => b"single-vanilla-v1".to_vec(),
             Self::SymmetricSelfplay => b"symmetric-selfplay-v1".to_vec(),
-            Self::Graded {
-                sampled_tree,
-                reward_scale_bits,
-            } => {
-                let mut bytes = b"graded-v1".to_vec();
-                bytes.push(u8::from(sampled_tree));
-                bytes.extend_from_slice(&reward_scale_bits.to_le_bytes());
-                bytes
-            }
             Self::SymmetricSelfplayStop => b"symmetric-selfplay-v2".to_vec(),
         }
     }
@@ -431,18 +371,8 @@ impl ReplayDataMode {
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         match bytes {
             b"standard-v1" => Some(Self::Standard),
-            b"sampled-tree-v1" => Some(Self::SampledTree),
-            b"single-vanilla-v1" => Some(Self::SingleVanilla),
             b"symmetric-selfplay-v1" => Some(Self::SymmetricSelfplay),
             b"symmetric-selfplay-v2" => Some(Self::SymmetricSelfplayStop),
-            _ if bytes.len() == 14 && bytes.starts_with(b"graded-v1") && bytes[9] <= 1 => {
-                let reward_scale_bits = u32::from_le_bytes(bytes[10..14].try_into().ok()?);
-                let reward_scale = f32::from_bits(reward_scale_bits);
-                (reward_scale.is_finite() && reward_scale > 0.0).then_some(Self::Graded {
-                    sampled_tree: bytes[9] != 0,
-                    reward_scale_bits,
-                })
-            }
             _ => None,
         }
     }
@@ -462,26 +392,16 @@ impl ReplayStore {
 
         let next_episode_seq = recover_next_episode_seq(&db)?;
         let produced_rows = recover_next_row_seq(&db)?;
-        let produced_policy_rows = read_meta_u64(&db, META_PRODUCED_POLICY_ROWS)?
-            .unwrap_or(0)
-            .max(recover_next_index_seq(&db, CF_POLICY_ROW_INDEX)?);
-        let produced_value_rows = read_meta_u64(&db, META_PRODUCED_VALUE_ROWS)?
-            .unwrap_or(0)
-            .max(recover_next_index_seq(&db, CF_VALUE_ROW_INDEX)?);
         let consumed_rows = read_meta_u64(&db, META_CONSUMED_ROWS)?.unwrap_or(0);
         let completed_games = read_meta_u64(&db, META_COMPLETED_GAMES)?.unwrap_or(next_episode_seq);
         let episodes_stopped = read_meta_u64(&db, META_EPISODES_STOPPED)?.unwrap_or(0);
         let retained_floor = read_meta_u64(&db, META_RETAINED_FLOOR)?.unwrap_or(0);
-        let retained_policy_floor = read_meta_u64(&db, META_RETAINED_POLICY_FLOOR)?.unwrap_or(0);
-        let retained_value_floor = read_meta_u64(&db, META_RETAINED_VALUE_FLOOR)?.unwrap_or(0);
         let cost_ema_bits = read_meta_u64(&db, META_TERMINAL_COST_EMA)?.unwrap_or(0);
         let best_cost_bits = read_meta_u64(&db, META_TERMINAL_COST_BEST)?.unwrap_or(0);
         let symmetric_metrics = SymmetricMetricAtoms::load(&db)?;
         let data_mode = read_data_mode(&db)?;
         write_meta_u64(&db, META_NEXT_EPISODE_SEQ, next_episode_seq)?;
         write_meta_u64(&db, META_PRODUCED_ROWS, produced_rows)?;
-        write_meta_u64(&db, META_PRODUCED_POLICY_ROWS, produced_policy_rows)?;
-        write_meta_u64(&db, META_PRODUCED_VALUE_ROWS, produced_value_rows)?;
         write_meta_u64(&db, META_COMPLETED_GAMES, completed_games)?;
 
         Ok(Self {
@@ -493,12 +413,8 @@ impl ReplayStore {
             completed_games: AtomicU64::new(completed_games),
             episodes_stopped: AtomicU64::new(episodes_stopped),
             produced_rows: AtomicU64::new(produced_rows),
-            produced_policy_rows: AtomicU64::new(produced_policy_rows),
-            produced_value_rows: AtomicU64::new(produced_value_rows),
             consumed_rows: AtomicU64::new(consumed_rows),
             retained_floor: AtomicU64::new(retained_floor),
-            retained_policy_floor: AtomicU64::new(retained_policy_floor),
-            retained_value_floor: AtomicU64::new(retained_value_floor),
             retain_rows,
             cost_ema_bits: AtomicU64::new(cost_ema_bits),
             win_ema_bits: AtomicU64::new(0),
@@ -533,8 +449,6 @@ impl ReplayStore {
         let sequences = AppendSequences {
             next_episode: self.next_episode_seq.load(Ordering::Acquire),
             next_row: self.produced_rows.load(Ordering::Acquire),
-            next_policy_row: self.produced_policy_rows.load(Ordering::Acquire),
-            next_value_row: self.produced_value_rows.load(Ordering::Acquire),
         };
         let id = ReplayEpisodeId::new(sequences.next_episode);
         let completed_games = self
@@ -542,7 +456,7 @@ impl ReplayStore {
             .load(Ordering::Acquire)
             .checked_add(1)
             .ok_or_else(|| ReplayError::storage("completed game counter overflow"))?;
-        let cost = f64::from(-record.outcome.learner_reward);
+        let cost = f64::from(-record.outcome.reward);
         let cost_ema_bits = next_ema_bits(self.cost_ema_bits.load(Ordering::Acquire), cost);
         let best_cost_bits = next_best_cost_bits(self.best_cost_bits.load(Ordering::Acquire), cost);
 
@@ -561,16 +475,6 @@ impl ReplayStore {
             encode_u64(sequences.next_episode),
         );
         batch.put_cf(&meta, META_PRODUCED_ROWS, encode_u64(sequences.next_row));
-        batch.put_cf(
-            &meta,
-            META_PRODUCED_POLICY_ROWS,
-            encode_u64(sequences.next_policy_row),
-        );
-        batch.put_cf(
-            &meta,
-            META_PRODUCED_VALUE_ROWS,
-            encode_u64(sequences.next_value_row),
-        );
         batch.put_cf(&meta, META_COMPLETED_GAMES, encode_u64(completed_games));
         batch.put_cf(&meta, META_TERMINAL_COST_EMA, encode_u64(cost_ema_bits));
         batch.put_cf(&meta, META_TERMINAL_COST_BEST, encode_u64(best_cost_bits));
@@ -586,10 +490,6 @@ impl ReplayStore {
             .store(completed_games, Ordering::Release);
         self.produced_rows
             .store(sequences.next_row, Ordering::Release);
-        self.produced_policy_rows
-            .store(sequences.next_policy_row, Ordering::Release);
-        self.produced_value_rows
-            .store(sequences.next_value_row, Ordering::Release);
         self.cost_ema_bits.store(cost_ema_bits, Ordering::Release);
         self.best_cost_bits.store(best_cost_bits, Ordering::Release);
         self.enforce_retention(sequences.next_row)?;
@@ -598,9 +498,7 @@ impl ReplayStore {
             &self.stop_ema_bits,
             f64::from(u8::from(record.outcome.stopped)),
         );
-        if !data_mode.is_single_vanilla()
-            && let Some(value_target) = record.outcome.value_target
-        {
+        if let Some(value_target) = record.outcome.value_target {
             // Stored biased by +1.0: an honest all-loss EMA of 0.0 would
             // collide with the zero-bits unseeded sentinel.
             self.update_ema(
@@ -614,8 +512,6 @@ impl ReplayStore {
     /// Atomically appends both perspectives of one paired game. The primary
     /// record supplies episode-level telemetry; row and
     /// storage counters include both records, while game counters advance once.
-    /// Sampled-tree stores reject this path because only learner rows belong
-    /// in replay; their swapped value orientation is generated by the trainer.
     pub fn append_episode_pair(
         &self,
         primary: (&ReplayEpisodeRecord, &[ReplayRow]),
@@ -629,9 +525,6 @@ impl ReplayStore {
             .transpose()
             .map_err(|_| ReplayError::InvalidRecord)?;
         let data_mode = self.data_mode()?;
-        if data_mode.is_sampled_tree() || data_mode.is_single_vanilla() {
-            return Err(ReplayError::InvalidRecord);
-        }
         validate_episode(primary.0, primary.1, feature_schema_hash, data_mode)?;
         validate_episode(secondary.0, secondary.1, feature_schema_hash, data_mode)?;
         let symmetric_metrics = data_mode
@@ -642,8 +535,6 @@ impl ReplayStore {
         let sequences = AppendSequences {
             next_episode: self.next_episode_seq.load(Ordering::Acquire),
             next_row: self.produced_rows.load(Ordering::Acquire),
-            next_policy_row: self.produced_policy_rows.load(Ordering::Acquire),
-            next_value_row: self.produced_value_rows.load(Ordering::Acquire),
         };
         let first_seq = sequences.next_episode;
         let second_seq = first_seq
@@ -654,7 +545,7 @@ impl ReplayStore {
             .load(Ordering::Acquire)
             .checked_add(1)
             .ok_or_else(|| ReplayError::storage("completed game counter overflow"))?;
-        let cost = f64::from(-primary.0.outcome.learner_reward);
+        let cost = f64::from(-primary.0.outcome.reward);
         let cost_ema_bits = next_ema_bits(self.cost_ema_bits.load(Ordering::Acquire), cost);
         let best_cost_bits = next_best_cost_bits(self.best_cost_bits.load(Ordering::Acquire), cost);
 
@@ -684,16 +575,6 @@ impl ReplayStore {
             encode_u64(sequences.next_episode),
         );
         batch.put_cf(&meta, META_PRODUCED_ROWS, encode_u64(sequences.next_row));
-        batch.put_cf(
-            &meta,
-            META_PRODUCED_POLICY_ROWS,
-            encode_u64(sequences.next_policy_row),
-        );
-        batch.put_cf(
-            &meta,
-            META_PRODUCED_VALUE_ROWS,
-            encode_u64(sequences.next_value_row),
-        );
         batch.put_cf(&meta, META_COMPLETED_GAMES, encode_u64(completed_games));
         batch.put_cf(&meta, META_EPISODES_STOPPED, encode_u64(episodes_stopped));
         batch.put_cf(&meta, META_TERMINAL_COST_EMA, encode_u64(cost_ema_bits));
@@ -711,10 +592,6 @@ impl ReplayStore {
             .store(episodes_stopped, Ordering::Release);
         self.produced_rows
             .store(sequences.next_row, Ordering::Release);
-        self.produced_policy_rows
-            .store(sequences.next_policy_row, Ordering::Release);
-        self.produced_value_rows
-            .store(sequences.next_value_row, Ordering::Release);
         self.cost_ema_bits.store(cost_ema_bits, Ordering::Release);
         self.best_cost_bits.store(best_cost_bits, Ordering::Release);
         if let Some(metrics) = symmetric_metrics {
@@ -766,24 +643,6 @@ impl ReplayStore {
         if new_floor <= floor {
             return Ok(());
         }
-        let new_floor_episode = decode_episode_from_row_key(&target_key)
-            .ok_or_else(|| ReplayError::storage("corrupt row key at retention target"))?;
-
-        let policy_floor = self.retained_policy_floor.load(Ordering::Acquire);
-        let value_floor = self.retained_value_floor.load(Ordering::Acquire);
-        let new_policy_floor = self.stream_floor_for_episode(
-            CF_POLICY_ROW_INDEX,
-            policy_floor,
-            self.produced_policy_rows.load(Ordering::Acquire),
-            new_floor_episode,
-        )?;
-        let new_value_floor = self.stream_floor_for_episode(
-            CF_VALUE_ROW_INDEX,
-            value_floor,
-            self.produced_value_rows.load(Ordering::Acquire),
-            new_floor_episode,
-        )?;
-
         let deleted = read_meta_u64(&self.db, META_DELETED_FLOOR)?.unwrap_or(0);
         let deleted_episode = if deleted == 0 {
             0
@@ -808,22 +667,8 @@ impl ReplayStore {
 
         let rows = self.cf(CF_ROWS)?;
         let episodes = self.cf(CF_EPISODES)?;
-        let policy_row_index = self.cf(CF_POLICY_ROW_INDEX)?;
-        let value_row_index = self.cf(CF_VALUE_ROW_INDEX)?;
-        let deleted_policy = read_meta_u64(&self.db, META_DELETED_POLICY_FLOOR)?.unwrap_or(0);
-        let deleted_value = read_meta_u64(&self.db, META_DELETED_VALUE_FLOOR)?.unwrap_or(0);
         let mut batch = WriteBatch::default();
         batch.delete_range_cf(&row_index, row_index_key(deleted), row_index_key(floor));
-        batch.delete_range_cf(
-            &policy_row_index,
-            row_index_key(deleted_policy),
-            row_index_key(policy_floor),
-        );
-        batch.delete_range_cf(
-            &value_row_index,
-            row_index_key(deleted_value),
-            row_index_key(value_floor),
-        );
         batch.delete_range_cf(
             &rows,
             row_key(deleted_episode, 0),
@@ -837,53 +682,10 @@ impl ReplayStore {
         let meta = self.cf(CF_META)?;
         batch.put_cf(&meta, META_DELETED_FLOOR, encode_u64(floor));
         batch.put_cf(&meta, META_RETAINED_FLOOR, encode_u64(new_floor));
-        batch.put_cf(&meta, META_DELETED_POLICY_FLOOR, encode_u64(policy_floor));
-        batch.put_cf(
-            &meta,
-            META_RETAINED_POLICY_FLOOR,
-            encode_u64(new_policy_floor),
-        );
-        batch.put_cf(&meta, META_DELETED_VALUE_FLOOR, encode_u64(value_floor));
-        batch.put_cf(
-            &meta,
-            META_RETAINED_VALUE_FLOOR,
-            encode_u64(new_value_floor),
-        );
         self.db.write(batch)?;
         self.retained_floor.store(new_floor, Ordering::Release);
-        self.retained_policy_floor
-            .store(new_policy_floor, Ordering::Release);
-        self.retained_value_floor
-            .store(new_value_floor, Ordering::Release);
 
         Ok(())
-    }
-
-    fn stream_floor_for_episode(
-        &self,
-        index_name: &'static str,
-        current_floor: u64,
-        produced: u64,
-        episode_floor: u64,
-    ) -> ReplayResult<u64> {
-        if current_floor >= produced {
-            return Ok(produced);
-        }
-        let index = self.cf(index_name)?;
-        let mut iter = self.db.iterator_cf(
-            &index,
-            IteratorMode::From(&row_index_key(current_floor), Direction::Forward),
-        );
-        while let Some((key, row_key)) = iter.next().transpose()? {
-            let sequence = decode_u64_key(&key)
-                .ok_or_else(|| ReplayError::storage("corrupt stream index key"))?;
-            let episode = decode_episode_from_row_key(&row_key)
-                .ok_or_else(|| ReplayError::storage("corrupt stream row key"))?;
-            if episode >= episode_floor {
-                return Ok(sequence);
-            }
-        }
-        Ok(produced)
     }
 
     pub fn ensure_feature_schema(&self, config: &FeatureSchemaConfig) -> ReplayResult<()> {
@@ -950,36 +752,13 @@ impl ReplayStore {
         &self,
         config: SampleConfig,
     ) -> ReplayResult<Vec<(ReplayEpisodeId, ReplayRow)>> {
-        self.sample_rows_kind(config, SampleKind::Any)
-    }
-
-    pub fn sample_rows_kind(
-        &self,
-        config: SampleConfig,
-        kind: SampleKind,
-    ) -> ReplayResult<Vec<(ReplayEpisodeId, ReplayRow)>> {
         // Lock-free against producers: appends commit all indexes and rows in
         // one WriteBatch before publishing the corresponding sequence count.
-        // Load each floor before its producer count. Retention publishes the
+        // Load the floor before its producer count. Retention publishes the
         // floor after the append's producer count, so this ordering cannot
         // combine a newer floor with an older count.
-        let (index_name, floor, produced) = match kind {
-            SampleKind::Any => (
-                CF_ROW_INDEX,
-                self.retained_floor.load(Ordering::Acquire),
-                self.produced_rows.load(Ordering::Acquire),
-            ),
-            SampleKind::Policy => (
-                CF_POLICY_ROW_INDEX,
-                self.retained_policy_floor.load(Ordering::Acquire),
-                self.produced_policy_rows.load(Ordering::Acquire),
-            ),
-            SampleKind::Value => (
-                CF_VALUE_ROW_INDEX,
-                self.retained_value_floor.load(Ordering::Acquire),
-                self.produced_value_rows.load(Ordering::Acquire),
-            ),
-        };
+        let floor = self.retained_floor.load(Ordering::Acquire);
+        let produced = self.produced_rows.load(Ordering::Acquire);
 
         if produced <= floor || produced == 0 {
             return Err(ReplayError::Empty);
@@ -997,17 +776,16 @@ impl ReplayStore {
         let sequences = (0..batch)
             .map(|_| start + rng.next_bounded(window))
             .collect::<Vec<_>>();
-        let out = self.read_row_sequences(index_name, &sequences)?;
+        let out = self.read_row_sequences(&sequences)?;
         self.record_consumed(config.batch.get() as u64)?;
         Ok(out)
     }
 
     fn read_row_sequences(
         &self,
-        index_name: &'static str,
         sequences: &[u64],
     ) -> ReplayResult<Vec<(ReplayEpisodeId, ReplayRow)>> {
-        let row_index = self.cf(index_name)?;
+        let row_index = self.cf(CF_ROW_INDEX)?;
         let rows = self.cf(CF_ROWS)?;
         let index_keys = sequences
             .iter()
@@ -1136,22 +914,6 @@ impl ReplayStore {
         self.symmetric_metrics.snapshot()
     }
 
-    /// Static root facts for single-graph runs; survives reopen.
-    pub fn set_root_info(&self, info: &ReplayRootInfo) -> ReplayResult<()> {
-        let meta = self.cf(CF_META)?;
-        self.db
-            .put_cf(&meta, META_ROOT_INFO, postcard::to_allocvec(info)?)
-            .map_err(ReplayError::from)
-    }
-
-    pub fn root_info(&self) -> ReplayResult<Option<ReplayRootInfo>> {
-        let meta = self.cf(CF_META)?;
-        self.db
-            .get_cf(&meta, META_ROOT_INFO)?
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(ReplayError::from))
-            .transpose()
-    }
-
     /// (completed games, primary learner episodes that selected STOP).
     #[must_use]
     pub fn episode_counters(&self) -> (u64, u64) {
@@ -1165,8 +927,6 @@ impl ReplayStore {
     pub fn counters(&self) -> ReplayCounters {
         ReplayCounters {
             produced_rows: self.produced_rows.load(Ordering::Acquire),
-            produced_policy_rows: self.produced_policy_rows.load(Ordering::Acquire),
-            produced_value_rows: self.produced_value_rows.load(Ordering::Acquire),
             consumed_rows: self.consumed_rows.load(Ordering::Acquire),
         }
     }
