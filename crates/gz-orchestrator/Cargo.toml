@@ -11,7 +11,3 @@ gz-features = { path = "../gz-features" }
 gz-measurer = { path = "../gz-measurer" }
 gz-replay = { path = "../gz-replay" }
 gz-search = { path = "../gz-search" }
-
-[dev-dependencies]
-gz-engine-whittle = { path = "../gz-engine-whittle" }
-gz-eval-whittle = { path = "../gz-eval-whittle" }

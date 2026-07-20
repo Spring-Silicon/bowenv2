@@ -6,20 +6,9 @@ import numpy as np
 
 from gz.codec import BatchView
 from gz.common import FeatureSchemaHash
-from gz.model import build
 from gz.model.stub import STUB_MODEL_VERSION, stub
 from gz.proto.frames import BATCH_ENCODING_VERSION
 from python.tests.test_codec import make_batch
-
-
-def test_registry_builds_stub() -> None:
-    batch = BatchView.parse(make_batch(attr_dim=1))
-    model = build("stub", batch.dims, {})
-
-    values, logits = model(batch)
-
-    assert values.shape == (2,)
-    assert logits.shape == (2, 3)
 
 
 def test_stub_matches_scalar_reference_on_batch() -> None:

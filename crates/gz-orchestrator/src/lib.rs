@@ -3,25 +3,24 @@
 //! Execution drivers for GraphZero search workers.
 
 pub mod admission;
-mod batch;
-mod bench;
 mod ids;
 mod lanes;
+mod leases;
 mod pool;
 mod root;
-mod serial;
-mod service;
 
 pub use admission::{AdaptiveAdmissionSchedule, AdmissionDecision, AdmissionSmoothingConfig};
-pub use batch::{BatchedGumbelOrchestrator, BatchedRun};
-pub use bench::{
-    SelfplayBenchConfig, SelfplayBenchReport, SelfplayEpisodeStats, SelfplayRunStats,
-    run_selfplay_benchmark, run_serial_selfplay_benchmark,
-};
-pub use ids::{EpisodeId, WorkerId};
+pub use ids::EpisodeId;
 pub use lanes::{
-    FeaturizedRuntime, LaneEpisodes, ReplayBackpressure, ReplayRuntime, ThreadedGumbelOrchestrator,
-    ThreadedOrchestratorConfig, ThreadedReplayRun, ThreadedRun,
+    FeaturizedRuntime, ReplayBackpressure, ReplayRuntime, ThreadedGumbelOrchestrator,
+    ThreadedOrchestratorConfig, ThreadedReplayRun,
 };
-pub use root::{CountedRoots, RootSource};
-pub use serial::{OrchestratedEpisode, SerialEpisode, SerialGumbelOrchestrator};
+pub use root::RootSource;
+
+pub(crate) fn internal(message: &'static str) -> gz_engine::EngineError {
+    gz_engine::EngineError::Internal {
+        code: gz_engine::ErrorCode::new(1),
+        message: gz_engine::ErrorMessage::new(message)
+            .expect("internal orchestrator message is short"),
+    }
+}

@@ -76,10 +76,9 @@ Whittle measurement-based evaluator used by tests and local search examples.
 
 ### `gz-orchestrator`
 
-Serial, batched, and threaded execution drivers. The threaded production path
-owns lane worker pools, bounded evaluator queues, model-version leases,
-admission shaping, wave batching, handle release, feature extraction, and the
-replay sink.
+The threaded production driver owns lane worker pools, bounded evaluator queues,
+model-version leases, admission shaping, concurrent search waves, handle release,
+feature extraction, and the replay sink.
 
 ### `gz-measurer`
 

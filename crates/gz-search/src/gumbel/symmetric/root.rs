@@ -54,11 +54,9 @@ pub struct SymmetricSelfplayRootTask<G, C> {
     releasable: GumbelHandleBatch<G, C>,
     reused: Option<ReusedTree<G, C>>,
     eval_count: usize,
-    portable_contexts: usize,
     carried_nodes: usize,
     carried_root_visits: u32,
     next_token: u64,
-    wave_batching: bool,
     pending: Option<Pending<G, C>>,
     state: State<G, C>,
 }
@@ -80,26 +78,6 @@ where
         player: GumbelPlayer,
         noise_seed: u64,
         visited: [HashSet<ReplayGraphContext>; 2],
-    ) -> Self {
-        Self::with_wave_batching(
-            search, identity, graphs, contexts, rewrites, inactive, stopped, player, noise_seed,
-            visited, false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_wave_batching(
-        search: &GumbelMcts,
-        identity: EngineIdentity,
-        graphs: [G; 2],
-        contexts: [Option<ReplayGraphContext>; 2],
-        rewrites: [usize; 2],
-        inactive: [bool; 2],
-        stopped: [bool; 2],
-        player: GumbelPlayer,
-        noise_seed: u64,
-        visited: [HashSet<ReplayGraphContext>; 2],
-        wave_batching: bool,
     ) -> Self {
         assert_eq!(
             search.config().value_mode,
@@ -128,17 +106,11 @@ where
             releasable: GumbelHandleBatch::default(),
             reused: None,
             eval_count: 0,
-            portable_contexts: 0,
             carried_nodes: 0,
             carried_root_visits: 0,
             next_token: 0,
-            wave_batching,
             pending: None,
-            state: State::Resolve {
-                board,
-                attach: None,
-                run: None,
-            },
+            state: State::Resolve { board },
         }
     }
 
@@ -146,115 +118,42 @@ where
         if self.pending.is_some() {
             return Ok(SearchPoll::Blocked);
         }
-        loop {
-            let state = std::mem::replace(&mut self.state, State::Done);
-            match state {
-                State::Resolve {
-                    mut board,
-                    mut attach,
-                    mut run,
-                } => {
-                    while !board.active(self.config.max_steps, board.player) {
-                        if board.terminal(self.config.max_steps) {
-                            let terminal_run = run
-                                .take()
-                                .ok_or_else(|| internal("symmetric root started terminal"))?;
-                            self.state = State::MeasureP1 {
-                                board,
-                                attach,
-                                run: terminal_run,
-                            };
-                            break;
-                        }
-                        board.player = board.player.opponent();
-                        if let Some(attach) = &mut attach {
-                            attach.turns = attach.turns.saturating_add(1);
-                        }
+        let state = std::mem::replace(&mut self.state, State::Done);
+        match state {
+            State::Resolve { mut board } => {
+                while !board.active(self.config.max_steps, board.player) {
+                    if board.terminal(self.config.max_steps) {
+                        return Err(internal("symmetric root started terminal"));
                     }
-                    if matches!(self.state, State::MeasureP1 { .. }) {
-                        continue;
-                    }
-                    let token = self.next_token();
-                    self.pending = Some(Pending::Expand {
-                        token,
-                        board,
-                        attach,
-                        run,
-                    });
-                    return Ok(SearchPoll::Work(SearchWork::Expand(ExpandWork {
-                        token,
-                        graph: board.current_graph(),
-                        options: self.config.candidate_options,
-                    })));
+                    board.player = board.player.opponent();
                 }
-                State::Eval {
-                    board,
-                    attach,
-                    run,
-                    expansion,
-                } => return self.poll_eval(board, attach, run, expansion),
-                State::Running(mut run) => {
-                    if run.descent.is_none() && !self.start_descent(&mut run) {
-                        return self.finish_root(run);
-                    }
-                    self.continue_descent(run)?;
-                }
-                State::WaveRunning(wave) => return self.poll_wave(wave),
-                State::MeasureP1 { board, attach, run } => {
-                    let token = self.next_token();
-                    self.pending = Some(Pending::MeasureP1 {
-                        token,
-                        board,
-                        attach,
-                        run,
-                    });
-                    return Ok(SearchPoll::Work(SearchWork::Measure(MeasureWork {
-                        token,
-                        graph: board.graphs[0],
-                        options: self.config.measure_options,
-                    })));
-                }
-                State::MeasureP2 {
-                    board,
-                    attach,
-                    run,
-                    p1_measure,
-                } => {
-                    let token = self.next_token();
-                    self.pending = Some(Pending::MeasureP2 {
-                        token,
-                        board,
-                        attach,
-                        run,
-                        p1_measure,
-                    });
-                    return Ok(SearchPoll::Work(SearchWork::Measure(MeasureWork {
-                        token,
-                        graph: board.graphs[1],
-                        options: self.config.measure_options,
-                    })));
-                }
-                State::Work(work) => return Ok(SearchPoll::Work(work)),
-                State::DoneResult(result) => {
-                    self.state = State::Done;
-                    return Ok(SearchPoll::Done(result));
-                }
-                State::Done => return Err(internal("poll after symmetric root completion")),
+                let token = self.next_token();
+                self.pending = Some(Pending::Expand { token, board });
+                Ok(SearchPoll::Work(SearchWork::Expand(ExpandWork {
+                    token,
+                    graph: board.current_graph(),
+                    options: self.config.candidate_options,
+                })))
             }
+            State::Eval { board, expansion } => self.poll_eval(board, expansion),
+            State::WaveRunning(wave) => self.poll_wave(wave),
+            State::DoneResult(result) => {
+                self.state = State::Done;
+                Ok(SearchPoll::Done(result))
+            }
+            State::Done => Err(internal("poll after symmetric root completion")),
         }
     }
 
     pub fn resume(&mut self, token: WorkToken, result: SearchWorkResult<G, C>) -> EngineResult<()> {
-        if self.wave_batching {
-            let state = std::mem::replace(&mut self.state, State::Done);
-            match state {
-                State::WaveRunning(mut wave) if wave.has_pending(token) => {
-                    let resumed = self.resume_wave(&mut wave, token, result);
-                    self.state = State::WaveRunning(wave);
-                    return resumed;
-                }
-                state => self.state = state,
+        let state = std::mem::replace(&mut self.state, State::Done);
+        match state {
+            State::WaveRunning(mut wave) if wave.has_pending(token) => {
+                let resumed = self.resume_wave(&mut wave, token, result);
+                self.state = State::WaveRunning(wave);
+                return resumed;
             }
+            state => self.state = state,
         }
         let pending = self
             .pending
@@ -265,58 +164,18 @@ where
             return Err(internal("unknown symmetric work token"));
         }
         match (pending, result) {
-            (
-                Pending::Expand {
-                    board, attach, run, ..
-                },
-                SearchWorkResult::Expand(result),
-            ) => self.resume_expand(board, attach, run, result),
+            (Pending::Expand { board, .. }, SearchWorkResult::Expand(result)) => {
+                self.resume_expand(board, result)
+            }
             (
                 Pending::Eval {
                     board,
-                    attach,
-                    run,
                     expansion,
                     request,
                     ..
                 },
                 SearchWorkResult::Eval(output),
-            ) => self.resume_eval(board, attach, run, expansion, request, output),
-            (
-                Pending::Apply {
-                    run, node, action, ..
-                },
-                SearchWorkResult::Apply(applied),
-            ) => self.resume_apply(run, node, action, applied),
-            (
-                Pending::MeasureP1 {
-                    board, attach, run, ..
-                },
-                SearchWorkResult::Measure(p1_measure),
-            ) => {
-                self.state = State::MeasureP2 {
-                    board,
-                    attach,
-                    run,
-                    p1_measure,
-                };
-                Ok(())
-            }
-            (
-                Pending::MeasureP2 {
-                    board,
-                    attach,
-                    mut run,
-                    p1_measure,
-                    ..
-                },
-                SearchWorkResult::Measure(p2_measure),
-            ) => {
-                let value = terminal_value(&board, &p1_measure, &p2_measure)?;
-                self.attach_and_backup(&mut run, attach, BranchTarget::Terminal(value))?;
-                self.state = State::Running(run);
-                Ok(())
-            }
+            ) => self.resume_eval(board, expansion, request, output),
             (pending, _) => {
                 self.pending = Some(pending);
                 Err(internal("mismatched symmetric work result"))
@@ -369,11 +228,9 @@ where
             releasable: GumbelHandleBatch::default(),
             reused: None,
             eval_count: 0,
-            portable_contexts: 0,
             carried_nodes: reused.carried_nodes,
             carried_root_visits: reused.carried_root_visits,
             next_token: 0,
-            wave_batching: self.wave_batching,
             pending: None,
             state: State::Done,
         };
@@ -387,11 +244,7 @@ where
                 return Err(error);
             }
         };
-        task.state = if task.wave_batching {
-            State::WaveRunning(WaveRun::new(run))
-        } else {
-            State::Running(run)
-        };
+        task.state = State::WaveRunning(WaveRun::new(run));
         Ok(Some(task))
     }
 
@@ -465,8 +318,6 @@ where
     fn poll_eval(
         &mut self,
         board: Board<G>,
-        attach: Option<Attach>,
-        run: Option<Run>,
         expansion: Expansion<C>,
     ) -> EngineResult<SearchPoll<G, C, SymmetricRootResult<G, C>>> {
         let player = board.player;
@@ -496,21 +347,13 @@ where
         self.pending = Some(Pending::Eval {
             token,
             board,
-            attach,
-            run,
             expansion,
             request,
         });
         Ok(SearchPoll::Work(SearchWork::Eval(work)))
     }
 
-    fn resume_expand(
-        &mut self,
-        mut board: Board<G>,
-        mut attach: Option<Attach>,
-        run: Option<Run>,
-        result: ExpandResult<C>,
-    ) -> EngineResult<()> {
+    fn resume_expand(&mut self, mut board: Board<G>, result: ExpandResult<C>) -> EngineResult<()> {
         self.created_candidates.extend(
             result
                 .candidates
@@ -518,7 +361,6 @@ where
                 .map(|candidate| candidate.candidate),
         );
         let context = self.identity.context(result.graph_hash);
-        self.portable_contexts += 1;
         let player = board.player;
         if let Some(expected) = board.contexts[player.index()]
             && expected != context
@@ -529,22 +371,11 @@ where
         if board.graphs[0] == board.graphs[1] {
             board.contexts[player.opponent().index()].get_or_insert(context);
         }
-        if attach.is_none() {
-            self.root_context = Some(context);
-        }
+        self.root_context = Some(context);
 
         if result.candidates.is_empty() {
-            if run.is_none() {
-                self.release_all_created();
-                self.state = State::DoneResult(SymmetricRootResult::Pass { player, context });
-                return Ok(());
-            }
-            board.inactive[player.index()] = true;
-            board.player = player.opponent();
-            if let Some(attach) = &mut attach {
-                attach.turns = attach.turns.saturating_add(1);
-            }
-            self.state = State::Resolve { board, attach, run };
+            self.release_all_created();
+            self.state = State::DoneResult(SymmetricRootResult::Pass { player, context });
             return Ok(());
         }
 
@@ -571,8 +402,6 @@ where
         eval_actions.push(EvalAction::stop(context));
         self.state = State::Eval {
             board,
-            attach,
-            run,
             expansion: Expansion {
                 context,
                 candidates,
@@ -585,8 +414,6 @@ where
     fn resume_eval(
         &mut self,
         board: Board<G>,
-        attach: Option<Attach>,
-        mut run: Option<Run>,
         expansion: Expansion<C>,
         request: EvalRequest,
         output: EvalOutput,
@@ -632,17 +459,8 @@ where
             pass: None,
         });
         self.eval_count += 1;
-        if let Some(mut run) = run.take() {
-            self.attach_and_backup(&mut run, attach, BranchTarget::Node(node_index))?;
-            self.state = State::Running(run);
-        } else {
-            let run = self.start_run()?;
-            self.state = if self.wave_batching {
-                State::WaveRunning(WaveRun::new(run))
-            } else {
-                State::Running(run)
-            };
-        }
+        let run = self.start_run()?;
+        self.state = State::WaveRunning(WaveRun::new(run));
         Ok(())
     }
 
@@ -699,58 +517,7 @@ where
             root_visit_baseline,
             schedule_index: 0,
             simulations: 0,
-            descent: None,
         })
-    }
-
-    fn start_descent(&self, run: &mut Run) -> bool {
-        let Some(&target) = run.schedule.get(run.schedule_index) else {
-            return false;
-        };
-        self.replenish_considered(run);
-        let root = &self.nodes[0];
-        let scores = self.root_scores(0, &run.base_scores);
-        let action = run
-            .considered
-            .iter()
-            .copied()
-            .filter(|&action| {
-                !root.masked[action]
-                    && root.edges[action].visits
-                        == run.root_visit_baseline[action].saturating_add(target)
-            })
-            .max_by(|&left, &right| {
-                scores[left]
-                    .total_cmp(&scores[right])
-                    .then_with(|| right.cmp(&left))
-            })
-            .or_else(|| {
-                run.considered
-                    .iter()
-                    .copied()
-                    .filter(|&action| !root.masked[action])
-                    .max_by(|&left, &right| {
-                        scores[left]
-                            .total_cmp(&scores[right])
-                            .then_with(|| right.cmp(&left))
-                    })
-            });
-        let Some(action) = action else {
-            return false;
-        };
-        let mut seen = self.visited.clone();
-        for player in [GumbelPlayer::One, GumbelPlayer::Two] {
-            if let Some(context) = root.board.contexts[player.index()] {
-                seen[player.index()].insert(context);
-            }
-        }
-        run.descent = Some(Descent {
-            node: 0,
-            path: Vec::new(),
-            seen,
-            forced: Some(action),
-        });
-        true
     }
 
     fn poll_wave(
@@ -1351,7 +1118,6 @@ where
         }
         let player = self.nodes[node_index].board.player;
         let context = self.identity.context(applied.after_hash);
-        self.portable_contexts += 1;
         if self.config.no_backtrack && descent.seen[player.index()].contains(&context) {
             self.releasable.graphs.push(applied.after);
             self.mask_action(node_index, action);
@@ -1394,7 +1160,6 @@ where
                 .map(|candidate| candidate.candidate),
         );
         let context = self.identity.context(result.graph_hash);
-        self.portable_contexts += 1;
         let player = board.player;
         if let Some(expected) = board.contexts[player.index()]
             && expected != context
@@ -1501,166 +1266,6 @@ where
         Ok(WaveSimulationState::Outcome { descent, value })
     }
 
-    fn continue_descent(&mut self, mut run: Run) -> EngineResult<()> {
-        let descent = run
-            .descent
-            .as_mut()
-            .ok_or_else(|| internal("missing symmetric descent"))?;
-        let node_index = descent.node;
-        let action = match descent.forced.take() {
-            Some(action) => Some(action),
-            None => self.select_nonroot(node_index),
-        };
-        let Some(action) = action else {
-            if let Some(branch) = self.nodes[node_index].pass {
-                descent.path.push(PathStep::Transform { flip: branch.flip });
-                return self.follow_target(run, branch.target);
-            }
-            let mut board = self.nodes[node_index].board;
-            let player = board.player;
-            board.inactive[player.index()] = true;
-            board.player = player.opponent();
-            self.state = State::Resolve {
-                board,
-                attach: Some(Attach {
-                    slot: AttachSlot::Pass { node: node_index },
-                    turns: 1,
-                }),
-                run: Some(run),
-            };
-            return Ok(());
-        };
-
-        if let Some(branch) = self.nodes[node_index].edges[action].branch {
-            let player = self.nodes[node_index].board.player;
-            if let Some(context) = self.nodes[node_index].edges[action].after_context {
-                if self.config.no_backtrack && descent.seen[player.index()].contains(&context) {
-                    self.mask_action(node_index, action);
-                    self.state = State::Running(run);
-                    return Ok(());
-                }
-                descent.seen[player.index()].insert(context);
-            }
-            descent.path.push(PathStep::Decision {
-                node: node_index,
-                action,
-                flip: branch.flip,
-            });
-            return self.follow_target(run, branch.target);
-        }
-        if self.nodes[node_index].is_stop(action) {
-            let board = self.stopped_board(node_index);
-            self.state = State::Resolve {
-                board,
-                attach: Some(Attach {
-                    slot: AttachSlot::Action {
-                        node: node_index,
-                        action,
-                    },
-                    turns: 1,
-                }),
-                run: Some(run),
-            };
-            return Ok(());
-        }
-        let token = self.next_token();
-        self.pending = Some(Pending::Apply {
-            token,
-            run,
-            node: node_index,
-            action,
-        });
-        let node = &self.nodes[node_index];
-        self.state = State::Work(SearchWork::Apply(ApplyWork {
-            token,
-            graph: node.board.current_graph(),
-            candidate: node.candidates[action],
-        }));
-        Ok(())
-    }
-
-    fn resume_apply(
-        &mut self,
-        mut run: Run,
-        node_index: usize,
-        action: usize,
-        applied: ApplyResult<G, C>,
-    ) -> EngineResult<()> {
-        if applied.rejected.is_some() {
-            self.releasable.graphs.push(applied.after);
-            self.mask_action(node_index, action);
-            self.state = State::Running(run);
-            return Ok(());
-        }
-        let player = self.nodes[node_index].board.player;
-        let context = self.identity.context(applied.after_hash);
-        self.portable_contexts += 1;
-        let Some(descent) = run.descent.as_mut() else {
-            self.releasable.graphs.push(applied.after);
-            return Err(internal("missing symmetric descent"));
-        };
-        if self.config.no_backtrack && descent.seen[player.index()].contains(&context) {
-            self.releasable.graphs.push(applied.after);
-            self.mask_action(node_index, action);
-            self.state = State::Running(run);
-            return Ok(());
-        }
-        descent.seen[player.index()].insert(context);
-        self.created_graphs.push(applied.after);
-        let edge = &mut self.nodes[node_index].edges[action];
-        edge.after_graph = Some(applied.after);
-        edge.after_context = Some(context);
-        let mut board = self.nodes[node_index].board;
-        board.graphs[player.index()] = applied.after;
-        board.contexts[player.index()] = Some(context);
-        board.rewrites[player.index()] += 1;
-        board.player = player.opponent();
-        self.state = State::Resolve {
-            board,
-            attach: Some(Attach {
-                slot: AttachSlot::Action {
-                    node: node_index,
-                    action,
-                },
-                turns: 1,
-            }),
-            run: Some(run),
-        };
-        Ok(())
-    }
-
-    fn follow_target(&mut self, mut run: Run, target: BranchTarget) -> EngineResult<()> {
-        match target {
-            BranchTarget::Node(node) => {
-                run.descent
-                    .as_mut()
-                    .ok_or_else(|| internal("missing symmetric descent"))?
-                    .node = node;
-                self.state = State::Running(run);
-            }
-            BranchTarget::Terminal(value) => {
-                self.backup(&mut run, value)?;
-                self.state = State::Running(run);
-            }
-        }
-        Ok(())
-    }
-
-    fn attach_and_backup(
-        &mut self,
-        run: &mut Run,
-        attach: Option<Attach>,
-        target: BranchTarget,
-    ) -> EngineResult<()> {
-        let attach = attach.ok_or_else(|| internal("missing symmetric branch attachment"))?;
-        let descent = run
-            .descent
-            .as_mut()
-            .ok_or_else(|| internal("missing symmetric descent"))?;
-        let value = self.attach_target(descent, attach, target)?;
-        self.backup(run, value)
-    }
-
     fn attach_target(
         &mut self,
         descent: &mut Descent,
@@ -1697,18 +1302,6 @@ where
             BranchTarget::Terminal(value) => value,
         };
         Ok(value)
-    }
-
-    fn backup(&mut self, run: &mut Run, value: f32) -> EngineResult<()> {
-        let descent = run
-            .descent
-            .as_ref()
-            .ok_or_else(|| internal("missing symmetric descent"))?;
-        self.backup_descent(descent, value);
-        run.simulations += 1;
-        run.schedule_index += 1;
-        run.descent = None;
-        Ok(())
     }
 
     fn backup_descent(&mut self, descent: &Descent, mut value: f32) {
@@ -2083,7 +1676,6 @@ where
                 simulations: run.simulations,
                 expanded_nodes: self.nodes.len(),
                 eval_count: self.eval_count,
-                portable_contexts: self.portable_contexts,
                 carried_nodes: self.carried_nodes,
                 carried_root_visits: self.carried_root_visits,
             },
@@ -2367,7 +1959,6 @@ struct Run {
     root_visit_baseline: Vec<u32>,
     schedule_index: usize,
     simulations: usize,
-    descent: Option<Descent>,
 }
 
 struct WaveRun<G, C> {
@@ -2554,29 +2145,12 @@ enum AttachSlot {
 enum State<G, C> {
     Resolve {
         board: Board<G>,
-        attach: Option<Attach>,
-        run: Option<Run>,
     },
     Eval {
         board: Board<G>,
-        attach: Option<Attach>,
-        run: Option<Run>,
         expansion: Expansion<C>,
     },
-    Running(Run),
     WaveRunning(WaveRun<G, C>),
-    MeasureP1 {
-        board: Board<G>,
-        attach: Option<Attach>,
-        run: Run,
-    },
-    MeasureP2 {
-        board: Board<G>,
-        attach: Option<Attach>,
-        run: Run,
-        p1_measure: MeasureResult<G>,
-    },
-    Work(SearchWork<G, C>),
     DoneResult(SymmetricRootResult<G, C>),
     Done,
 }
@@ -2586,46 +2160,19 @@ enum Pending<G, C> {
     Expand {
         token: WorkToken,
         board: Board<G>,
-        attach: Option<Attach>,
-        run: Option<Run>,
     },
     Eval {
         token: WorkToken,
         board: Board<G>,
-        attach: Option<Attach>,
-        run: Option<Run>,
         expansion: Expansion<C>,
         request: EvalRequest,
-    },
-    Apply {
-        token: WorkToken,
-        run: Run,
-        node: usize,
-        action: usize,
-    },
-    MeasureP1 {
-        token: WorkToken,
-        board: Board<G>,
-        attach: Option<Attach>,
-        run: Run,
-    },
-    MeasureP2 {
-        token: WorkToken,
-        board: Board<G>,
-        attach: Option<Attach>,
-        run: Run,
-        p1_measure: MeasureResult<G>,
     },
 }
 
 impl<G, C> Pending<G, C> {
     fn token(&self) -> WorkToken {
         match self {
-            Self::Expand { token, .. }
-            | Self::Eval { token, .. }
-            | Self::Apply { token, .. }
-            | Self::MeasureP1 { token, .. }
-            | Self::MeasureP2 { token, .. } => *token,
+            Self::Expand { token, .. } | Self::Eval { token, .. } => *token,
         }
     }
 }

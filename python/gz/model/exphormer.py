@@ -74,7 +74,12 @@ class ArchConfig:
         for field, expected in fixed.items():
             if getattr(self, field) != expected:
                 raise ValueError(f"{field} must be {expected!r}")
-        if self.auxiliary_heads not in {"none", "v8-v32-score"}:
+        if self.auxiliary_heads not in {
+            "none",
+            "v8-v32-score",
+            "v8-v32-score-soft-policy",
+            "v8-v32-score-soft-policy-v2",
+        }:
             raise ValueError("unsupported auxiliary_heads")
 
     def to_dict(self) -> dict[str, object]:
@@ -521,7 +526,11 @@ def _model_class():
                 arch.dropout,
             )
             value_dim = arch.dim
-            if arch.auxiliary_heads == "v8-v32-score":
+            if arch.auxiliary_heads in {
+                "v8-v32-score",
+                "v8-v32-score-soft-policy",
+                "v8-v32-score-soft-policy-v2",
+            }:
                 auxiliary_hidden = arch.value_hidden or arch.ffn_dim
                 self.horizon_value = _mlp(
                     nn,
@@ -542,6 +551,22 @@ def _model_class():
             else:
                 self.horizon_value = None
                 self.terminal_score = None
+            self.soft_policy_kind_embedding = None
+            self.soft_policy = None
+            if arch.auxiliary_heads == "v8-v32-score-soft-policy":
+                # Checkpoint compatibility for the retired shared-head
+                # experiment. Training configuration rejects this layout.
+                self.policy.add_legacy_soft_policy_readout()
+            elif arch.auxiliary_heads == "v8-v32-score-soft-policy-v2":
+                # Initialize the auxiliary head after every pre-existing module
+                # so a fixed model seed preserves their historical initialization.
+                # It shares only encoded graph tensors with the serving policy.
+                self.soft_policy_kind_embedding = nn.Embedding(
+                    schema.action_kind_vocab_size,
+                    arch.dim,
+                    padding_idx=0,
+                )
+                self.soft_policy = PointerPolicyHead(arch, _action_feat_dim(arch))
 
         def forward(
             self,
@@ -583,6 +608,49 @@ def _model_class():
             logits = self._policy_logits(batch, h, g_readout, node_mask)
             return value_raw, horizon_raw, score_raw, logits, g_readout
 
+        def training_forward_with_soft_policy(
+            self,
+            batch: GraphBatchTensors,
+            value_trunk_grad_scale: float = 1.0,
+            soft_policy_trunk_grad_scale: float = 1.0,
+        ):
+            graph, node_roles = self._model_graph(batch)
+            h, g_readout, node_mask = self._encode_graph(graph, node_roles)
+            value_raw, horizon_raw, score_raw = self._training_value_outputs(
+                g_readout,
+                value_trunk_grad_scale,
+            )
+            logits, soft_policy_logits = self._training_policy_logits(
+                batch,
+                h,
+                g_readout,
+                node_mask,
+                soft_policy_trunk_grad_scale,
+            )
+            return (
+                value_raw,
+                horizon_raw,
+                score_raw,
+                logits,
+                soft_policy_logits,
+                g_readout,
+            )
+
+        def training_policy_logits(
+            self,
+            batch: GraphBatchTensors,
+            soft_policy_trunk_grad_scale: float = 1.0,
+        ):
+            graph, node_roles = self._model_graph(batch)
+            h, g_readout, node_mask = self._encode_graph(graph, node_roles)
+            return self._training_policy_logits(
+                batch,
+                h,
+                g_readout,
+                node_mask,
+                soft_policy_trunk_grad_scale,
+            )
+
         def training_values(
             self,
             batch: GraphBatchTensors,
@@ -599,7 +667,57 @@ def _model_class():
             return _joint_board_graph(torch, batch)
 
         def _policy_logits(self, batch, h, g_readout, node_mask):
-            kind = self.kind_embedding(
+            action_feat, action_mask = self._policy_inputs(
+                batch,
+                h,
+                g_readout,
+                node_mask,
+                self.kind_embedding,
+            )
+            return self.policy(g_readout, action_feat, action_mask)
+
+        def _training_policy_logits(
+            self,
+            batch,
+            h,
+            g_readout,
+            node_mask,
+            soft_policy_trunk_grad_scale,
+        ):
+            if (
+                self.soft_policy is None
+                or self.soft_policy_kind_embedding is None
+            ):
+                raise ValueError("soft-policy training requires an independent head")
+            action_feat, action_mask = self._policy_inputs(
+                batch,
+                h,
+                g_readout,
+                node_mask,
+                self.kind_embedding,
+            )
+            logits = self.policy(g_readout, action_feat, action_mask)
+            soft_h = _scale_gradient(h, soft_policy_trunk_grad_scale)
+            soft_g_readout = _scale_gradient(
+                g_readout,
+                soft_policy_trunk_grad_scale,
+            )
+            soft_action_feat, soft_action_mask = self._policy_inputs(
+                batch,
+                soft_h,
+                soft_g_readout,
+                node_mask,
+                self.soft_policy_kind_embedding,
+            )
+            soft_policy_logits = self.soft_policy(
+                soft_g_readout,
+                soft_action_feat,
+                soft_action_mask,
+            )
+            return logits, soft_policy_logits
+
+        def _policy_inputs(self, batch, h, g_readout, node_mask, kind_embedding):
+            kind = kind_embedding(
                 batch.action_kind.clamp(0, self.schema.action_kind_vocab_size - 1)
             )
             subject_feat = _subject_pool(
@@ -620,7 +738,7 @@ def _model_class():
             )
             action_index = torch.arange(action_feat.shape[1], device=action_feat.device)
             action_mask = action_index.unsqueeze(0) < batch.action_count.unsqueeze(1)
-            return self.policy(g_readout, action_feat, action_mask)
+            return action_feat, action_mask
 
         def _value_output(
             self,
@@ -698,8 +816,20 @@ def _model_class():
             self.pointer_board_norm = nn.LayerNorm(dim)
             self.pointer_token_norm = nn.LayerNorm(dim)
             self.pointer_key = nn.Linear(dim, dim, bias=False)
+            self.soft_pointer_key = None
+
+        def add_legacy_soft_policy_readout(self) -> None:
+            self.soft_pointer_key = nn.Linear(
+                self.pointer_key.in_features,
+                self.pointer_key.out_features,
+                bias=False,
+            )
 
         def forward(self, readout, action_feat, action_mask):
+            board, tokens = self._representations(readout, action_feat, action_mask)
+            return self._pointer_logits(board, tokens, self.pointer_key)
+
+        def _representations(self, readout, action_feat, action_mask):
             b, a, _ = action_feat.shape
             tokens = self.token_proj(action_feat)
             dim = tokens.shape[-1]
@@ -716,7 +846,12 @@ def _model_class():
             board = board + self.board_ffn(board)
             board = self.pointer_board_norm(board)
             tokens = self.pointer_token_norm(tokens)
-            raw = torch.einsum("bd,bad->ba", board, self.pointer_key(tokens)) / math.sqrt(dim)
+            return board, tokens
+
+        def _pointer_logits(self, board, tokens, pointer_key):
+            raw = torch.einsum("bd,bad->ba", board, pointer_key(tokens)) / math.sqrt(
+                tokens.shape[-1]
+            )
             return self.CLIP * torch.tanh(raw)
 
     class GraphLayer(nn.Module):

@@ -32,6 +32,9 @@ class LoopConfig:
     value_v8_weight: float = 0.0
     value_v32_weight: float = 0.0
     terminal_score_weight: float = 0.0
+    soft_policy_weight: float = 0.0
+    soft_policy_temperature: float = 4.0
+    soft_policy_trunk_grad_scale: float = 1.0
     grad_clip: float = 1.0
     weight_decay: float = 0.01
     optimizer: str = "adamw"
@@ -48,6 +51,9 @@ class LoopConfig:
 class StepMetrics:
     step: int
     policy_loss: float
+    soft_policy_loss: float
+    soft_policy_kl: float
+    soft_policy_target_entropy: float
     value_loss: float
     value_final_loss: float
     value_v8_loss: float
@@ -84,10 +90,16 @@ class TrainerLoop:
         self.model = model
         self.config = config
         _validate_task_weights(config)
-        self._auxiliary_layout = (
-            getattr(getattr(model, "arch", None), "auxiliary_heads", "none")
-            == "v8-v32-score"
+        auxiliary_heads = getattr(
+            getattr(model, "arch", None),
+            "auxiliary_heads",
+            "none",
         )
+        self._auxiliary_layout = auxiliary_heads in {
+            "v8-v32-score",
+            "v8-v32-score-soft-policy-v2",
+        }
+        self._soft_policy_layout = auxiliary_heads == "v8-v32-score-soft-policy-v2"
         self._auxiliary_tasks = any(
             weight > 0.0
             for weight in (
@@ -97,7 +109,10 @@ class TrainerLoop:
             )
         )
         if self._auxiliary_tasks and not self._auxiliary_layout:
-            raise ValueError("auxiliary task weights require v8-v32-score model heads")
+            raise ValueError("auxiliary value task weights require v8-v32-score model heads")
+        self._soft_policy_task = config.soft_policy_weight > 0.0
+        if self._soft_policy_task and not self._soft_policy_layout:
+            raise ValueError("soft-policy weight requires a soft-policy model head")
         self.optimizer = build_optimizer(
             model,
             name=config.optimizer,
@@ -113,11 +128,29 @@ class TrainerLoop:
         self._value_only = model.value_only
         self._training_forward = getattr(model, "training_forward", None)
         self._training_values = getattr(model, "training_values", None)
+        self._training_policy_logits = getattr(model, "training_policy_logits", None)
+        self._training_forward_with_soft_policy = getattr(
+            model,
+            "training_forward_with_soft_policy",
+            None,
+        )
         if self._auxiliary_tasks and (
             self._training_forward is None or self._training_values is None
         ):
             raise ValueError("model does not expose auxiliary training outputs")
+        if self._soft_policy_task and (
+            self._training_policy_logits is None
+            or self._training_forward_with_soft_policy is None
+        ):
+            raise ValueError("model does not expose soft-policy training outputs")
         if config.compile_model:
+            if self._auxiliary_tasks:
+                # Logging steps take several retained VJPs at the shared
+                # readout before the combined backward. AOTAutograd's donated
+                # backward buffers permit only one backward invocation.
+                from torch._functorch import config as functorch_config
+
+                functorch_config.donated_buffer = False
             compile_options = {
                 "fullgraph": True,
                 "dynamic": False,
@@ -140,6 +173,26 @@ class TrainerLoop:
 
             self._policy_logits = split_policy_logits
             self._value_only = torch.compile(model.value_only, **compile_options)
+            if self._soft_policy_task:
+                compiled_training_policy_head = torch.compile(
+                    model._training_policy_logits,
+                    **compile_options,
+                )
+
+                def split_training_policy_logits(
+                    batch: object,
+                    soft_policy_trunk_grad_scale: float = 1.0,
+                ) -> tuple[object, object]:
+                    h, g_readout, node_mask = compiled_policy_trunk(batch)
+                    return compiled_training_policy_head(
+                        batch,
+                        h,
+                        g_readout,
+                        node_mask,
+                        soft_policy_trunk_grad_scale,
+                    )
+
+                self._training_policy_logits = split_training_policy_logits
             if self._auxiliary_tasks:
                 compiled_auxiliary_heads = torch.compile(
                     model._training_value_outputs,
@@ -173,6 +226,35 @@ class TrainerLoop:
 
                 self._training_forward = split_training_forward
                 self._training_values = split_training_values
+                if self._soft_policy_task:
+
+                    def split_training_forward_with_soft_policy(
+                        batch: object,
+                        value_trunk_grad_scale: float = 1.0,
+                        soft_policy_trunk_grad_scale: float = 1.0,
+                    ) -> tuple[object, object, object, object, object, object]:
+                        h, g_readout, node_mask = compiled_policy_trunk(batch)
+                        value_outputs = compiled_auxiliary_heads(
+                            g_readout,
+                            value_trunk_grad_scale,
+                        )
+                        logits, soft_policy_logits = compiled_training_policy_head(
+                            batch,
+                            h,
+                            g_readout,
+                            node_mask,
+                            soft_policy_trunk_grad_scale,
+                        )
+                        return (
+                            *value_outputs,
+                            logits,
+                            soft_policy_logits,
+                            g_readout,
+                        )
+
+                    self._training_forward_with_soft_policy = (
+                        split_training_forward_with_soft_policy
+                    )
         self.step_index = 0
         # bf16 autocast on CUDA, matching the evaluator's serving numerics.
         # Params and optimizer state stay f32; no GradScaler is needed for
@@ -193,6 +275,9 @@ class TrainerLoop:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         metric_zero = batch.value.new_zeros(())
+        soft_policy_loss = metric_zero
+        soft_policy_kl = metric_zero
+        soft_policy_target_entropy = metric_zero
         value_final_loss = metric_zero
         value_v8_loss = metric_zero
         value_v32_loss = metric_zero
@@ -208,7 +293,14 @@ class TrainerLoop:
                 dtype=torch.bfloat16,
                 enabled=self.device_type == "cuda",
             ):
-                logits = self._policy_logits(batch.features)
+                if self._soft_policy_task:
+                    assert self._training_policy_logits is not None
+                    logits, soft_policy_logits = self._training_policy_logits(
+                        batch.features,
+                        self.config.soft_policy_trunk_grad_scale,
+                    )
+                else:
+                    logits = self._policy_logits(batch.features)
                 policy_loss = policy_ce_loss(
                     logits,
                     batch.policy,
@@ -217,8 +309,29 @@ class TrainerLoop:
                     action_kind=getattr(batch.features, "action_kind", None),
                     mask_stop=self.config.mask_stop_loss,
                 )
-            policy_loss.backward()
+                if self._soft_policy_task:
+                    (
+                        soft_policy_loss,
+                        soft_policy_kl,
+                        soft_policy_target_entropy,
+                    ) = soft_policy_ce_loss(
+                        soft_policy_logits,
+                        batch.policy,
+                        batch.features.action_count,
+                        batch.row_count,
+                        temperature=self.config.soft_policy_temperature,
+                        action_kind=getattr(batch.features, "action_kind", None),
+                        mask_stop=self.config.mask_stop_loss,
+                    )
+                policy_objective = (
+                    policy_loss
+                    + self.config.soft_policy_weight * soft_policy_loss
+                )
+            policy_objective.backward()
             policy_loss = policy_loss.detach()
+            soft_policy_loss = soft_policy_loss.detach()
+            soft_policy_kl = soft_policy_kl.detach()
+            soft_policy_target_entropy = soft_policy_target_entropy.detach()
             del logits
 
             with torch.autocast(
@@ -281,7 +394,7 @@ class TrainerLoop:
             if score_prediction is not None:
                 score_prediction = score_prediction.detach()
             del value_raw
-            loss = policy_loss + self.config.value_weight * value_loss
+            loss = policy_objective.detach() + self.config.value_weight * value_loss
         else:
             with torch.autocast(
                 device_type=self.device_type,
@@ -292,7 +405,14 @@ class TrainerLoop:
                     # Policy distillation should not encode the opponent graph or
                     # execute a value head whose loss is identically zero.
                     value_batch = batch
-                    logits = self._policy_logits(batch.features)
+                    if self._soft_policy_task:
+                        assert self._training_policy_logits is not None
+                        logits, soft_policy_logits = self._training_policy_logits(
+                            batch.features,
+                            self.config.soft_policy_trunk_grad_scale,
+                        )
+                    else:
+                        logits = self._policy_logits(batch.features)
                     value_raw = batch.value.new_zeros(batch.value.shape)
                     value = batch.value
                     value_prediction = value_raw
@@ -304,10 +424,42 @@ class TrainerLoop:
                         action_kind=getattr(batch.features, "action_kind", None),
                         mask_stop=self.config.mask_stop_loss,
                     )
+                    if self._soft_policy_task:
+                        (
+                            soft_policy_loss,
+                            soft_policy_kl,
+                            soft_policy_target_entropy,
+                        ) = soft_policy_ce_loss(
+                            soft_policy_logits,
+                            batch.policy,
+                            batch.features.action_count,
+                            batch.row_count,
+                            temperature=self.config.soft_policy_temperature,
+                            action_kind=getattr(batch.features, "action_kind", None),
+                            mask_stop=self.config.mask_stop_loss,
+                        )
                     value_loss = logits.sum() * 0.0
                 else:
                     value_batch = batch
-                    if self._auxiliary_tasks:
+                    if self._soft_policy_task:
+                        assert self._training_forward_with_soft_policy is not None
+                        (
+                            value_raw,
+                            horizon_raw,
+                            score_raw,
+                            logits,
+                            soft_policy_logits,
+                            value_readout,
+                        ) = self._training_forward_with_soft_policy(
+                            batch.features,
+                            value_trunk_grad_scale=(
+                                self.config.value_trunk_grad_scale
+                            ),
+                            soft_policy_trunk_grad_scale=(
+                                self.config.soft_policy_trunk_grad_scale
+                            ),
+                        )
+                    elif self._auxiliary_tasks:
                         assert self._training_forward is not None
                         value_raw, horizon_raw, score_raw, logits, value_readout = (
                             self._training_forward(
@@ -330,6 +482,20 @@ class TrainerLoop:
                         action_kind=getattr(batch.features, "action_kind", None),
                         mask_stop=self.config.mask_stop_loss,
                     )
+                    if self._soft_policy_task:
+                        (
+                            soft_policy_loss,
+                            soft_policy_kl,
+                            soft_policy_target_entropy,
+                        ) = soft_policy_ce_loss(
+                            soft_policy_logits,
+                            batch.policy,
+                            batch.features.action_count,
+                            batch.row_count,
+                            temperature=self.config.soft_policy_temperature,
+                            action_kind=getattr(batch.features, "action_kind", None),
+                            mask_stop=self.config.mask_stop_loss,
+                        )
                     if self._auxiliary_tasks:
                         value = value_batch.value
                         (
@@ -357,7 +523,11 @@ class TrainerLoop:
                         )
                         value_final_loss = value_loss
                     value_prediction = value_raw
-                loss = policy_loss + self.config.value_weight * value_loss
+                loss = (
+                    policy_loss
+                    + self.config.soft_policy_weight * soft_policy_loss
+                    + self.config.value_weight * value_loss
+                )
             if (
                 self._auxiliary_tasks
                 and self.config.value_weight != 0.0
@@ -376,6 +546,9 @@ class TrainerLoop:
                 horizon_prediction = horizon_raw.detach()
             loss.backward()
             value_prediction = value_prediction.detach()
+            soft_policy_loss = soft_policy_loss.detach()
+            soft_policy_kl = soft_policy_kl.detach()
+            soft_policy_target_entropy = soft_policy_target_entropy.detach()
             if score_prediction is not None:
                 score_prediction = score_prediction.detach()
         if with_metrics and self._auxiliary_layout:
@@ -481,6 +654,11 @@ class TrainerLoop:
         return StepMetrics(
             step=self.step_index,
             policy_loss=float(policy_loss.detach().cpu()),
+            soft_policy_loss=float(soft_policy_loss.detach().cpu()),
+            soft_policy_kl=float(soft_policy_kl.detach().cpu()),
+            soft_policy_target_entropy=float(
+                soft_policy_target_entropy.detach().cpu()
+            ),
             value_loss=float(value_loss.detach().cpu()),
             value_final_loss=float(value_final_loss.detach().cpu()),
             value_v8_loss=float(value_v8_loss.detach().cpu()),
@@ -528,6 +706,73 @@ def policy_ce_loss(
     valid = row_mask & (policy_masked.sum(dim=1) > 0)
     weight = valid.to(per_row.dtype)
     return (per_row * weight).sum() / weight.sum().clamp(min=1.0)
+
+
+def softened_policy_target(
+    policy: object,
+    action_count: object,
+    *,
+    temperature: float,
+    action_kind: object | None = None,
+    mask_stop: bool = False,
+) -> object:
+    if not math.isfinite(temperature) or temperature <= 1.0:
+        raise ValueError("soft-policy temperature must be finite and greater than one")
+    torch = _torch()
+    action_index = torch.arange(policy.shape[1], device=policy.device)
+    action_mask = action_index.unsqueeze(0) < action_count.unsqueeze(1)
+    if mask_stop:
+        if action_kind is None:
+            raise ValueError("mask_stop requires action_kind")
+        action_mask = action_mask & (action_kind != 1)
+    masked = torch.where(
+        action_mask,
+        policy.float().clamp_min(0.0),
+        torch.zeros_like(policy, dtype=torch.float32),
+    )
+    softened = masked.pow(1.0 / temperature)
+    normalizer = softened.sum(dim=1, keepdim=True)
+    return torch.where(
+        normalizer > 0.0,
+        softened / normalizer.clamp_min(torch.finfo(softened.dtype).tiny),
+        torch.zeros_like(softened),
+    )
+
+
+def soft_policy_ce_loss(
+    logits: object,
+    policy: object,
+    action_count: object,
+    row_count: int,
+    *,
+    temperature: float,
+    action_kind: object | None = None,
+    mask_stop: bool = False,
+) -> tuple[object, object, object]:
+    torch = _torch()
+    target = softened_policy_target(
+        policy,
+        action_count,
+        temperature=temperature,
+        action_kind=action_kind,
+        mask_stop=mask_stop,
+    )
+    loss = policy_ce_loss(
+        logits,
+        target,
+        action_count,
+        row_count,
+        action_kind=action_kind,
+        mask_stop=mask_stop,
+    )
+    row_mask = _row_mask(torch, row_count, logits.shape[0], logits.device)
+    valid = row_mask & (target.sum(dim=1) > 0.0)
+    per_row_entropy = -(
+        target * target.clamp_min(torch.finfo(target.dtype).tiny).log()
+    ).sum(dim=1)
+    weight = valid.to(per_row_entropy.dtype)
+    entropy = (per_row_entropy * weight).sum() / weight.sum().clamp(min=1.0)
+    return loss, (loss - entropy).clamp_min(0.0), entropy
 
 
 def value_mse_loss(value_raw: object, value: object, value_valid: object, row_count: int) -> object:
@@ -606,6 +851,17 @@ def _validate_task_weights(config: LoopConfig) -> None:
         raise ValueError("value task weights must be finite and non-negative")
     if not math.isclose(sum(weights), 1.0, rel_tol=0.0, abs_tol=1.0e-6):
         raise ValueError("value task weights must sum to one")
+    if not math.isfinite(config.soft_policy_weight) or config.soft_policy_weight < 0.0:
+        raise ValueError("soft-policy weight must be finite and non-negative")
+    if (
+        not math.isfinite(config.soft_policy_temperature)
+        or config.soft_policy_temperature <= 1.0
+    ):
+        raise ValueError("soft-policy temperature must be finite and greater than one")
+    if not math.isfinite(config.soft_policy_trunk_grad_scale) or not (
+        0.0 <= config.soft_policy_trunk_grad_scale <= 1.0
+    ):
+        raise ValueError("soft-policy trunk gradient scale must be finite and in [0, 1]")
 
 
 def lr_at_step(

@@ -60,25 +60,19 @@ fn expand(engine: &mut TestEngine, graph: u8, options: CandidateOptions) -> Expa
     }
 }
 
-fn drive(
-    engine: TestEngine,
-    max_steps: usize,
-    wave_batching: bool,
-) -> (SymmetricEpisode<u8, u8>, usize, usize, usize) {
-    drive_with_budget(engine, max_steps, wave_batching, 24, 2)
+fn drive(engine: TestEngine, max_steps: usize) -> (SymmetricEpisode<u8, u8>, usize, usize, usize) {
+    drive_with_budget(engine, max_steps, 24, 2)
 }
 
 fn drive_with_budget(
     engine: TestEngine,
     max_steps: usize,
-    wave_batching: bool,
     simulations: usize,
     max_considered: usize,
 ) -> (SymmetricEpisode<u8, u8>, usize, usize, usize) {
     drive_with_options(
         engine,
         max_steps,
-        wave_batching,
         simulations,
         max_considered,
         false,
@@ -92,7 +86,6 @@ fn drive_with_budget(
 fn drive_with_options(
     engine: TestEngine,
     max_steps: usize,
-    wave_batching: bool,
     simulations: usize,
     max_considered: usize,
     no_backtrack: bool,
@@ -103,7 +96,6 @@ fn drive_with_options(
     drive_with_reuse_options(
         engine,
         max_steps,
-        wave_batching,
         simulations,
         max_considered,
         no_backtrack,
@@ -118,7 +110,6 @@ fn drive_with_options(
 fn drive_with_reuse_options(
     mut engine: TestEngine,
     max_steps: usize,
-    wave_batching: bool,
     simulations: usize,
     max_considered: usize,
     no_backtrack: bool,
@@ -137,12 +128,11 @@ fn drive_with_reuse_options(
     .config();
     config.tree_reuse = tree_reuse;
     let search = GumbelMcts::new(config);
-    let mut task = SymmetricSelfplayEpisodeTask::with_wave_batching(
+    let mut task = SymmetricSelfplayEpisodeTask::new(
         &search,
         EngineIdentity::from_engine(&engine),
         0,
         GumbelEpisodeContext { noise_seed: 17 },
-        wave_batching,
     );
     let mut evals = 0;
     let mut pending_applies = Vec::new();
@@ -326,7 +316,7 @@ fn symmetric_search_ignores_stop_and_backs_up_adversarial_outcomes() {
         .reward(1, 10.0)
         .reward(2, 5.0);
 
-    let (episode, evals, _, _) = drive(engine, 1, false);
+    let (episode, evals, _, _) = drive(engine, 1);
 
     assert!(evals > 2);
     assert_eq!(episode.p1.steps.len(), 1);
@@ -354,8 +344,7 @@ fn both_players_can_stop_and_end_before_the_rewrite_budget() {
         .reward(0, 4.0)
         .reward(1, 4.0);
 
-    let (episode, _, _, _) =
-        drive_with_options(engine, 4, false, 24, 2, false, false, false, false);
+    let (episode, _, _, _) = drive_with_options(engine, 4, 24, 2, false, false, false, false);
 
     for actor in [&episode.p1, &episode.p2] {
         assert!(actor.stopped);
@@ -383,7 +372,7 @@ fn stopping_retires_only_that_player_while_the_opponent_continues() {
         .reward(0, 4.0)
         .reward(1, 4.0);
 
-    let (episode, _, _, _) = drive_with_options(engine, 4, false, 24, 2, false, false, false, true);
+    let (episode, _, _, _) = drive_with_options(engine, 4, 24, 2, false, false, false, true);
 
     assert!(episode.p1.stopped);
     assert!(!episode.p1.blocked);
@@ -408,7 +397,7 @@ fn stop_remains_selectable_when_no_backtrack_masks_every_rewrite() {
         .apply(0, 1, 0)
         .reward(0, 4.0);
 
-    let (episode, _, _, _) = drive_with_options(engine, 4, false, 24, 2, true, false, false, true);
+    let (episode, _, _, _) = drive_with_options(engine, 4, 24, 2, true, false, false, true);
 
     assert!(episode.p1.stopped);
     assert!(episode.p2.stopped);
@@ -422,35 +411,10 @@ fn stop_remains_selectable_when_no_backtrack_masks_every_rewrite() {
 }
 
 #[test]
-fn wave_batching_preserves_stop_transitions() {
-    let engine = || {
-        TestEngine::new()
-            .candidates(0, [1])
-            .apply(0, 1, 1)
-            .reward(0, 4.0)
-            .reward(1, 4.0)
-    };
-
-    let (sequential, _, _, _) =
-        drive_with_options(engine(), 4, false, 24, 2, false, false, false, true);
-    let (wave, _, _, _) = drive_with_options(engine(), 4, true, 24, 2, false, false, false, true);
-
-    for (left, right) in [(&sequential.p1, &wave.p1), (&sequential.p2, &wave.p2)] {
-        assert_eq!(left.stopped, right.stopped);
-        assert_eq!(left.blocked, right.blocked);
-        assert_eq!(left.steps.len(), right.steps.len());
-        for (left, right) in left.steps.iter().zip(&right.steps) {
-            assert_eq!(left.action, right.action);
-            assert_eq!(left.policy_target, right.policy_target);
-        }
-    }
-}
-
-#[test]
 fn empty_candidate_roots_force_pass_without_policy_rows() {
     let engine = TestEngine::new().reward(0, 4.0);
 
-    let (episode, evals, _, _) = drive(engine, 3, false);
+    let (episode, evals, _, _) = drive(engine, 3);
 
     assert_eq!(evals, 0);
     assert!(episode.p1.blocked);
@@ -467,7 +431,7 @@ fn first_player_is_canonical_root_actor() {
         .candidates(0, [1])
         .apply(0, 1, 1)
         .reward(1, 1.0);
-    let (episode, _, _, _) = drive(engine, 1, false);
+    let (episode, _, _, _) = drive(engine, 1);
     assert_eq!(episode.p1.steps[0].before, 0);
     assert_eq!(episode.p2.steps[0].before, 0);
     assert_eq!(GumbelPlayer::One.opponent(), GumbelPlayer::Two);
@@ -524,104 +488,6 @@ fn resumed_position_uses_requested_pair_state_and_player() {
 }
 
 #[test]
-fn wave_batching_matches_sequential_search_with_out_of_order_eval_replies() {
-    let engine = || {
-        TestEngine::new()
-            .candidates(0, [1, 2])
-            .candidates(1, [3, 4])
-            .candidates(2, [4, 3])
-            .candidates(3, [5, 6])
-            .candidates(4, [6, 5])
-            .candidates(5, [7, 8])
-            .candidates(6, [8, 7])
-            .apply(0, 1, 1)
-            .apply(0, 2, 2)
-            .apply(1, 3, 3)
-            .apply(1, 4, 4)
-            .apply(2, 3, 3)
-            .apply(2, 4, 4)
-            .apply(3, 5, 5)
-            .apply(3, 6, 6)
-            .apply(4, 5, 5)
-            .apply(4, 6, 6)
-            .reward(5, 5.0)
-            .reward(6, 6.0)
-            .reward(7, 7.0)
-            .reward(8, 8.0)
-    };
-
-    let (sequential, sequential_evals, sequential_pending, sequential_rounds) =
-        drive(engine(), 3, false);
-    let (wave, wave_evals, wave_pending, wave_rounds) = drive(engine(), 3, true);
-
-    assert_eq!(sequential_pending, 1);
-    assert!(wave_pending > 1);
-    assert!(wave_rounds < sequential_rounds);
-    println!(
-        "sequential eval rounds={sequential_rounds}, wave eval rounds={wave_rounds}, evals={wave_evals}"
-    );
-    assert_eq!(wave_evals, sequential_evals);
-    assert_eq!(wave.search_config_hash, sequential.search_config_hash);
-    for (wave_actor, sequential_actor) in [(&wave.p1, &sequential.p1), (&wave.p2, &sequential.p2)] {
-        assert_eq!(wave_actor.steps.len(), sequential_actor.steps.len());
-        assert_eq!(
-            wave_actor.final_measure.scalar_reward,
-            sequential_actor.final_measure.scalar_reward
-        );
-        for (wave_step, sequential_step) in wave_actor.steps.iter().zip(&sequential_actor.steps) {
-            assert_eq!(wave_step.action, sequential_step.action);
-            assert_eq!(wave_step.legal_actions, sequential_step.legal_actions);
-            assert_eq!(wave_step.policy_target, sequential_step.policy_target);
-            assert_eq!(wave_step.root_value, sequential_step.root_value);
-            assert_eq!(
-                wave_step.root_search_value,
-                sequential_step.root_search_value
-            );
-            assert_eq!(wave_step.root_q_max, sequential_step.root_q_max);
-        }
-    }
-}
-
-#[test]
-fn wave_batching_preserves_root_rejection_semantics() {
-    let engine = || {
-        TestEngine::new()
-            .candidates(0, [1, 2])
-            .candidates(2, [3, 4])
-            .candidates(3, [5, 6])
-            .candidates(4, [6, 5])
-            .rejected(0, 1)
-            .apply(0, 2, 2)
-            .apply(2, 3, 3)
-            .apply(2, 4, 4)
-            .reward(3, 3.0)
-            .reward(4, 4.0)
-            .reward(5, 5.0)
-            .reward(6, 6.0)
-    };
-
-    let (sequential, sequential_evals, _, _) = drive(engine(), 2, false);
-    let (wave, wave_evals, _, _) = drive(engine(), 2, true);
-
-    assert_eq!(wave_evals, sequential_evals);
-    for (wave_actor, sequential_actor) in [(&wave.p1, &sequential.p1), (&wave.p2, &sequential.p2)] {
-        assert_eq!(wave_actor.steps.len(), sequential_actor.steps.len());
-        for (wave_step, sequential_step) in wave_actor.steps.iter().zip(&sequential_actor.steps) {
-            assert_eq!(wave_step.action, sequential_step.action);
-            assert_eq!(wave_step.policy_target, sequential_step.policy_target);
-            assert_eq!(
-                wave_step.root_search_value,
-                sequential_step.root_search_value
-            );
-        }
-        assert_eq!(
-            wave_actor.final_measure.scalar_reward,
-            sequential_actor.final_measure.scalar_reward
-        );
-    }
-}
-
-#[test]
 fn speculative_first_visits_preserve_no_backtrack_with_reordered_applies() {
     let engine = || {
         TestEngine::new()
@@ -640,30 +506,10 @@ fn speculative_first_visits_preserve_no_backtrack_with_reordered_applies() {
     };
 
     for tree_reuse in [false, true] {
-        let (sequential, sequential_evals, _, _) = drive_with_reuse_options(
-            engine(),
-            2,
-            false,
-            24,
-            2,
-            true,
-            false,
-            true,
-            false,
-            tree_reuse,
-        );
-        let (wave, wave_evals, _, _) = drive_with_reuse_options(
-            engine(),
-            2,
-            true,
-            24,
-            2,
-            true,
-            true,
-            true,
-            false,
-            tree_reuse,
-        );
+        let (sequential, sequential_evals, _, _) =
+            drive_with_reuse_options(engine(), 2, 24, 2, true, false, true, false, tree_reuse);
+        let (wave, wave_evals, _, _) =
+            drive_with_reuse_options(engine(), 2, 24, 2, true, true, true, false, tree_reuse);
 
         assert_eq!(wave_evals, sequential_evals, "reuse={tree_reuse}");
         for (wave_actor, sequential_actor) in
@@ -702,9 +548,8 @@ fn speculative_first_visits_preserve_duplicate_after_states() {
     };
 
     let (sequential, sequential_evals, _, _) =
-        drive_with_options(engine(), 2, false, 24, 2, true, false, true, false);
-    let (wave, wave_evals, _, _) =
-        drive_with_options(engine(), 2, true, 24, 2, true, true, true, false);
+        drive_with_options(engine(), 2, 24, 2, true, false, true, false);
+    let (wave, wave_evals, _, _) = drive_with_options(engine(), 2, 24, 2, true, true, true, false);
 
     assert_eq!(wave_evals, sequential_evals);
     for (wave_actor, sequential_actor) in [(&wave.p1, &sequential.p1), (&wave.p2, &sequential.p2)] {
@@ -724,12 +569,11 @@ fn speculative_first_visits_preserve_duplicate_after_states() {
 fn speculative_apply_handles_are_returned_when_search_is_aborted() {
     let mut engine = TestEngine::new().candidates(0, [1, 2, 3, 4, 5, 6, 7, 8]);
     let search = search_with_options(2, 48, 8, false, true);
-    let mut task = SymmetricSelfplayEpisodeTask::with_wave_batching(
+    let mut task = SymmetricSelfplayEpisodeTask::new(
         &search,
         EngineIdentity::from_engine(&engine),
         0,
         GumbelEpisodeContext { noise_seed: 17 },
-        true,
     );
     let mut speculative_applies = 0;
 
@@ -768,21 +612,8 @@ fn speculative_apply_handles_are_returned_when_search_is_aborted() {
 
 #[test]
 fn tree_reuse_is_deterministic_and_carries_promoted_root_statistics() {
-    let run = || {
-        drive_with_reuse_options(
-            reuse_fixture(),
-            3,
-            false,
-            24,
-            2,
-            false,
-            false,
-            true,
-            false,
-            true,
-        )
-        .0
-    };
+    let run =
+        || drive_with_reuse_options(reuse_fixture(), 3, 24, 2, false, false, true, false, true).0;
 
     let first = run();
     let second = run();
@@ -823,30 +654,10 @@ fn symmetric_tree_reuse_changes_the_search_identity() {
 
 #[test]
 fn tree_reuse_reduces_eval_work_while_adding_the_full_root_budget() {
-    let (_, fresh_evals, _, _) = drive_with_reuse_options(
-        reuse_fixture(),
-        3,
-        false,
-        24,
-        2,
-        false,
-        false,
-        true,
-        false,
-        false,
-    );
-    let (reused, reused_evals, _, _) = drive_with_reuse_options(
-        reuse_fixture(),
-        3,
-        false,
-        24,
-        2,
-        false,
-        false,
-        true,
-        false,
-        true,
-    );
+    let (_, fresh_evals, _, _) =
+        drive_with_reuse_options(reuse_fixture(), 3, 24, 2, false, false, true, false, false);
+    let (reused, reused_evals, _, _) =
+        drive_with_reuse_options(reuse_fixture(), 3, 24, 2, false, false, true, false, true);
 
     assert!(
         reused_evals < fresh_evals,
@@ -872,7 +683,7 @@ fn tree_reuse_carries_a_stop_transition_to_the_remaining_player() {
         .reward(1, 4.0);
 
     let (episode, _, _, _) =
-        drive_with_reuse_options(engine, 4, false, 24, 2, false, false, false, true, true);
+        drive_with_reuse_options(engine, 4, 24, 2, false, false, false, true, true);
 
     assert!(episode.p1.stopped);
     assert!(matches!(
@@ -897,7 +708,7 @@ fn tree_reuse_skips_a_known_inactive_player_without_losing_the_subtree() {
         .reward(2, 2.0);
 
     let (episode, _, _, _) =
-        drive_with_reuse_options(engine, 2, false, 24, 2, false, false, false, true, true);
+        drive_with_reuse_options(engine, 2, 24, 2, false, false, false, true, true);
 
     assert!(episode.p1.stopped);
     assert_eq!(episode.p2.steps.len(), 2);
@@ -911,155 +722,100 @@ fn tree_reuse_skips_a_known_inactive_player_without_losing_the_subtree() {
 }
 
 #[test]
-fn tree_reuse_wave_batching_matches_sequential_search() {
-    let (sequential, _, _, _) = drive_with_reuse_options(
-        reuse_fixture(),
-        3,
-        false,
-        24,
-        2,
-        false,
-        false,
-        true,
-        false,
-        true,
-    );
-    let (wave, _, pending, _) = drive_with_reuse_options(
-        reuse_fixture(),
-        3,
-        true,
-        24,
-        2,
-        false,
-        true,
-        true,
-        false,
-        true,
-    );
-
-    assert!(pending > 1);
-    for (left, right) in [(&sequential.p1, &wave.p1), (&sequential.p2, &wave.p2)] {
-        assert_eq!(left.steps, right.steps);
-        assert_eq!(left.root_stats, right.root_stats);
-        assert_eq!(left.final_context, right.final_context);
-    }
-}
-
-#[test]
 fn tree_reuse_preserves_no_backtrack_across_cached_branches() {
-    for wave_batching in [false, true] {
-        let (episode, _, _, _) = drive_with_reuse_options(
-            no_backtrack_reuse_fixture(),
-            2,
-            wave_batching,
-            24,
-            2,
-            true,
-            wave_batching,
-            true,
-            false,
-            true,
-        );
+    let (episode, _, _, _) = drive_with_reuse_options(
+        no_backtrack_reuse_fixture(),
+        2,
+        24,
+        2,
+        true,
+        true,
+        true,
+        false,
+        true,
+    );
 
-        assert!(
-            episode
-                .p1
-                .root_stats
-                .iter()
-                .chain(&episode.p2.root_stats)
-                .any(|stats| stats.carried_nodes > 0)
+    assert!(
+        episode
+            .p1
+            .root_stats
+            .iter()
+            .chain(&episode.p2.root_stats)
+            .any(|stats| stats.carried_nodes > 0)
+    );
+    for step in episode.p1.steps.iter().chain(&episode.p2.steps) {
+        assert_ne!(
+            step.before, step.after,
+            "reuse selected a no-backtrack loop"
         );
-        for step in episode.p1.steps.iter().chain(&episode.p2.steps) {
-            assert_ne!(
-                step.before, step.after,
-                "reuse selected a no-backtrack loop with wave_batching={wave_batching}"
-            );
-        }
     }
 }
 
 #[test]
 fn tree_reuse_excludes_carried_masks_from_the_root_considered_set() {
-    for wave_batching in [false, true] {
-        let (episode, _, _, _) = drive_with_reuse_options(
-            no_backtrack_reuse_fixture(),
-            2,
-            wave_batching,
-            24,
-            2,
-            true,
-            wave_batching,
-            true,
-            false,
-            true,
-        );
-
-        assert!(
-            episode
-                .p1
-                .root_stats
-                .iter()
-                .chain(&episode.p2.root_stats)
-                .all(|stats| stats.simulations == 24),
-            "a reused root lost simulation budget with wave_batching={wave_batching}"
-        );
-    }
-}
-
-#[test]
-fn symmetric_root_replenishes_the_considered_set_after_new_masks() {
-    for wave_batching in [false, true] {
-        let (episode, _, _, _) = drive_with_reuse_options(
-            no_backtrack_reuse_fixture(),
-            2,
-            wave_batching,
-            24,
-            2,
-            true,
-            wave_batching,
-            true,
-            false,
-            false,
-        );
-
-        assert!(
-            episode
-                .p1
-                .root_stats
-                .iter()
-                .chain(&episode.p2.root_stats)
-                .all(|stats| stats.simulations == 24),
-            "a root lost simulation budget after new masks with wave_batching={wave_batching}"
-        );
-    }
-}
-
-#[test]
-fn aborting_a_promoted_tree_returns_every_retained_handle() {
-    let (completed, _, _, _) = drive_with_reuse_options(
-        reuse_fixture(),
-        3,
-        false,
+    let (episode, _, _, _) = drive_with_reuse_options(
+        no_backtrack_reuse_fixture(),
+        2,
         24,
         2,
-        false,
-        false,
+        true,
+        true,
         true,
         false,
         true,
     );
+
+    assert!(
+        episode
+            .p1
+            .root_stats
+            .iter()
+            .chain(&episode.p2.root_stats)
+            .all(|stats| stats.simulations == 24),
+        "a reused root lost simulation budget"
+    );
+}
+
+#[test]
+fn symmetric_root_replenishes_the_considered_set_after_new_masks() {
+    let (episode, _, _, _) = drive_with_reuse_options(
+        no_backtrack_reuse_fixture(),
+        2,
+        24,
+        2,
+        true,
+        true,
+        true,
+        false,
+        false,
+    );
+
+    assert!(
+        episode
+            .p1
+            .root_stats
+            .iter()
+            .chain(&episode.p2.root_stats)
+            .all(|stats| stats.simulations == 24),
+        "a root lost simulation budget after new masks"
+    );
+}
+
+#[test]
+fn aborting_a_promoted_tree_returns_every_retained_handle() {
+    let (completed, _, _, _) =
+        drive_with_reuse_options(reuse_fixture(), 3, 24, 2, false, false, true, false, true);
     let first_root_evals = completed.p1.root_stats[0].eval_count;
 
     let mut engine = reuse_fixture();
     let mut config = search_with_options(3, 24, 2, false, true).config();
     config.tree_reuse = true;
     let search = GumbelMcts::new(config);
-    let mut task = SymmetricSelfplayEpisodeTask::with_wave_batching(
+    let mut task = SymmetricSelfplayEpisodeTask::new(
         &search,
         EngineIdentity::from_engine(&engine),
         0,
         GumbelEpisodeContext { noise_seed: 17 },
-        false,
     );
     let mut created_graphs = Vec::new();
     let mut created_candidates = Vec::new();
@@ -1115,31 +871,4 @@ fn aborting_a_promoted_tree_returns_every_retained_handle() {
             break;
         }
     }
-}
-
-#[test]
-fn production_search_budget_reduces_sequential_eval_rounds() {
-    let engine = || {
-        TestEngine::new()
-            .candidates(0, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(1, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(2, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(3, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(4, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(5, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(6, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(7, [1, 2, 3, 4, 5, 6, 7, 8])
-            .candidates(8, [1, 2, 3, 4, 5, 6, 7, 8])
-    };
-
-    let (_, sequential_evals, _, sequential_rounds) = drive_with_budget(engine(), 2, false, 48, 8);
-    let (_, wave_evals, wave_pending, wave_rounds) =
-        drive_with_options(engine(), 2, true, 48, 8, false, true, true, false);
-
-    assert_eq!(wave_evals, sequential_evals);
-    assert!(wave_pending > 1);
-    assert!(wave_rounds < sequential_rounds);
-    println!(
-        "8/48 sequential eval rounds={sequential_rounds}, wave eval rounds={wave_rounds}, max wave={wave_pending}, evals={wave_evals}"
-    );
 }

@@ -1,12 +1,10 @@
 use crate::root::RootSource;
-use crate::serial::OrchestratedEpisode;
-use crate::service::{internal, service_engine_work};
-use crate::{EpisodeId, WorkerId};
+use crate::{EpisodeId, internal};
 use gz_engine::{EngineResult, GraphEngine};
-use gz_eval::{EvalOutput, EvalRequest};
+use gz_eval::EvalOutput;
 use gz_features::{FeatureExtractor, FeatureRow, PositionFeatures};
 use gz_search::{
-    EngineIdentity, GumbelEpisode, GumbelEpisodeTask, GumbelMcts, SearchHandleBatch, SearchPoll,
+    EngineIdentity, ExpandResult, ExpandedCandidate, GumbelMcts, SearchHandleBatch, SearchPoll,
     SearchWork, SearchWorkResult, SymmetricEpisode, SymmetricSelfplayEpisodeTask, WorkToken,
 };
 use std::hash::Hash;
@@ -17,33 +15,9 @@ pub(crate) struct WorkerPool<G, C> {
 }
 
 pub(crate) struct CompletedTask<G, C> {
-    pub worker_id: WorkerId,
     pub episode_id: EpisodeId,
     pub evaluations: u64,
-    pub episode: CompletedSearchEpisode<G, C>,
-}
-
-// EpisodePoll already boxes this enum; boxing Gumbel again would only add indirection.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum CompletedSearchEpisode<G, C> {
-    Gumbel(GumbelEpisode<G, C>),
-    Symmetric(Box<SymmetricEpisode<G, C>>),
-}
-
-type EpisodePoll<G, C> = SearchPoll<G, C, Box<CompletedSearchEpisode<G, C>>>;
-
-impl<G, C> CompletedTask<G, C> {
-    pub(crate) fn into_gumbel(self) -> EngineResult<OrchestratedEpisode<G, C>> {
-        let CompletedSearchEpisode::Gumbel(episode) = self.episode else {
-            return Err(internal("symmetric episode completed on the Gumbel path"));
-        };
-        Ok(OrchestratedEpisode {
-            worker_id: self.worker_id,
-            episode_id: self.episode_id,
-            evaluations: self.evaluations,
-            episode,
-        })
-    }
+    pub episode: SymmetricEpisode<G, C>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,8 +25,7 @@ pub(crate) struct ParkedEval {
     pub episode_id: EpisodeId,
     pub slot: usize,
     pub token: WorkToken,
-    pub request: EvalRequest,
-    pub row: Option<FeatureRow>,
+    pub row: FeatureRow,
     pub action_count: u32,
     pub pressure_reserved: bool,
 }
@@ -60,7 +33,6 @@ pub(crate) struct ParkedEval {
 pub(crate) struct Admission<'a> {
     pub search: &'a GumbelMcts,
     pub identity: EngineIdentity,
-    pub symmetric_selfplay: bool,
     pub pressure_reserved: bool,
     pub next_episode_id: &'a mut u64,
 }
@@ -72,12 +44,11 @@ pub(crate) struct AdmissionResult {
 }
 
 struct Slot<G, C> {
-    worker_id: WorkerId,
     state: SlotState<G, C>,
 }
 
 struct ActiveEpisode<G, C> {
-    task: EpisodeTask<G, C>,
+    task: SymmetricSelfplayEpisodeTask<G, C>,
     episode_id: EpisodeId,
     evaluations: u64,
     pressure_reserved: bool,
@@ -95,7 +66,6 @@ enum SlotState<G, C> {
 
 struct ParkedEvalState {
     token: WorkToken,
-    request: Option<EvalRequest>,
     row: Option<FeatureRow>,
     action_count: u32,
     sent: bool,
@@ -129,31 +99,13 @@ where
     G: Copy + Eq + Hash,
     C: Copy + Eq + Hash,
 {
-    pub(crate) fn new(workers: NonZeroUsize, worker_id_base: u64) -> Self {
+    pub(crate) fn new(workers: NonZeroUsize) -> Self {
         let slots = (0..workers.get())
-            .map(|index| Slot {
-                worker_id: WorkerId::new(worker_id_base + index as u64),
+            .map(|_| Slot {
                 state: SlotState::Idle,
             })
             .collect();
         Self { slots }
-    }
-
-    pub(crate) fn admit<E, R, F>(
-        &mut self,
-        engine: &mut E,
-        roots: &mut R,
-        admission: &mut Admission<'_>,
-        episode_context: F,
-    ) -> EngineResult<bool>
-    where
-        E: GraphEngine<Graph = G, Candidate = C>,
-        R: RootSource<E>,
-        F: FnMut(&mut E, EpisodeId, G) -> EngineResult<()>,
-    {
-        Ok(self
-            .admit_limited(engine, roots, admission, usize::MAX, episode_context)?
-            .roots_exhausted)
     }
 
     pub(crate) fn admit_limited<E, R, F>(
@@ -198,22 +150,12 @@ where
             let context = gz_search::GumbelEpisodeContext {
                 noise_seed: crate::root::episode_noise_seed(episode_id.value()),
             };
-            let mut task = if admission.symmetric_selfplay {
-                EpisodeTask::Symmetric(SymmetricSelfplayEpisodeTask::with_wave_batching(
-                    admission.search,
-                    admission.identity,
-                    root,
-                    context,
-                    admission.search.symmetric_wave_batching(),
-                ))
-            } else {
-                EpisodeTask::Gumbel(GumbelEpisodeTask::new(
-                    admission.search,
-                    admission.identity,
-                    root,
-                    context,
-                ))
-            };
+            let mut task = SymmetricSelfplayEpisodeTask::new(
+                admission.search,
+                admission.identity,
+                root,
+                context,
+            );
             if roots.episode_roots_are_owned() {
                 task.track_owned_root();
             }
@@ -232,14 +174,14 @@ where
         })
     }
 
-    pub(crate) fn drive<E>(
+    pub(crate) fn drive<E, X>(
         &mut self,
         engine: &mut E,
-        blocked_message: &'static str,
-        mut extractor: Option<&mut dyn FeatureExtractor<E>>,
+        extractor: &mut X,
     ) -> EngineResult<Vec<CompletedTask<G, C>>>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
+        X: FeatureExtractor<E>,
     {
         let mut completed = Vec::new();
 
@@ -289,55 +231,36 @@ where
                                 return Err(internal("action count overflow"));
                             }
                         };
-                        let row = match extractor.as_deref_mut() {
-                            Some(extractor) => {
-                                let position = position_features(
-                                    work.request.position,
-                                    work.opponent.is_some(),
-                                );
-                                match extractor.extract(
-                                    engine,
-                                    work.graph,
-                                    &work.candidates,
-                                    position,
-                                ) {
-                                    Ok(mut row) => {
-                                        if let Some(opponent) = work.opponent.as_deref() {
-                                            let opponent_position =
-                                                position_features(opponent.position, false);
-                                            let opponent_row = extractor
-                                                .extract(
-                                                    engine,
-                                                    opponent.graph,
-                                                    &[],
-                                                    opponent_position,
-                                                )
-                                                .map_err(|_| {
-                                                    internal("opponent feature extraction failed")
-                                                });
-                                            let opponent_row = match opponent_row {
-                                                Ok(row) => row,
-                                                Err(error) => {
-                                                    release_task_all(engine, &mut episode.task)?;
-                                                    return Err(error);
-                                                }
-                                            };
-                                            row.opponent = Some(opponent_state(opponent_row));
-                                        }
-                                        Some(row)
-                                    }
-                                    Err(_) => {
-                                        release_task_all(engine, &mut episode.task)?;
-                                        return Err(internal("feature extraction failed"));
-                                    }
+                        let position =
+                            position_features(work.request.position, work.opponent.is_some());
+                        let mut row =
+                            match extractor.extract(engine, work.graph, &work.candidates, position)
+                            {
+                                Ok(row) => row,
+                                Err(_) => {
+                                    release_task_all(engine, &mut episode.task)?;
+                                    return Err(internal("feature extraction failed"));
                                 }
-                            }
-                            None => None,
-                        };
+                            };
+                        if let Some(opponent) = work.opponent.as_deref() {
+                            let opponent_position = position_features(opponent.position, false);
+                            let opponent_row = match extractor.extract(
+                                engine,
+                                opponent.graph,
+                                &[],
+                                opponent_position,
+                            ) {
+                                Ok(row) => row,
+                                Err(_) => {
+                                    release_task_all(engine, &mut episode.task)?;
+                                    return Err(internal("opponent feature extraction failed"));
+                                }
+                            };
+                            row.opponent = Some(opponent_state(opponent_row));
+                        }
                         parked_evals.push(ParkedEvalState {
                             token,
-                            request: Some(work.request),
-                            row,
+                            row: Some(row),
                             action_count,
                             sent: false,
                         });
@@ -345,7 +268,7 @@ where
                     SearchPoll::Blocked => {
                         if parked_evals.is_empty() {
                             release_task_all(engine, &mut episode.task)?;
-                            return Err(internal(blocked_message));
+                            return Err(internal("worker blocked"));
                         }
                         slot.state = SlotState::Parked {
                             episode,
@@ -359,10 +282,9 @@ where
                             return Err(internal("search completed with pending evaluations"));
                         }
                         completed.push(CompletedTask {
-                            worker_id: slot.worker_id,
                             episode_id: episode.episode_id,
                             evaluations: episode.evaluations,
-                            episode: *result,
+                            episode: result,
                         });
                         break;
                     }
@@ -371,32 +293,6 @@ where
         }
 
         Ok(completed)
-    }
-
-    pub(crate) fn parked(&self) -> Vec<ParkedEval> {
-        let mut parked = Vec::new();
-        for (index, slot) in self.slots.iter().enumerate() {
-            let SlotState::Parked { episode, evals } = &slot.state else {
-                continue;
-            };
-            let mut pressure_reserved = episode.pressure_reserved;
-            for eval in evals {
-                let Some(request) = &eval.request else {
-                    continue;
-                };
-                parked.push(ParkedEval {
-                    episode_id: episode.episode_id,
-                    slot: index,
-                    token: eval.token,
-                    request: request.clone(),
-                    row: eval.row.clone(),
-                    action_count: eval.action_count,
-                    pressure_reserved,
-                });
-                pressure_reserved = false;
-            }
-        }
-        parked
     }
 
     pub(crate) fn take_unsent_parked(&mut self) -> Vec<ParkedEval> {
@@ -408,16 +304,14 @@ where
             let mut pressure_reserved = episode.pressure_reserved;
             for eval in evals.iter_mut().filter(|eval| !eval.sent) {
                 eval.sent = true;
-                let request = eval
-                    .request
-                    .take()
-                    .expect("unsent parked eval retains its request");
                 parked.push(ParkedEval {
                     episode_id: episode.episode_id,
                     slot: index,
                     token: eval.token,
-                    request,
-                    row: eval.row.take(),
+                    row: eval
+                        .row
+                        .take()
+                        .expect("unsent eval retains its feature row"),
                     action_count: eval.action_count,
                     pressure_reserved,
                 });
@@ -517,7 +411,7 @@ where
 
 fn release_task_releasable<E>(
     engine: &mut E,
-    task: &mut EpisodeTask<E::Graph, E::Candidate>,
+    task: &mut SymmetricSelfplayEpisodeTask<E::Graph, E::Candidate>,
 ) -> EngineResult<()>
 where
     E: GraphEngine,
@@ -527,63 +421,12 @@ where
 
 fn release_task_all<E>(
     engine: &mut E,
-    task: &mut EpisodeTask<E::Graph, E::Candidate>,
+    task: &mut SymmetricSelfplayEpisodeTask<E::Graph, E::Candidate>,
 ) -> EngineResult<()>
 where
     E: GraphEngine,
 {
     release_handles(engine, task.take_all_handles())
-}
-
-#[allow(clippy::large_enum_variant)]
-enum EpisodeTask<G, C> {
-    Gumbel(GumbelEpisodeTask<G, C>),
-    Symmetric(SymmetricSelfplayEpisodeTask<G, C>),
-}
-
-impl<G, C> EpisodeTask<G, C>
-where
-    G: Copy + Eq + Hash,
-    C: Copy + Eq + Hash,
-{
-    fn poll(&mut self) -> EngineResult<EpisodePoll<G, C>> {
-        Ok(match self {
-            Self::Gumbel(task) => task
-                .poll()?
-                .map_done(|episode| Box::new(CompletedSearchEpisode::Gumbel(episode))),
-            Self::Symmetric(task) => task
-                .poll()?
-                .map_done(|episode| Box::new(CompletedSearchEpisode::Symmetric(Box::new(episode)))),
-        })
-    }
-
-    fn resume(&mut self, token: WorkToken, result: SearchWorkResult<G, C>) -> EngineResult<()> {
-        match self {
-            Self::Gumbel(task) => task.resume(token, result),
-            Self::Symmetric(task) => task.resume(token, result),
-        }
-    }
-
-    fn take_releasable(&mut self) -> SearchHandleBatch<G, C> {
-        match self {
-            Self::Gumbel(task) => task.take_releasable(),
-            Self::Symmetric(task) => task.take_releasable(),
-        }
-    }
-
-    fn track_owned_root(&mut self) {
-        match self {
-            Self::Gumbel(task) => task.track_owned_root(),
-            Self::Symmetric(task) => task.track_owned_root(),
-        }
-    }
-
-    fn take_all_handles(&mut self) -> SearchHandleBatch<G, C> {
-        match self {
-            Self::Gumbel(task) => task.take_all_handles(),
-            Self::Symmetric(task) => task.take_all_handles(),
-        }
-    }
 }
 
 fn release_handles<E>(
@@ -597,6 +440,61 @@ where
         return Ok(());
     }
     engine.release(&handles.graphs, &handles.candidates)
+}
+
+fn service_engine_work<E>(
+    engine: &mut E,
+    work: &SearchWork<E::Graph, E::Candidate>,
+) -> EngineResult<Option<SearchWorkResult<E::Graph, E::Candidate>>>
+where
+    E: GraphEngine,
+{
+    match work {
+        SearchWork::Expand(work) => {
+            service_expand_work(engine, *work).map(|result| Some(SearchWorkResult::Expand(result)))
+        }
+        SearchWork::Apply(work) => engine
+            .apply(work.graph, work.candidate)
+            .map(|result| Some(SearchWorkResult::Apply(result))),
+        SearchWork::Measure(work) => engine
+            .measure(work.graph, work.options)
+            .map(|result| Some(SearchWorkResult::Measure(result))),
+        SearchWork::Eval(_) => Ok(None),
+        _ => Err(internal("unsupported search work")),
+    }
+}
+
+fn service_expand_work<E>(
+    engine: &mut E,
+    work: gz_search::ExpandWork<E::Graph>,
+) -> EngineResult<ExpandResult<E::Candidate>>
+where
+    E: GraphEngine,
+{
+    let mut candidates = Vec::new();
+    engine.candidates(work.graph, work.options, &mut candidates)?;
+    let graph_hash = engine.hash(work.graph)?;
+    let candidates = candidates
+        .into_iter()
+        .map(|candidate| {
+            engine
+                .candidate_info(work.graph, candidate)?
+                .validate()
+                .map_err(|_| internal("invalid candidate info"))
+                .map(|info| ExpandedCandidate {
+                    candidate,
+                    candidate_hash: info.candidate_hash,
+                    kind: info.kind,
+                    tags: info.tags,
+                    static_prior: info.static_prior,
+                })
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+
+    Ok(ExpandResult {
+        graph_hash,
+        candidates,
+    })
 }
 
 fn position_features(

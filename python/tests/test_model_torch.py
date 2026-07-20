@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from dataclasses import replace
 
 import pytest
 
@@ -20,6 +21,24 @@ torch = pytest.importorskip("torch")
 def test_arch_round_trip_and_fixed_runtime_contract() -> None:
     arch = ArchConfig(dim=16, layers=2, heads=4, ffn_dim=32, dropout=0.0)
     assert ArchConfig.from_dict(arch.to_dict()) == arch
+    soft_policy_arch = ArchConfig(
+        dim=16,
+        layers=2,
+        heads=4,
+        ffn_dim=32,
+        dropout=0.0,
+        auxiliary_heads="v8-v32-score-soft-policy-v2",
+    )
+    assert ArchConfig.from_dict(soft_policy_arch.to_dict()) == soft_policy_arch
+    legacy_soft_policy_arch = replace(
+        soft_policy_arch,
+        auxiliary_heads="v8-v32-score-soft-policy",
+    )
+    legacy_model = build_model(
+        schema_for_view(BatchView.parse(make_batch(attr_dim=1))),
+        legacy_soft_policy_arch,
+    )
+    assert legacy_model.policy.soft_pointer_key is not None
 
     for field, value in (
         ("name", "gz-graph-v1"),
@@ -193,13 +212,20 @@ def test_auxiliary_heads_share_trunk_without_changing_serving_outputs() -> None:
     schema = schema_for_view(view)
     model = build_model(
         schema,
-        small_arch(auxiliary_heads="v8-v32-score"),
+        small_arch(auxiliary_heads="v8-v32-score-soft-policy-v2"),
     ).eval()
     tensors = tensors_of(schema, view)
     with torch.no_grad():
         serving_before = model(tensors)
-        value, horizons, score, logits, readout = model.training_forward(tensors)
+        value, horizons, score, logits, soft_logits, readout = (
+            model.training_forward_with_soft_policy(tensors)
+        )
         for parameter in (*model.horizon_value.parameters(), *model.terminal_score.parameters()):
+            parameter.add_(torch.randn_like(parameter))
+        for parameter in (
+            *model.soft_policy_kind_embedding.parameters(),
+            *model.soft_policy.parameters(),
+        ):
             parameter.add_(torch.randn_like(parameter))
         serving_after = model(tensors)
 
@@ -207,9 +233,78 @@ def test_auxiliary_heads_share_trunk_without_changing_serving_outputs() -> None:
     assert horizons.shape == (view.batch_capacity, 2)
     assert score.shape == (view.batch_capacity,)
     assert logits.shape == (view.batch_capacity, view.max_actions)
+    assert soft_logits.shape == (view.batch_capacity, view.max_actions)
     assert readout.shape == (view.batch_capacity, model.arch.dim)
     torch.testing.assert_close(serving_after[0], serving_before[0], rtol=0, atol=0)
     torch.testing.assert_close(serving_after[1], serving_before[1], rtol=0, atol=0)
+
+
+def test_soft_policy_gradient_isolated_from_main_head_and_scaled_at_trunk() -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    schema = schema_for_view(view)
+    full = build_model(
+        schema,
+        small_arch(auxiliary_heads="v8-v32-score-soft-policy-v2"),
+    )
+    scaled = build_model(schema, full.arch)
+    scaled.load_state_dict(full.state_dict())
+    tensors = tensors_of(schema, view)
+
+    _, full_soft = full.training_policy_logits(
+        tensors,
+        soft_policy_trunk_grad_scale=1.0,
+    )
+    _, scaled_soft = scaled.training_policy_logits(
+        tensors,
+        soft_policy_trunk_grad_scale=0.1,
+    )
+    full_soft.sum().backward()
+    scaled_soft.sum().backward()
+
+    assert all(parameter.grad is None for parameter in full.policy.parameters())
+    assert all(parameter.grad is None for parameter in scaled.policy.parameters())
+    assert full.kind_embedding.weight.grad is None
+    assert scaled.kind_embedding.weight.grad is None
+    torch.testing.assert_close(
+        scaled.soft_policy.pointer_key.weight.grad,
+        full.soft_policy.pointer_key.weight.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        scaled.soft_policy_kind_embedding.weight.grad,
+        full.soft_policy_kind_embedding.weight.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        scaled.node_embedding.weight.grad,
+        full.node_embedding.weight.grad * 0.1,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_soft_policy_v2_preserves_preexisting_initialization() -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    schema = schema_for_view(view)
+    torch.manual_seed(5)
+    baseline = build_model(
+        schema,
+        small_arch(auxiliary_heads="v8-v32-score"),
+    )
+    torch.manual_seed(5)
+    auxiliary = build_model(
+        schema,
+        small_arch(auxiliary_heads="v8-v32-score-soft-policy-v2"),
+    )
+
+    baseline_state = baseline.state_dict()
+    auxiliary_state = auxiliary.state_dict()
+    assert all(
+        torch.equal(tensor, auxiliary_state[name])
+        for name, tensor in baseline_state.items()
+    )
 
 
 def model_fixture():

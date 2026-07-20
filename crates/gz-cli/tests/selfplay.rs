@@ -103,10 +103,6 @@ fn stop_enabled_selfplay_uses_the_stop_replay_contract() {
 fn validation_rejects_incoherent_runtime_settings() {
     let dir = TestDir::new();
     let mut config = short_config(dir.path());
-    config.length_tiebreak = false;
-    assert!(config.validate().unwrap_err().contains("length-tiebreak"));
-
-    let mut config = short_config(dir.path());
     config.mask_stop = false;
     config.position_features = false;
     assert!(config.validate().unwrap_err().contains("position-features"));
@@ -118,6 +114,15 @@ fn validation_rejects_incoherent_runtime_settings() {
     let mut config = short_config(dir.path());
     config.eval_processes = 2;
     assert!(config.validate().unwrap_err().contains("cannot exceed"));
+
+    let mut config = short_config(dir.path());
+    config.checkpoint_pointer = Some("step_50000.json".to_owned());
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .contains("checkpoint-pointer")
+    );
 }
 
 #[test]
@@ -126,17 +131,19 @@ fn torch_evaluator_args_select_checkpoint_and_device() {
     let mut config = short_config(dir.path());
     config.evaluator = EvaluatorMode::Torch;
     config.checkpoint_dir = Some(PathBuf::from("/checkpoints"));
+    config.checkpoint_pointer = Some("step_50000.json".to_owned());
     config.eval_device = Some("cuda:1".to_owned());
-    config.eval_poll_interval = Some(0.25);
+    config.eval_poll_interval = Some(0.0);
     config.validate().unwrap();
 
     let args = config.evaluator_extra_args();
     assert!(args.windows(2).any(|pair| pair == ["--backend", "torch"]));
-    assert!(args.windows(2).any(|pair| pair == ["--device", "cuda:1"]));
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["--poll-interval", "0.25"])
+            .any(|pair| pair == ["--checkpoint-pointer", "step_50000.json"])
     );
+    assert!(args.windows(2).any(|pair| pair == ["--device", "cuda:1"]));
+    assert!(args.windows(2).any(|pair| pair == ["--poll-interval", "0"]));
     assert!(!args.iter().any(|arg| arg.starts_with("--require-")));
 }
 
@@ -157,7 +164,6 @@ fn short_config(path: &Path) -> SelfplayConfig {
         max_batch: 2,
         evaluator: EvaluatorMode::Stub,
         mask_stop: true,
-        length_tiebreak: true,
         no_backtrack: true,
         ..SelfplayConfig::default()
     }

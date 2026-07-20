@@ -56,17 +56,15 @@ pub struct MeasurerStats {
 
 pub struct ReplayMeasurer<'a> {
     store: &'a ReplayStore,
-    length_tiebreak: bool,
     summary: MeasurerRunSummary,
     ledger: MeasureLedger,
 }
 
 impl<'a> ReplayMeasurer<'a> {
     #[must_use]
-    pub fn new(store: &'a ReplayStore, length_tiebreak: bool) -> Self {
+    pub fn new(store: &'a ReplayStore) -> Self {
         Self {
             store,
-            length_tiebreak,
             summary: MeasurerRunSummary::default(),
             ledger: MeasureLedger::default(),
         }
@@ -83,7 +81,7 @@ impl<'a> ReplayMeasurer<'a> {
             self.ledger.observe(&game.p2_artifact);
         }
 
-        let projected = project_symmetric_game(&game, self.length_tiebreak);
+        let projected = project_symmetric_game(&game);
         let (status, replay_rows) = match projected {
             Ok((p1, p2, p1_target)) => {
                 let value_sign_accuracy = symmetric_value_sign_accuracies(&game, p1_target);
@@ -138,7 +136,6 @@ const VALUE_SIGN_LATE_STEP: usize = 40;
 
 fn project_symmetric_game(
     game: &MeasuredSymmetricGame,
-    length_tiebreak: bool,
 ) -> Result<ProjectedSymmetricGame, MeasurerError> {
     let p1_reward = episode_reward(&game.p1_artifact).ok_or(MeasurerError::Unmeasured)?;
     let p2_reward = episode_reward(&game.p2_artifact).ok_or(MeasurerError::Unmeasured)?;
@@ -147,7 +144,6 @@ fn project_symmetric_game(
         p2_reward,
         symmetric_rewrite_count(&game.p1_artifact),
         symmetric_rewrite_count(&game.p2_artifact),
-        length_tiebreak,
     );
     let mut p1 = project_episode(&game.p1_artifact)?;
     let mut p2 = project_episode(&game.p2_artifact)?;
@@ -166,20 +162,14 @@ fn symmetric_rewrite_count(artifact: &CompletedEpisodeArtifact) -> usize {
         .count()
 }
 
-fn symmetric_outcome_target(
-    p1_reward: f32,
-    p2_reward: f32,
-    p1_len: usize,
-    p2_len: usize,
-    length_tiebreak: bool,
-) -> f32 {
+fn symmetric_outcome_target(p1_reward: f32, p2_reward: f32, p1_len: usize, p2_len: usize) -> f32 {
     if p1_reward > p2_reward {
         1.0
     } else if p1_reward < p2_reward {
         -1.0
-    } else if length_tiebreak && p1_len < p2_len {
+    } else if p1_len < p2_len {
         1.0
-    } else if length_tiebreak && p1_len > p2_len {
+    } else if p1_len > p2_len {
         -1.0
     } else {
         0.0

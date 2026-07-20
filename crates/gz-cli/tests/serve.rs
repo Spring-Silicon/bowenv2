@@ -53,7 +53,6 @@ fn replay_serve_returns_symmetric_features_targets_and_metrics() {
         max_batch: 2,
         evaluator: EvaluatorMode::Stub,
         mask_stop: true,
-        length_tiebreak: true,
         ..SelfplayConfig::default()
     })
     .unwrap();

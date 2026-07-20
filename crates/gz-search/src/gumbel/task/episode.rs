@@ -83,7 +83,6 @@ pub(crate) fn gumbel_episode<G, C>(episode: MctsEpisode<G, C>) -> GumbelEpisode<
                 simulations: stats.simulations,
                 expanded_nodes: stats.expanded_nodes,
                 eval_count: stats.eval_count,
-                portable_contexts: stats.portable_contexts,
                 carried_nodes: stats.carried_nodes,
                 carried_root_visits: stats.carried_root_visits,
             })

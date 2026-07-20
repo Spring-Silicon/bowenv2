@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gz.trainer.driver import SelfplayStatsTracker, parse_stat_fields
+from gz.trainer.telemetry import SelfplayStatsTracker, parse_stat_fields
 
 
 def test_parse_stat_fields_extracts_pairs() -> None:

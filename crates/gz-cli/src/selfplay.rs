@@ -3,7 +3,6 @@ use gz_engine_whittle::{
     WhittleEngine, WhittleEngineConfig, WhittleFeatureExtractor, WhittleFeatureExtractorConfig,
     WhittleGraphGenerator, WhittleGraphGeneratorConfig, WhittleGraphId, WhittleRoot,
 };
-use gz_eval::{RandomValueEvaluator, RandomValueEvaluatorConfig};
 use gz_eval_service::{
     EvaluatorProcess, EvaluatorProcessConfig, Hello, STUB_MODEL_VERSION, StubBackend,
 };
@@ -43,6 +42,7 @@ pub struct SelfplayConfig {
     pub evaluator: EvaluatorMode,
     pub python_dir: Option<PathBuf>,
     pub checkpoint_dir: Option<PathBuf>,
+    pub checkpoint_pointer: Option<String>,
     pub eval_device: Option<String>,
     pub eval_poll_interval: Option<f32>,
     pub serve_socket: Option<PathBuf>,
@@ -52,11 +52,9 @@ pub struct SelfplayConfig {
     pub position_features: bool,
     pub no_backtrack: bool,
     pub mask_stop: bool,
-    pub length_tiebreak: bool,
     pub eval_processes: usize,
     pub admission_stagger_ms: u64,
     pub admission_smoothing: bool,
-    pub wave_batching: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +112,7 @@ impl Default for SelfplayConfig {
             evaluator: EvaluatorMode::Stub,
             python_dir: None,
             checkpoint_dir: None,
+            checkpoint_pointer: None,
             eval_device: None,
             eval_poll_interval: None,
             serve_socket: None,
@@ -123,11 +122,9 @@ impl Default for SelfplayConfig {
             position_features: true,
             no_backtrack: true,
             mask_stop: false,
-            length_tiebreak: true,
             eval_processes: 1,
             admission_stagger_ms: 0,
             admission_smoothing: false,
-            wave_batching: false,
         }
     }
 }
@@ -165,9 +162,6 @@ impl SelfplayConfig {
         if !self.c_scale.is_finite() || self.c_scale < 0.0 {
             return Err("--c-scale must be finite and non-negative".to_owned());
         }
-        if !self.length_tiebreak {
-            return Err("symmetric selfplay requires --length-tiebreak true".to_owned());
-        }
         if !self.mask_stop && !self.position_features {
             return Err(
                 "STOP-enabled symmetric selfplay requires --position-features true".to_owned(),
@@ -180,6 +174,9 @@ impl SelfplayConfig {
             if self.checkpoint_dir.is_some() {
                 return Err("--checkpoint-dir requires --evaluator torch".to_owned());
             }
+            if self.checkpoint_pointer.is_some() {
+                return Err("--checkpoint-pointer requires --evaluator torch".to_owned());
+            }
             if self.eval_device.is_some() {
                 return Err("--eval-device requires --evaluator torch".to_owned());
             }
@@ -191,6 +188,15 @@ impl SelfplayConfig {
             && (!interval.is_finite() || interval < 0.0)
         {
             return Err("--eval-poll-interval must be zero (disabled) or positive".to_owned());
+        }
+        if let Some(pointer) = &self.checkpoint_pointer
+            && (pointer.is_empty()
+                || PathBuf::from(pointer)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(pointer.as_str()))
+        {
+            return Err("--checkpoint-pointer must be a checkpoint file name".to_owned());
         }
         if self.serve_socket.is_some() && self.episodes != 0 {
             return Err("--serve-socket requires --episodes 0 (unbounded)".to_owned());
@@ -241,9 +247,13 @@ impl SelfplayConfig {
                     "torch".to_owned(),
                     "--checkpoint-dir".to_owned(),
                     checkpoint_dir.display().to_string(),
-                    "--device".to_owned(),
-                    device.to_owned(),
                 ];
+                if let Some(pointer) = &self.checkpoint_pointer {
+                    args.push("--checkpoint-pointer".to_owned());
+                    args.push(pointer.clone());
+                }
+                args.push("--device".to_owned());
+                args.push(device.to_owned());
                 if let Some(interval) = self.eval_poll_interval {
                     args.push("--poll-interval".to_owned());
                     args.push(interval.to_string());
@@ -296,7 +306,6 @@ pub struct SelfplaySummary {
     pub ties: u64,
     pub eval_batch_count: usize,
     pub mean_eval_batch_size: f64,
-    pub search_contexts: u64,
     pub replay_rows: u64,
     pub counters: ReplayCounters,
     pub measure_ledger: MeasureLedgerSnapshot,
@@ -392,12 +401,7 @@ fn run_stub(
         .iter()
         .map(|engine| feature_extractor(engine, &config))
         .collect::<Vec<_>>();
-    let orchestrator = ThreadedGumbelOrchestrator::new(
-        engines,
-        random_placeholder(&config)?,
-        search,
-        threaded_config(&config)?,
-    );
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, search, threaded_config(&config)?);
     let run = orchestrator
         .run_featurized_with_replay(
             roots,
@@ -408,7 +412,6 @@ fn run_stub(
             ReplayRuntime {
                 store: &store,
                 backpressure: replay_backpressure(&config),
-                length_tiebreak: config.length_tiebreak,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -460,12 +463,7 @@ fn run_process(
         backends.push(process.connect(&hello).map_err(|error| error.to_string())?);
     }
     let model_version = backends[0].model_version();
-    let orchestrator = ThreadedGumbelOrchestrator::new(
-        engines,
-        random_placeholder(&config)?,
-        search,
-        threaded_config(&config)?,
-    );
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, search, threaded_config(&config)?);
     let run = orchestrator
         .run_featurized_with_replay(
             roots,
@@ -476,7 +474,6 @@ fn run_process(
             ReplayRuntime {
                 store: &store,
                 backpressure: replay_backpressure(&config),
-                length_tiebreak: config.length_tiebreak,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -513,7 +510,6 @@ fn summarize(
         ties,
         eval_batch_count: run.batch_sizes.len(),
         mean_eval_batch_size,
-        search_contexts: run.search_contexts,
         replay_rows: run.replay_rows,
         counters,
         measure_ledger: run.measure_ledger,
@@ -562,14 +558,6 @@ fn admission_smoothing(
     }))
 }
 
-fn random_placeholder(config: &SelfplayConfig) -> Result<RandomValueEvaluator, String> {
-    RandomValueEvaluator::new(RandomValueEvaluatorConfig {
-        seed: config.seed,
-        ..RandomValueEvaluatorConfig::default()
-    })
-    .map_err(|error| error.to_string())
-}
-
 fn process_socket_path(index: usize) -> PathBuf {
     std::env::temp_dir().join(format!("gz-evaluator-{}-{index}.sock", std::process::id()))
 }
@@ -606,8 +594,7 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         value_mode: GumbelValueMode::SymmetricSelfplay,
         candidate_options: feature_candidate_options(config),
         measure_options: engine.measure_options(),
-    })
-    .with_symmetric_wave_batching(config.wave_batching))
+    }))
 }
 
 fn feature_candidate_options(config: &SelfplayConfig) -> CandidateOptions {

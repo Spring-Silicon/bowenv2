@@ -99,7 +99,6 @@ pub(crate) fn gumbel_result<G, C>(result: MctsRootResult<G, C>) -> GumbelRootRes
             simulations: result.stats.simulations,
             expanded_nodes: result.stats.expanded_nodes,
             eval_count: result.stats.eval_count,
-            portable_contexts: result.stats.portable_contexts,
             carried_nodes: result.stats.carried_nodes,
             carried_root_visits: result.stats.carried_root_visits,
         },

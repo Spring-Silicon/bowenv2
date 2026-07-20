@@ -44,7 +44,7 @@ fn symmetric_game_uses_reward_then_length_and_preserves_draws() {
     store
         .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
         .unwrap();
-    let mut measurer = ReplayMeasurer::new(&store, true);
+    let mut measurer = ReplayMeasurer::new(&store);
 
     let admission = measurer
         .admit_symmetric(MeasuredSymmetricGame {
@@ -88,7 +88,7 @@ fn unmeasured_game_is_dropped_without_replay_rows() {
     let mut p1 = artifact(1, -4.0, 1, false, version(1));
     p1.final_measure.measured = false;
     p1.final_measure.scalar_reward = None;
-    let mut measurer = ReplayMeasurer::new(&store, false);
+    let mut measurer = ReplayMeasurer::new(&store);
 
     let admission = measurer
         .admit_symmetric(MeasuredSymmetricGame {
@@ -115,7 +115,7 @@ fn stop_is_not_counted_as_a_length_tiebreak_rewrite() {
     store
         .ensure_data_mode(ReplayDataMode::SymmetricSelfplayStop)
         .unwrap();
-    let mut measurer = ReplayMeasurer::new(&store, true);
+    let mut measurer = ReplayMeasurer::new(&store);
     let mut p2 = artifact(2, -4.0, 2, false, version(2));
     add_stop_options(&mut p2);
 

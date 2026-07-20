@@ -11,7 +11,6 @@ pub(crate) struct MctsTree<G, C> {
     pub(crate) config: MctsConfig,
     pub(crate) nodes: Vec<MctsNode<G, C>>,
     pub(crate) eval_count: usize,
-    pub(crate) portable_contexts: usize,
     pub(crate) carried_nodes: usize,
     pub(crate) carried_root_visits: u32,
 }
@@ -26,7 +25,6 @@ where
             config,
             nodes: Vec::new(),
             eval_count: 0,
-            portable_contexts: 0,
             carried_nodes: 0,
             carried_root_visits: 0,
         }
@@ -79,7 +77,6 @@ where
                 config: self.config,
                 nodes,
                 eval_count: 0,
-                portable_contexts: 0,
                 carried_nodes,
                 carried_root_visits,
             },

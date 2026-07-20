@@ -13,8 +13,6 @@ lanes = 44
 workers_per_lane = 4
 max_steps = 96
 mask_stop = false
-length_tiebreak = true
-wave_batching = true
 tree_reuse = true
 replay_retain = 320000
 

@@ -11,7 +11,7 @@ the Python side.
 
 ```text
 PROTOCOL_VERSION = 2
-ENCODING_VERSION = 1
+ENCODING_VERSION = 5
 MAX_FRAME = 256 MiB
 ```
 
@@ -176,8 +176,8 @@ u32 LE body_length, then body: u8 frame_type + fields
 Constants:
 
 ```text
-SAMPLE_PROTOCOL_VERSION = 1
-ENCODING_VERSION = 1
+SAMPLE_PROTOCOL_VERSION = 11
+ENCODING_VERSION = 5
 MAX_FRAME = 256 MiB
 ```
 

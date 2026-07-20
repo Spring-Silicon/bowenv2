@@ -5,9 +5,9 @@ before every task.
 
 **Working code only. Finish the job. Plausibility is not correctness.**
 
-GraphZero is a performance-first Rust codebase for async graph/search pipelines.
-The first target is a modular `GraphEngine` abstraction tested with fake and
-Whittle-backed engines before any compiler backend exists.
+GraphZero is a performance-first Rust/Python codebase for asynchronous graph
+search, selfplay, replay, and training. Whittle is the concrete engine; search
+and orchestration remain generic over the `GraphEngine` boundary.
 
 ---
 
@@ -209,71 +209,47 @@ Proceed without asking when:
 
 ### Stack
 
-- Language: Rust planned.
-- Package manager: Cargo.
-- Runtime: async single-process first, process boundaries later.
+- Languages: Rust for engines/search/orchestration/storage and Python for
+  torch evaluation/training.
+- Package managers: Cargo and uv.
+- Runtime: bounded Rust worker lanes, Python evaluator processes, and a Python
+  trainer supervising the process group.
 - Storage: RocksDB + compact binary replay rows.
 
 ### Current Layout
 
 ```text
-specs/
-  CODEBASE_OUTLINE.md
-  GZ_EVAL.md
-  GZ_ENGINE.md
-  GZ_ENGINE_WHITTLE.md
-  GZ_ORCHESTRATOR.md
-  GZ_ORCHESTRATOR_SERIAL_IMPL.md
-  GZ_ORCHESTRATOR_FEATURIZED_IMPL.md
-  GZ_ORCHESTRATOR_MULTI_WORKER_IMPL.md
-  GZ_EVAL_SERVICE.md
-  GZ_FEATURES.md
-  GZ_FEATURES_EXPANDER_IMPL.md
-  GZ_MODEL.md
-  GZ_MODEL_TORCH_IMPL.md
-  GZ_OPPONENT_IMPL.md
-  GZ_ORCHESTRATOR_REPLAY_IMPL.md
-  GZ_EVAL_PROTOCOL.md
-  GZ_EVAL_SERVICE_IMPL.md
-  GZ_PYTHON.md
-  GZ_PYTHON_FRAMEWORK_IMPL.md
-  GZ_REPLAY.md
-  GZ_REUSE_RATIO_IMPL.md
-  GZ_SEARCH.md
-  GZ_SEARCH_GUMBEL_MCTS.md
-  GZ_SEARCH_TREE_REUSE_IMPL.md
-  GZ_ENGINE_RELEASE_IMPL.md
-  GZ_EVALUATOR_HOTSWAP_IMPL.md
-  GZ_TRAINER.md
-  GZ_TRAINER_IMPL.md
-  GZ_TRAINER_RUST_IMPL.md
-  GZ_TRAINING_DATA_IMPL.md
-```
-
-Planned layout:
-
-```text
 crates/
-  gz-engine/
-  gz-engine-fake/
-  gz-engine-whittle/
-  gz-features/
-  gz-search/
-  gz-eval/
-  gz-replay/
-  gz-orchestrator/
   gz-cli/
+  gz-engine/
+  gz-engine-whittle/
+  gz-eval/
+  gz-eval-service/
+  gz-eval-whittle/
+  gz-features/
+  gz-measurer/
+  gz-replay/
+  gz-search/
+  gz-orchestrator/
+python/gz/
+  checkpoints/
+  codec/
+  evaluator/
+  model/
+  proto/
+  replay/
+  trainer/
+specs/
+configs/
 ```
 
 ### Commands
 
-These are pending until the Rust workspace exists.
-
 ```bash
-cargo fmt
-cargo clippy --all-targets --all-features
-cargo test --all
-cargo bench
+cargo fmt --all --check
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+PYTHONPATH=.:python uv run --project python pytest -q python/tests
 ```
 
 ---

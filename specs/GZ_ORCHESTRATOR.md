@@ -7,12 +7,12 @@ worker slots, bounded queues, batching, model leases, feature extraction,
 admission shaping, replay submission, and handle release. It does not own search
 semantics, model code, measurement semantics, or replay validation.
 
-## Drivers
+## Driver
 
-`SerialGumbelOrchestrator` services one task synchronously.
-`BatchedGumbelOrchestrator` parks several single-agent tasks and evaluates their
-requests in batches. `ThreadedGumbelOrchestrator` runs one engine per lane and is
-the production symmetric/replay path.
+`ThreadedGumbelOrchestrator` runs one engine per lane and owns the production
+symmetric/replay path. Search algorithms remain independently testable in
+`gz-search`; the orchestrator does not retain alternate replay-less execution
+drivers.
 
 Every admitted episode receives a deterministic noise seed derived from its
 lane-scoped episode ID. Caller-supplied episode context is not accepted because
@@ -58,8 +58,8 @@ before propagating the error.
 
 Admission is work-conserving and may be shaped by evaluator capacity feedback.
 It accounts for symmetric work per game, current outstanding/reserved evals,
-observed episode work, and wave batching. A fixed stagger remains available but
-the adaptive shaper does not impose a hard episode-rate ceiling.
+observed episode work, and concurrent search waves. A fixed stagger remains
+available, but the adaptive shaper does not impose a hard episode-rate ceiling.
 
 Replay backpressure closes only new admission when
 `produced_rows - consumed_rows` exceeds the configured backlog. In-flight games

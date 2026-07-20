@@ -128,7 +128,8 @@ The mode requires:
 
 - the fixed `gz-graph-v2` joint-board Exphormer architecture;
 - generated Whittle roots for production training;
-- `length_tiebreak = true`; `tree_reuse` may be enabled or disabled;
+- equal measured rewards are broken by shorter rewrite length; `tree_reuse`
+  may be enabled or disabled;
 - either `mask_stop = true` for V1 or `mask_stop = false` with
   `position_features = true` for V2;
 - a featurized evaluator and a new topology-compatible checkpoint.

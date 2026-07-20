@@ -1,5 +1,4 @@
-from gz.model.exphormer import ArchConfig
-from gz.model.registry import ARCHS, build
+from gz.model.exphormer import ArchConfig, build_model
 from gz.model.stub import STUB_MODEL_VERSION, stub
 
-__all__ = ["ARCHS", "STUB_MODEL_VERSION", "ArchConfig", "build", "stub"]
+__all__ = ["STUB_MODEL_VERSION", "ArchConfig", "build_model", "stub"]

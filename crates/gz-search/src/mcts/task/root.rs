@@ -311,7 +311,6 @@ where
         result: ExpandResult<C>,
     ) -> EngineResult<()> {
         let context = self.identity.context(result.graph_hash);
-        self.tree.portable_contexts += 1;
         if let Some(expected) = expected_context
             && expected != context
         {
@@ -407,7 +406,6 @@ where
         }
 
         let child_context = self.identity.context(applied.after_hash);
-        self.tree.portable_contexts += 1;
         if self.config.no_backtrack
             && (self.root_context == Some(child_context) || self.visited.contains(&child_context))
         {
@@ -517,7 +515,6 @@ where
                 simulations: run.simulations,
                 expanded_nodes: self.tree.nodes.len(),
                 eval_count: self.tree.eval_count,
-                portable_contexts: self.tree.portable_contexts,
                 carried_nodes: self.tree.carried_nodes,
                 carried_root_visits: self.tree.carried_root_visits,
             },

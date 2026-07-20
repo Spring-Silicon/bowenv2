@@ -38,20 +38,6 @@ fn main() {
                 summary.counters.produced_rows,
                 summary.counters.consumed_rows,
             );
-            if std::env::var_os("GZ_HASH_VOLUME_STATS").is_some() {
-                println!(
-                    "hash_volume_contexts search={} replay_rows={} total={}",
-                    summary.search_contexts,
-                    summary.replay_rows,
-                    summary.search_contexts + summary.replay_rows,
-                );
-                println!(
-                    "measure_ledger finals={} distinct={} repeat={}",
-                    summary.measure_ledger.finals,
-                    summary.measure_ledger.distinct_finals,
-                    summary.measure_ledger.repeat_finals,
-                );
-            }
         }),
         "replay-init" => parse_replay_init(args.collect())
             .and_then(init_replay)
@@ -194,6 +180,7 @@ fn parse_selfplay(args: Vec<String>) -> Result<SelfplayConfig, String> {
             "--evaluator" => config.evaluator = value.parse()?,
             "--python-dir" => config.python_dir = Some(PathBuf::from(value)),
             "--checkpoint-dir" => config.checkpoint_dir = Some(PathBuf::from(value)),
+            "--checkpoint-pointer" => config.checkpoint_pointer = Some(value.clone()),
             "--eval-device" => config.eval_device = Some(value.clone()),
             "--eval-poll-interval" => {
                 config.eval_poll_interval = Some(parse_f32(flag, value)?);
@@ -216,11 +203,9 @@ fn parse_selfplay(args: Vec<String>) -> Result<SelfplayConfig, String> {
             "--position-features" => config.position_features = parse_bool(flag, value)?,
             "--no-backtrack" => config.no_backtrack = parse_bool(flag, value)?,
             "--mask-stop" => config.mask_stop = parse_bool(flag, value)?,
-            "--length-tiebreak" => config.length_tiebreak = parse_bool(flag, value)?,
             "--eval-processes" => config.eval_processes = parse_usize(flag, value)?,
             "--admission-stagger-ms" => config.admission_stagger_ms = parse_u64(flag, value)?,
             "--admission-smoothing" => config.admission_smoothing = parse_bool(flag, value)?,
-            "--wave-batching" => config.wave_batching = parse_bool(flag, value)?,
             _ => return Err(format!("unknown flag: {flag}\n{}", usage())),
         }
     }
@@ -257,5 +242,5 @@ fn parse_bool(flag: &str, value: &str) -> Result<bool, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: graphzero selfplay --replay-dir PATH [--episodes N; 0 = unbounded] [--lanes L] [--workers-per-lane W] [--evaluator stub|process-stub|torch] [--python-dir PATH] [--checkpoint-dir DIR] [--eval-device DEV] [--eval-poll-interval SECS] [--seed S] [--max-steps M] [--simulations K] [--max-considered M] [--gumbel-scale G] [--c-visit C] [--c-scale C] [--gumbel-noise-overlap V; negative disables] [--tree-reuse true|false] [--max-candidates N] [--max-batch B] [--serve-socket PATH] [--serve-max-batch B] [--replay-backlog ROWS] [--replay-retain ROWS] [--position-features true|false] [--no-backtrack true|false] [--mask-stop true|false] [--length-tiebreak true|false] [--eval-processes N] [--admission-stagger-ms MS] [--admission-smoothing true|false] [--wave-batching true|false]\n       graphzero replay-init --replay-dir PATH [--max-candidates N]\n       graphzero distill-generate --replay-dir PATH [--states N] [--workers N] [--max-attempts N; 0 = 10x states] [--teacher reducing-uniform] [--seed S] [--max-candidates N] [--max-steps N] [--position-features true|false]\n       graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B"
+    "usage: graphzero selfplay --replay-dir PATH [--episodes N; 0 = unbounded] [--lanes L] [--workers-per-lane W] [--evaluator stub|process-stub|torch] [--python-dir PATH] [--checkpoint-dir DIR] [--checkpoint-pointer FILE] [--eval-device DEV] [--eval-poll-interval SECS] [--seed S] [--max-steps M] [--simulations K] [--max-considered M] [--gumbel-scale G] [--c-visit C] [--c-scale C] [--gumbel-noise-overlap V; negative disables] [--tree-reuse true|false] [--max-candidates N] [--max-batch B] [--serve-socket PATH] [--serve-max-batch B] [--replay-backlog ROWS] [--replay-retain ROWS] [--position-features true|false] [--no-backtrack true|false] [--mask-stop true|false] [--eval-processes N] [--admission-stagger-ms MS] [--admission-smoothing true|false]\n       graphzero replay-init --replay-dir PATH [--max-candidates N]\n       graphzero distill-generate --replay-dir PATH [--states N] [--workers N] [--max-attempts N; 0 = 10x states] [--teacher reducing-uniform] [--seed S] [--max-candidates N] [--max-steps N] [--position-features true|false]\n       graphzero replay-serve --replay-dir PATH --socket PATH --max-batch B"
 }

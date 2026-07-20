@@ -15,6 +15,8 @@ from gz.trainer.loop import (
     auxiliary_task_loss,
     lr_at_step,
     policy_ce_loss,
+    soft_policy_ce_loss,
+    softened_policy_target,
     value_head_loss,
     value_mse_loss,
 )
@@ -45,6 +47,40 @@ def test_policy_ce_loss_masks_padding_and_reserved_stop() -> None:
     loss.backward()
     assert logits.grad is not None
     assert logits.grad[0, 2].item() == 0.0
+
+
+def test_t4_soft_policy_target_preserves_zeros_and_renormalizes() -> None:
+    policy = torch.tensor(
+        [
+            [0.60, 0.36, 0.03, 0.01, 999.0],
+            [0.0, 0.0, 0.0, 0.0, 999.0],
+        ]
+    )
+    action_count = torch.tensor([4, 4])
+    target = softened_policy_target(
+        policy,
+        action_count,
+        temperature=4.0,
+    )
+    expected = policy[0, :4].pow(0.25)
+    expected = expected / expected.sum()
+
+    torch.testing.assert_close(target[0, :4], expected)
+    assert target[0, 4].item() == 0.0
+    assert torch.count_nonzero(target[1]).item() == 0
+
+    logits = torch.zeros_like(policy, requires_grad=True)
+    loss, kl, entropy = soft_policy_ce_loss(
+        logits,
+        policy,
+        action_count,
+        row_count=2,
+        temperature=4.0,
+    )
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert float(loss.detach()) == pytest.approx(math.log(4.0))
+    assert float(kl.detach()) == pytest.approx(math.log(4.0) - float(entropy))
 
 
 def test_value_mse_masks_invalid_and_zero_valid_has_finite_gradient() -> None:
@@ -247,7 +283,7 @@ def test_auxiliary_model_trains_through_shared_and_independent_batches() -> None
             heads=4,
             ffn_dim=32,
             dropout=0.0,
-            auxiliary_heads="v8-v32-score",
+            auxiliary_heads="v8-v32-score-soft-policy-v2",
         ),
     )
     features = BatchStager(schema, view.batch_capacity, "cpu").copy(view)
@@ -269,8 +305,18 @@ def test_auxiliary_model_trains_through_shared_and_independent_batches() -> None
         value_v8_weight=0.2,
         value_v32_weight=0.2,
         terminal_score_weight=0.1,
+        soft_policy_weight=8.0,
+        soft_policy_temperature=4.0,
+        soft_policy_trunk_grad_scale=0.1,
     )
-    assert TrainerLoop(model, config).train_step(batch, with_metrics=False) is None
+    soft_before = model.soft_policy.pointer_key.weight.detach().clone()
+    metrics = TrainerLoop(model, config).train_step(batch)
+    assert metrics is not None
+    assert metrics.soft_policy_loss > metrics.soft_policy_target_entropy
+    assert metrics.soft_policy_kl == pytest.approx(
+        metrics.soft_policy_loss - metrics.soft_policy_target_entropy
+    )
+    assert not torch.equal(model.soft_policy.pointer_key.weight, soft_before)
 
     split_model = build_model(schema, model.arch)
     assert (
@@ -281,6 +327,73 @@ def test_auxiliary_model_trains_through_shared_and_independent_batches() -> None
         )
         is None
     )
+
+
+def test_compile_wraps_soft_policy_training_entrypoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    schema = FeatureSchemaConfig(
+        name="test",
+        node_vocab_size=8,
+        node_attr_dim=1,
+        edge_type_count=3,
+        action_kind_vocab_size=8,
+        max_nodes=view.dims.max_nodes,
+        max_edges=view.dims.max_edges,
+        max_actions=view.dims.max_actions,
+        max_subjects=view.dims.max_subjects,
+        expander_degree=0,
+        expander_seed=0,
+    )
+    model = build_model(
+        schema,
+        ArchConfig(
+            dim=16,
+            layers=1,
+            heads=4,
+            ffn_dim=32,
+            dropout=0.0,
+            auxiliary_heads="v8-v32-score-soft-policy-v2",
+        ),
+    )
+    features = BatchStager(schema, view.batch_capacity, "cpu").copy(view)
+    policy = torch.zeros((view.batch_capacity, view.max_actions))
+    policy[:, 0] = 1.0
+    batch = TrainingBatch(
+        features=features,
+        policy=policy,
+        value=torch.tensor([1.0, -1.0]),
+        value_valid=torch.ones(2),
+        horizon_value=torch.tensor([[1.0, 1.0], [-1.0, -1.0]]),
+        horizon_value_valid=torch.ones(2),
+        reward=torch.tensor([-20.0, -30.0]),
+        row_count=2,
+    )
+    compiled = []
+
+    def compile_path(path, **_options):
+        compiled.append(path)
+        return path
+
+    monkeypatch.setattr(torch, "compile", compile_path)
+    loop = TrainerLoop(
+        model,
+        LoopConfig(
+            warmup_steps=0,
+            value_final_weight=0.5,
+            value_v8_weight=0.2,
+            value_v32_weight=0.2,
+            terminal_score_weight=0.1,
+            soft_policy_weight=8.0,
+            soft_policy_temperature=4.0,
+            soft_policy_trunk_grad_scale=0.1,
+            compile_model=True,
+        ),
+    )
+
+    assert loop.train_step(batch, with_metrics=False) is None
+    assert len(compiled) == 6
 
 
 def test_compile_wraps_current_static_training_entrypoints(monkeypatch: pytest.MonkeyPatch) -> None:

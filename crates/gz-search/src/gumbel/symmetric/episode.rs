@@ -42,7 +42,6 @@ pub struct SymmetricSelfplayEpisodeTask<G, C> {
     path_graphs: Vec<G>,
     releasable: GumbelHandleBatch<G, C>,
     next_token: u64,
-    wave_batching: bool,
     root_pending: Vec<RootPending>,
     pending: Option<Pending<G>>,
     state: State<G, C>,
@@ -58,22 +57,6 @@ where
         identity: EngineIdentity,
         root: G,
         context: GumbelEpisodeContext,
-    ) -> Self {
-        Self::with_wave_batching(
-            search,
-            identity,
-            root,
-            context,
-            search.symmetric_wave_batching(),
-        )
-    }
-
-    pub fn with_wave_batching(
-        search: &GumbelMcts,
-        identity: EngineIdentity,
-        root: G,
-        context: GumbelEpisodeContext,
-        wave_batching: bool,
     ) -> Self {
         assert_eq!(
             search.config().value_mode,
@@ -93,7 +76,6 @@ where
             path_graphs: Vec::new(),
             releasable: GumbelHandleBatch::default(),
             next_token: 0,
-            wave_batching,
             root_pending: Vec::new(),
             pending: None,
             state: State::Turn,
@@ -137,7 +119,6 @@ where
             path_graphs: Vec::new(),
             releasable: GumbelHandleBatch::default(),
             next_token: 0,
-            wave_batching: search.symmetric_wave_batching(),
             root_pending: Vec::new(),
             pending: None,
             state: State::Turn,
@@ -335,7 +316,7 @@ where
             self.state = State::Turn;
             return Ok(());
         }
-        let task = SymmetricSelfplayRootTask::with_wave_batching(
+        let task = SymmetricSelfplayRootTask::new(
             &GumbelMcts::new(self.config),
             self.identity,
             [self.actors[0].current, self.actors[1].current],
@@ -349,7 +330,6 @@ where
             self.player,
             self.context.noise_seed,
             self.visited.clone(),
-            self.wave_batching,
         );
         self.state = State::Root(task);
         Ok(())

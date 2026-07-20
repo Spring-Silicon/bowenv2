@@ -28,7 +28,6 @@ use gz_eval::EngineEvaluator;
 pub struct GumbelMcts {
     config: GumbelMctsConfig,
     search_config_hash: SearchConfigHash,
-    symmetric_wave_batching: bool,
 }
 
 impl GumbelMcts {
@@ -59,21 +58,7 @@ impl GumbelMcts {
         Self {
             config,
             search_config_hash,
-            symmetric_wave_batching: false,
         }
-    }
-
-    /// Executes independent symmetric root branches concurrently without
-    /// changing the search configuration or replay identity.
-    #[must_use]
-    pub const fn with_symmetric_wave_batching(mut self, enabled: bool) -> Self {
-        self.symmetric_wave_batching = enabled;
-        self
-    }
-
-    #[must_use]
-    pub const fn symmetric_wave_batching(&self) -> bool {
-        self.symmetric_wave_batching
     }
 
     #[must_use]

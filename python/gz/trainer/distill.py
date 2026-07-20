@@ -7,22 +7,21 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from gz.model.exphormer import build_model, initialize_policy, initialize_value
+from gz.trainer.config import (
+    RunConfig,
+    dataclass_from_dict,
+    load_config,
+    load_config_table,
+    resolved_trainer_seeds,
+)
 from gz.trainer.data import TrainingStager
 from gz.trainer.driver import (
-    MetricsWriter,
-    PerfWindow,
-    RunConfig,
     SamplePrefetcher,
-    WandbRun,
     _checkpoint_due,
-    _dataclass_from_dict,
-    _load_config_table,
     _permanent_checkpoint_pointers,
-    _resolved_trainer_seeds,
     _seed_model,
     check_child,
     check_memory,
-    load_config,
     spawn_replay_serve,
     stop_child,
     trainer_loop_config,
@@ -30,6 +29,7 @@ from gz.trainer.driver import (
 from gz.trainer.loop import TrainerLoop
 from gz.trainer.publish import EmaWeights, publish_ema
 from gz.trainer.sampler import SampleClient, step_seed
+from gz.trainer.telemetry import MetricsWriter, PerfWindow, WandbRun
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,9 +45,9 @@ class DistillConfig:
 
 def load_distill_config(path: str | Path) -> tuple[RunConfig, DistillConfig]:
     path = Path(path)
-    data = _load_config_table(path)
+    data = load_config_table(path)
     run_config = load_config(path)
-    distill = _dataclass_from_dict(DistillConfig, data.get("distill", {}))
+    distill = dataclass_from_dict(DistillConfig, data.get("distill", {}))
     if distill.states < 1:
         raise ValueError("distill.states must be positive")
     if distill.workers < 1:
@@ -130,7 +130,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
                 f"rows={ack.produced_rows}"
             )
 
-        model_seed, data_seed = _resolved_trainer_seeds(config.trainer)
+        model_seed, data_seed = resolved_trainer_seeds(config.trainer)
         _seed_model(model_seed)
         model = build_model(sampler.feature_schema, config.arch)
         initialize_policy(model, config.trainer.policy_init)

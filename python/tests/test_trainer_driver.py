@@ -6,24 +6,23 @@ from types import SimpleNamespace
 
 import pytest
 
+from gz.common import FeatureSchemaHash
+from gz.trainer.config import TrainerConfig, load_config, resolved_trainer_seeds
 from gz.trainer.driver import (
     SamplePrefetcher,
-    TrainerConfig,
-    WandbRun,
     _checkpoint_due,
     _cumulative_reuse,
     _permanent_checkpoint_pointers,
     _required_episodes,
     _required_produced_rows,
-    _resolved_trainer_seeds,
+    _resolve_actor_checkpoint,
     _sample_training_batches,
     _sample_window_rows,
-    _symmetric_step_fields,
     init_replay,
-    load_config,
     spawn_torch_selfplay,
     trainer_loop_config,
 )
+from gz.trainer.telemetry import WandbRun, symmetric_step_fields
 
 
 def test_load_config_defaults_and_absolute_paths(tmp_path: Path) -> None:
@@ -52,8 +51,39 @@ graphzero_bin = "graphzero-test"
     assert config.paths.run_dir == Path.cwd() / "run"
     assert config.paths.replay_dir == Path.cwd() / "run/replay"
     assert config.paths.checkpoint_dir == Path.cwd() / "run/checkpoints"
+    assert config.paths.actor_checkpoint_dir == config.paths.checkpoint_dir
     assert config.paths.sample_socket == Path.cwd() / "run/sample.sock"
     assert config.paths.graphzero_bin == "graphzero-test"
+    assert config.selfplay.actor_checkpoint_pointer == "latest.json"
+
+
+def test_actor_checkpoint_must_match_learner_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    expected = FeatureSchemaHash.from_bytes(b"a" * 32)
+    resolved = SimpleNamespace(
+        manifest=SimpleNamespace(
+            feature_schema_hash=FeatureSchemaHash.from_bytes(b"b" * 32),
+        )
+    )
+
+    class FakeSource:
+        def __init__(self, root: Path, pointer: str) -> None:
+            assert root == tmp_path
+            assert pointer == "step_50000.json"
+
+        def resolve_latest(self) -> object:
+            return resolved
+
+    monkeypatch.setattr("gz.trainer.driver.DirectorySource", FakeSource)
+    config = SimpleNamespace(
+        paths=SimpleNamespace(actor_checkpoint_dir=tmp_path),
+        selfplay=SimpleNamespace(actor_checkpoint_pointer="step_50000.json"),
+    )
+
+    with pytest.raises(RuntimeError, match="feature schema"):
+        _resolve_actor_checkpoint(config, expected)
 
 
 def test_config_inheritance_is_recursive_and_one_layer_only(tmp_path: Path) -> None:
@@ -100,41 +130,19 @@ run_dir = "child"
         load_config(grandchild)
 
 
-def test_retired_symmetric_keys_are_accepted_only_at_fixed_values(tmp_path: Path) -> None:
-    compatible = write_config(
+def test_load_config_rejects_retired_symmetric_keys(tmp_path: Path) -> None:
+    path = write_config(
         tmp_path,
         """
 [trainer]
 value_mirror = false
-[selfplay]
-training_mode = "symmetric-selfplay"
-reference = "none"
-root_mode = "generated"
-reference_gamma = 0.0
-reference_trajectory_pool = 0
-value_reward = "sign"
 [paths]
 run_dir = "run"
 graphzero_bin = "graphzero"
 """,
     )
-    assert load_config(compatible).selfplay.lanes == 2
-
-    incompatible = compatible.read_text(encoding="utf-8").replace(
-        "reference_gamma = 0.0", "reference_gamma = 0.2"
-    )
-    compatible.write_text(incompatible, encoding="utf-8")
-    with pytest.raises(ValueError, match="retired selfplay setting"):
-        load_config(compatible)
-
-    compatible.write_text(
-        incompatible.replace("reference_gamma = 0.2", "reference_gamma = 0.0").replace(
-            "value_mirror = false", "value_mirror = true"
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="value_mirror=true"):
-        load_config(compatible)
+    with pytest.raises(ValueError, match="unknown config fields"):
+        load_config(path)
 
 
 @pytest.mark.parametrize(
@@ -144,7 +152,12 @@ graphzero_bin = "graphzero"
         ("trainer", "compile_mode", '"unknown"', "compile_mode"),
         ("trainer", "checkpoint_retain", "-1", "checkpoint_retain"),
         ("trainer", "min_startup_rows", "0", "min_startup_rows"),
-        ("selfplay", "length_tiebreak", "false", "length_tiebreak"),
+        (
+            "selfplay",
+            "actor_checkpoint_pointer",
+            '"nested/latest.json"',
+            "actor_checkpoint_pointer",
+        ),
     ],
 )
 def test_load_config_rejects_invalid_active_settings(
@@ -198,12 +211,11 @@ def test_canonical_symmetric_config_resolves_retained_recipe() -> None:
     assert config.arch.trunk == "exphormer"
     assert config.arch.state_input == "joint-board"
     assert config.arch.value_input == "single"
-    assert config.selfplay.length_tiebreak is True
     assert config.paths.replay_dir.as_posix().startswith("/opt/dlami/nvme/")
 
 
 def test_trainer_seed_and_loop_settings_are_independent() -> None:
-    assert _resolved_trainer_seeds(TrainerConfig(seed=7)) == (7, 7)
+    assert resolved_trainer_seeds(TrainerConfig(seed=7)) == (7, 7)
     config = TrainerConfig(
         seed=7,
         model_seed=11,
@@ -211,12 +223,18 @@ def test_trainer_seed_and_loop_settings_are_independent() -> None:
         compile_model=True,
         compile_mode="reduce-overhead",
         value_trunk_grad_scale=0.1,
+        soft_policy_weight=8.0,
+        soft_policy_temperature=4.0,
+        soft_policy_trunk_grad_scale=0.1,
     )
-    assert _resolved_trainer_seeds(config) == (11, 13)
+    assert resolved_trainer_seeds(config) == (11, 13)
     loop = trainer_loop_config(config, symmetric_mask_stop=False)
     assert loop.compile_model is True
     assert loop.compile_mode == "reduce-overhead"
     assert loop.value_trunk_grad_scale == 0.1
+    assert loop.soft_policy_weight == 8.0
+    assert loop.soft_policy_temperature == 4.0
+    assert loop.soft_policy_trunk_grad_scale == 0.1
     assert loop.mask_stop_loss is False
 
 
@@ -333,7 +351,7 @@ def test_symmetric_step_fields_report_both_seats() -> None:
         value_sign_accuracy_late_ema=0.7,
         episode_latency_ema=12.0,
     )
-    fields = _symmetric_step_fields(ack, completed_games=123)
+    fields = symmetric_step_fields(ack, completed_games=123)
     assert fields["symmetric_games_completed"] == 123
     assert fields["symmetric_p1_win_rate_ema"] == 0.4
     assert fields["symmetric_p2_win_rate_ema"] == 0.35
@@ -356,8 +374,11 @@ lanes = 4
 workers_per_lane = 3
 tree_reuse = true
 mask_stop = true
+actor_checkpoint_pointer = "step_50000.json"
+eval_poll_interval = 0.0
 [paths]
 run_dir = "run"
+actor_checkpoint_dir = "frozen-actor"
 graphzero_bin = "graphzero-test"
 """,
         )
@@ -378,6 +399,11 @@ graphzero_bin = "graphzero-test"
     assert command[:2] == ["graphzero-test", "selfplay"]
     assert command[command.index("--lanes") + 1] == "4"
     assert command[command.index("--tree-reuse") + 1] == "true"
+    assert command[command.index("--checkpoint-dir") + 1] == str(
+        Path.cwd() / "frozen-actor"
+    )
+    assert command[command.index("--checkpoint-pointer") + 1] == "step_50000.json"
+    assert command[command.index("--eval-poll-interval") + 1] == "0.0"
     assert "--reference" not in command
     assert "--training-mode" not in command
     assert calls[1][1]["start_new_session"] is True
@@ -398,12 +424,24 @@ def test_wandb_mapping_logs_only_explicit_metrics() -> None:
             "event": "step",
             "step": 8,
             "policy_loss": 1.25,
+            "soft_policy_loss": 2.0,
+            "soft_policy_kl": 0.25,
+            "soft_policy_target_entropy": 1.75,
             "value_loss": 0.5,
             "unknown": 99,
         }
     )
     assert run.logs == [
-        ({"train/policy_loss": 1.25, "train/value_loss": 0.5}, 8)
+        (
+            {
+                "train/policy_loss": 1.25,
+                "train/soft_policy_loss": 2.0,
+                "train/soft_policy_kl": 0.25,
+                "train/soft_policy_target_entropy": 1.75,
+                "train/value_loss": 0.5,
+            },
+            8,
+        )
     ]
 
 

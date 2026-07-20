@@ -10,8 +10,7 @@ from pathlib import Path
 from gz.codec import BatchView, OutputEncoder
 from gz.checkpoints import CheckpointSource, DirectorySource, ResolvedCheckpoint
 from gz.common.tags import ModelVersion
-from gz.model import build
-from gz.model.exphormer import ArchConfig, BatchStager
+from gz.model.exphormer import ArchConfig, BatchStager, build_model
 from gz.model.stub import STUB_MODEL_VERSION, stub
 from gz.proto import ERROR_CAPACITY, ERROR_PROTOCOL, ERROR_SCHEMA, Hello, ProtocolError
 
@@ -537,7 +536,7 @@ class TorchBackend:
         arch = ArchConfig.from_dict(resolved.manifest.arch_config)
         if arch.name != resolved.manifest.arch_name:
             raise ValueError("manifest arch name mismatch")
-        model = build(resolved.manifest.feature_schema, arch)
+        model = build_model(resolved.manifest.feature_schema, arch)
         from gz.checkpoints.weights import load_state_dict
 
         model.load_state_dict(load_state_dict(resolved.weights_path))

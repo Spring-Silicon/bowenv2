@@ -305,10 +305,8 @@ name = "gz-orchestrator"
 version = "0.1.0"
 dependencies = [
  "gz-engine",
- "gz-engine-whittle",
  "gz-eval",
  "gz-eval-service",
- "gz-eval-whittle",
  "gz-features",
  "gz-measurer",
  "gz-replay",
