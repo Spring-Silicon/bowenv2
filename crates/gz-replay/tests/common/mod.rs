@@ -106,6 +106,7 @@ pub fn episode_with_rows(row_count: usize) -> (ReplayEpisodeRecord, Vec<ReplayRo
             policy_target: vec![1.0, 0.0],
             selected_action: action,
             value_target: Some(1.0),
+            horizon_value_targets: None,
             reward_target: Some(5.0),
             final_measure: final_measure.clone(),
             model_version: None,

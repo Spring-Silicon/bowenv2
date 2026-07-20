@@ -2,7 +2,7 @@ use crate::{ServiceError, ServiceResult};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 
 pub const FRAME_HELLO: u8 = 1;
@@ -12,6 +12,7 @@ pub const FRAME_EVAL_RESULT: u8 = 4;
 pub const FRAME_PING: u8 = 5;
 pub const FRAME_PONG: u8 = 6;
 pub const FRAME_ERROR: u8 = 7;
+pub const FRAME_MODEL_RELEASE: u8 = 8;
 
 pub fn read_frame<'a>(
     stream: &mut UnixStream,
@@ -86,5 +87,6 @@ const fn known_frame_type(frame_type: u8) -> bool {
             | FRAME_PING
             | FRAME_PONG
             | FRAME_ERROR
+            | FRAME_MODEL_RELEASE
     )
 }

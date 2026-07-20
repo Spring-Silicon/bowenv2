@@ -1,3 +1,4 @@
+use crate::GumbelValueMode;
 use gz_engine::{CandidateOptions, MeasureOptions, SearchConfigHash};
 
 pub fn greedy_search_config_hash(
@@ -43,7 +44,7 @@ pub fn random_search_config_hash(
     SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
-pub fn categorical_policy_config_hash(
+pub fn policy_rollout_config_hash(
     max_steps: usize,
     seed: u64,
     mask_stop: bool,
@@ -70,6 +71,16 @@ pub fn sampled_tree_search_config_hash(
     update_chunk(&mut hasher, b"gz-search-gumbel-sampled-tree-v1");
     update_chunk(&mut hasher, base.as_bytes());
     update_bool(&mut hasher, reference_mask_stop);
+    SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
+}
+
+pub fn symmetric_selfplay_search_config_hash(base: SearchConfigHash) -> SearchConfigHash {
+    let mut hasher = blake3::Hasher::new();
+    // v2: retired players preserve their true rewrite count, and corrected
+    // reused no-backtrack masks/root considered-set replenishment affect
+    // selected actions and policy targets.
+    update_chunk(&mut hasher, b"gz-search-gumbel-symmetric-selfplay-v2");
+    update_chunk(&mut hasher, base.as_bytes());
     SearchConfigHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
@@ -104,6 +115,7 @@ pub fn gumbel_search_config_hash(
     no_backtrack: bool,
     candidate_options: CandidateOptions,
     measure_options: MeasureOptions,
+    value_mode: GumbelValueMode,
 ) -> SearchConfigHash {
     let mut hasher = blake3::Hasher::new();
     // v3: reused roots credit carried visits against the simulation
@@ -118,10 +130,19 @@ pub fn gumbel_search_config_hash(
     //     policy-based-self-competition; fresh simulations are counted
     //     relative to the carried visit baseline. tree_reuse=false keeps
     //     the v7 namespace because fresh-tree semantics did not change.
-    if tree_reuse {
-        update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v8");
-    } else {
-        update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v7");
+    match value_mode {
+        GumbelValueMode::SingleVanilla => {
+            update_chunk(&mut hasher, b"gz-search-gumbel-mcts-single-vanilla-v1");
+        }
+        GumbelValueMode::SymmetricSelfplay => {
+            update_chunk(&mut hasher, b"gz-search-gumbel-mcts-symmetric-selfplay-v2");
+        }
+        GumbelValueMode::Competitive if tree_reuse => {
+            update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v8");
+        }
+        GumbelValueMode::Competitive => {
+            update_chunk(&mut hasher, b"gz-search-gumbel-mcts-v7");
+        }
     }
     update_u64(&mut hasher, max_steps as u64);
     update_u64(&mut hasher, simulations as u64);

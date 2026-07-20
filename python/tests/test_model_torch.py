@@ -279,6 +279,198 @@ def test_pair_value_head_uses_opponent_state() -> None:
     assert not torch.equal(changed_values, values)
 
 
+def test_joint_board_conditions_policy_and_value_on_opponent_nodes() -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    changed_bytes = bytearray(make_batch(attr_dim=1))
+    layout = _layout(2, 3, 2, 3, 2, 1)
+    struct.pack_into("<H", changed_bytes, layout["opponent_node_tokens"], 6)
+    changed = BatchView.parse(changed_bytes)
+    schema = schema_for_view(view, node_vocab_size=7, edge_type_count=2, action_kind_vocab_size=8)
+    arch = ArchConfig(
+        dim=16,
+        layers=2,
+        heads=4,
+        ffn_dim=32,
+        dropout=0.0,
+        aggregation="attention",
+        state_input="joint-board",
+    )
+    model = build_model(schema, arch).eval()
+
+    values, logits = run_model(model, schema, view)
+    changed_values, changed_logits = run_model(model, schema, changed)
+
+    assert values.shape == (2,)
+    assert logits.shape == (2, 3)
+    assert not torch.equal(changed_values, values)
+    assert not torch.equal(changed_logits, logits)
+
+
+def test_joint_board_arch_round_trip_and_constraints() -> None:
+    arch = ArchConfig(state_input="joint-board")
+    assert ArchConfig.from_dict(arch.to_dict()) == arch
+    with pytest.raises(ValueError, match="requires value_input"):
+        ArchConfig(state_input="joint-board", value_input="pair")
+    with pytest.raises(ValueError, match="auxiliary heads require"):
+        ArchConfig(auxiliary_heads="v8-v32-score")
+
+
+def test_auxiliary_training_outputs_share_one_trunk_and_do_not_change_serving_value(
+    monkeypatch,
+) -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    schema = schema_for_view(
+        view,
+        node_vocab_size=7,
+        edge_type_count=2,
+        action_kind_vocab_size=8,
+    )
+    arch = ArchConfig(
+        dim=16,
+        layers=1,
+        heads=4,
+        ffn_dim=32,
+        dropout=0.0,
+        state_input="joint-board",
+        value_activation="tanh",
+        auxiliary_heads="v8-v32-score",
+    )
+    model = build_model(schema, arch).eval()
+    tensors = tensors_of(schema, view)
+    encode_calls = 0
+    encode_graph = model._encode_graph
+
+    def counted_encode(*args, **kwargs):
+        nonlocal encode_calls
+        encode_calls += 1
+        return encode_graph(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_encode_graph", counted_encode)
+    with torch.no_grad():
+        value, horizon, score, logits, readout = model.training_forward(tensors)
+    assert encode_calls == 1
+    assert value.shape == (view.batch_capacity,)
+    assert horizon.shape == (view.batch_capacity, 2)
+    assert score.shape == (view.batch_capacity,)
+    assert logits.shape == (view.batch_capacity, view.max_actions)
+    assert readout.shape[0] == view.batch_capacity
+    assert torch.all((-1.0 < horizon) & (horizon < 1.0))
+
+    with torch.no_grad():
+        serving_value_before, serving_logits_before = model(tensors)
+        for parameter in (*model.horizon_value.parameters(), *model.terminal_score.parameters()):
+            parameter.add_(torch.randn_like(parameter))
+        serving_value_after, serving_logits_after = model(tensors)
+
+    torch.testing.assert_close(serving_value_after, serving_value_before, rtol=0, atol=0)
+    torch.testing.assert_close(serving_logits_after, serving_logits_before, rtol=0, atol=0)
+
+
+def test_auxiliary_value_gradient_scale_is_applied_once_before_head_fanout() -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    schema = schema_for_view(
+        view,
+        node_vocab_size=7,
+        edge_type_count=2,
+        action_kind_vocab_size=8,
+    )
+    model = build_model(
+        schema,
+        ArchConfig(
+            dim=16,
+            layers=1,
+            heads=4,
+            ffn_dim=32,
+            dropout=0.0,
+            state_input="joint-board",
+            value_activation="tanh",
+            auxiliary_heads="v8-v32-score",
+        ),
+    ).eval()
+    tensors = tensors_of(schema, view)
+
+    def gradients(scale: float):
+        model.zero_grad(set_to_none=True)
+        value, horizon, score, _ = model.training_values(
+            tensors,
+            value_trunk_grad_scale=scale,
+        )
+        (value.sum() + horizon.sum() + score.sum()).backward()
+        return {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+
+    full = gradients(1.0)
+    scaled = gradients(0.1)
+    head_prefixes = ("value.", "horizon_value.", "terminal_score.")
+    trunk_names = [name for name in full if not name.startswith(head_prefixes)]
+    head_names = [name for name in full if name.startswith(head_prefixes)]
+    assert trunk_names and head_names
+    for name in trunk_names:
+        torch.testing.assert_close(scaled[name], 0.1 * full[name])
+    for name in head_names:
+        torch.testing.assert_close(scaled[name], full[name], rtol=0, atol=0)
+
+
+def test_value_trunk_gradient_scale_preserves_forward_and_value_head_gradient() -> None:
+    view = BatchView.parse(make_batch(attr_dim=1))
+    schema = schema_for_view(
+        view,
+        node_vocab_size=7,
+        edge_type_count=2,
+        action_kind_vocab_size=8,
+    )
+    model = build_model(
+        schema,
+        ArchConfig(
+            dim=16,
+            layers=2,
+            heads=4,
+            ffn_dim=32,
+            dropout=0.0,
+            state_input="joint-board",
+        ),
+    ).eval()
+    tensors = tensors_of(schema, view)
+
+    def gradients(scale: float):
+        model.zero_grad(set_to_none=True)
+        output = model.value_only(tensors, value_trunk_grad_scale=scale)
+        output.sum().backward()
+        return output.detach().clone(), {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+
+    full_output, full_gradients = gradients(1.0)
+    scaled_output, scaled_gradients = gradients(0.1)
+
+    torch.testing.assert_close(scaled_output, full_output, rtol=0, atol=0)
+    trunk_names = [
+        name for name in full_gradients if not name.startswith("value.")
+    ]
+    value_names = [name for name in full_gradients if name.startswith("value.")]
+    assert trunk_names
+    assert value_names
+    for name in trunk_names:
+        torch.testing.assert_close(
+            scaled_gradients[name],
+            0.1 * full_gradients[name],
+            rtol=1e-5,
+            atol=1e-7,
+        )
+    for name in value_names:
+        torch.testing.assert_close(
+            scaled_gradients[name],
+            full_gradients[name],
+            rtol=0,
+            atol=0,
+        )
+
+
 def test_pair_serving_split_matches_full_forward() -> None:
     view = BatchView.parse(make_batch(attr_dim=1))
     schema = schema_for_view(view, node_vocab_size=7, edge_type_count=2, action_kind_vocab_size=8)
@@ -838,9 +1030,11 @@ def test_value_mirror_returns_both_orientations() -> None:
     tensors = tensors_of(schema, view)
     with torch.no_grad():
         mirrored, _ = model(tensors, value_mirror=True)
+        value_only_mirrored = model.value_only(tensors, value_mirror=True)
         canonical, _ = model(tensors)
 
     assert mirrored.shape[0] == 2
+    torch.testing.assert_close(value_only_mirrored, mirrored, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(mirrored[0], canonical, rtol=0, atol=0)
     # The swapped orientation equals canonical exactly when self and
     # opponent readouts coincide; on real batches they differ per row

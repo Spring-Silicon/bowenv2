@@ -1,0 +1,16 @@
+extends = "../../bases/whittle-generated-exphormer-v2-symmetric-selfplay.toml"
+
+[arch]
+auxiliary_heads = "v8-v32-score"
+
+[trainer]
+value_final_weight = 1.0
+value_v8_weight = 0.0
+value_v32_weight = 0.0
+terminal_score_weight = 0.0
+
+[wandb]
+run_name = "katago-aux-heads-main-only"
+
+[paths]
+run_dir = "runs/katago-aux-heads-main-only"

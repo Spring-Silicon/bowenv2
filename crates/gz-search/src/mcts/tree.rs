@@ -145,6 +145,7 @@ pub(crate) struct MctsNode<G, C> {
     pub(crate) logits: Vec<f32>,
     pub(crate) priors: Vec<f32>,
     pub(crate) value: f32,
+    pub(crate) terminal: bool,
     pub(crate) model_version: ModelVersion,
     pub(crate) children: Vec<Option<usize>>,
     pub(crate) visits: Vec<u32>,
@@ -167,6 +168,7 @@ where
         summaries: Vec<Option<SearchCandidateSummary>>,
         output: gz_eval::EvalOutput,
         mask_stop: bool,
+        terminal: bool,
     ) -> Self {
         let priors = softmax(&output.policy_logits);
         let action_count = output.policy_logits.len();
@@ -184,6 +186,7 @@ where
             logits: output.policy_logits,
             priors,
             value: output.value,
+            terminal,
             model_version: output.model_version,
             children: vec![None; action_count],
             visits: vec![0; action_count],

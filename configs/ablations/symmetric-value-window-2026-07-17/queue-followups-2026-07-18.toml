@@ -1,0 +1,21 @@
+[queue]
+name = "symmetric-value-window-followups-2026-07-18"
+results_dir = "runs/queues/symmetric-value-window-followups-2026-07-18"
+poll_seconds = 5.0
+min_free_gb = 5.0
+continue_on_failure = false
+
+[observe]
+pid = 1428084
+config = "04-10m-reuse-on-value-window300k-trunk-grad0p1.toml"
+timeout_seconds = 43200
+
+[[runs]]
+name = "10m-vtg0p05-c8s48"
+config = "05-10m-reuse-on-value-window300k-trunk-grad0p05.toml"
+timeout_seconds = 86400
+
+[[runs]]
+name = "1m-vtg0p1-c32s128"
+config = "06-1m-reuse-on-value-window300k-trunk-grad0p1-c32s128.toml"
+timeout_seconds = 86400

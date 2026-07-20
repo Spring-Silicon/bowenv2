@@ -5,9 +5,9 @@ import struct
 
 from gz.proto.errors import ERROR_MALFORMED, ERROR_PROTOCOL, ProtocolError
 
-PROTOCOL_VERSION = 1
-# Row/targets encoding version: pairs with the Rust row codec.
-ENCODING_VERSION = 4
+PROTOCOL_VERSION = 2
+# Row/targets encoding version: v5 adds V8/V32 training targets.
+ENCODING_VERSION = 5
 # Eval-wire batch/output encoding version. v5 adds transient opponent
 # trajectory identity and row sections for serving-side readout caches.
 BATCH_ENCODING_VERSION = 5
@@ -20,6 +20,7 @@ FRAME_EVAL_RESULT = 4
 FRAME_PING = 5
 FRAME_PONG = 6
 FRAME_ERROR = 7
+FRAME_MODEL_RELEASE = 8
 
 _KNOWN_TYPES = {
     FRAME_HELLO,
@@ -29,6 +30,7 @@ _KNOWN_TYPES = {
     FRAME_PING,
     FRAME_PONG,
     FRAME_ERROR,
+    FRAME_MODEL_RELEASE,
 }
 
 

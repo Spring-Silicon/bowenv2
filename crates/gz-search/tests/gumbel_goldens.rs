@@ -8,7 +8,7 @@ use gz_engine::{
 use gz_eval::{EvalOutput, EvalRequest, EvalResult, Evaluator};
 use gz_search::{
     GumbelEpisode, GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext,
-    GumbelRootResult, GumbelRootStats, GumbelSearchContext, GumbelStopReason,
+    GumbelRootResult, GumbelRootStats, GumbelSearchContext, GumbelStopReason, GumbelValueMode,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -79,6 +79,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: GumbelValueMode::Competitive,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: measure_options(),
     }

@@ -207,6 +207,50 @@ def test_prune_checkpoints_keeps_newest_named_and_in_flight_versions(
     assert DirectorySource(tmp_path).resolve_latest().weights_path.parent.name == "version_6"
 
 
+def test_permanent_step_pointer_survives_rolling_prune(tmp_path: Path) -> None:
+    schema = schema_config()
+    arch = ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0)
+    model = build_model(schema, arch)
+    kwargs = dict(
+        arch_name=arch.name,
+        arch_config=arch.to_dict(),
+        arch_config_hash=arch.hash(),
+        feature_schema=schema,
+        feature_schema_hash=feature_hash(),
+        engine_id=EngineId.from_bytes(b"e" * 16),
+        engine_version=EngineVersion.from_bytes(b"v" * 16),
+        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        run_id="run",
+    )
+    base_state = model.state_dict()
+    first_key = next(iter(base_state))
+    manifests = []
+    for step in (1000, 1001, 1002):
+        state = dict(base_state)
+        state[first_key] = base_state[first_key] + float(step)
+        manifests.append(
+            publish_checkpoint(
+                tmp_path,
+                state,
+                training_step=step,
+                checkpoint_pointers=("step_1000.json",) if step == 1000 else (),
+                **kwargs,
+            )
+        )
+
+    removed = prune_checkpoints(tmp_path, 1)
+
+    assert removed == ("version_1",)
+    assert {
+        path.name
+        for path in tmp_path.iterdir()
+        if path.is_dir() and path.name.startswith("version_")
+    } == {"version_0", "version_2"}
+    milestone = DirectorySource(tmp_path, pointer="step_1000.json").resolve_latest()
+    assert milestone.manifest == manifests[0]
+    assert DirectorySource(tmp_path).resolve_latest().manifest == manifests[2]
+
+
 def test_prune_checkpoints_validates_pointers_before_deleting(tmp_path: Path) -> None:
     schema = schema_config()
     arch = ArchConfig(dim=16, layers=1, heads=4, ffn_dim=32, dropout=0.0)

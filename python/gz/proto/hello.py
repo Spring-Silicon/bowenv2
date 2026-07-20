@@ -7,7 +7,7 @@ from gz.common.tags import ActionSetHash, EngineId, EngineVersion, FeatureSchema
 from gz.proto.errors import ERROR_MALFORMED, ProtocolError
 
 HELLO_LEN = 108
-HELLO_ACK_LEN = 20
+HELLO_ACK_LEN = 28
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,9 +50,14 @@ class Hello:
 class HelloAck:
     protocol_version: int
     model_version: ModelVersion
+    model_generation: int
 
     def encode(self) -> bytes:
-        return struct.pack("<I", self.protocol_version) + bytes(self.model_version)
+        return (
+            struct.pack("<I", self.protocol_version)
+            + bytes(self.model_version)
+            + struct.pack("<Q", self.model_generation)
+        )
 
     @classmethod
     def decode(cls, buf: memoryview) -> HelloAck:
@@ -61,4 +66,5 @@ class HelloAck:
         return cls(
             protocol_version=struct.unpack_from("<I", buf, 0)[0],
             model_version=ModelVersion.from_bytes(buf[4:20]),
+            model_generation=struct.unpack_from("<Q", buf, 20)[0],
         )

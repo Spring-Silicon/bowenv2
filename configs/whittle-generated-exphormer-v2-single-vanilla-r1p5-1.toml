@@ -1,0 +1,11 @@
+extends = "bases/whittle-generated-exphormer-v2-single-vanilla.toml"
+
+[trainer]
+max_reuse = 1.5
+
+[wandb]
+run_name = "whittle-generated-exphormer-v2-single-vanilla-r1p5-1"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-v2-single-vanilla-r1p5-1"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/whittle-generated-exphormer-v2-single-vanilla-r1p5-1"

@@ -275,7 +275,8 @@ def summarize_run(config_path: Path, config: RunConfig) -> dict[str, Any]:
         "tail_learner_win_rate": _mean(tail, "learner_win_rate"),
         "tail_policy_loss": _mean(tail, "policy_loss"),
         "tail_value_loss": _mean(tail, "value_loss"),
-        "samples_per_row": last.get("samples_per_row"),
+        "policy_reuse": last.get("policy_reuse"),
+        "value_reuse": last.get("value_reuse"),
         "metrics_duration_seconds": max(timestamps) - min(timestamps) if len(timestamps) >= 2 else None,
         "wandb_url": urls[-1] if urls else None,
     }

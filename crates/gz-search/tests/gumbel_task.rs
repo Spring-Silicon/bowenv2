@@ -5,10 +5,10 @@ use common::{TestEngine, measure_options};
 use gz_engine::{CandidateOptions, GraphEngine, ModelVersion};
 use gz_eval::EvalOutput;
 use gz_search::{
-    CategoricalPolicyEpisodeTask, EngineIdentity, EvalWork, ExpandResult, ExpandedCandidate,
-    GumbelEpisodeContext, GumbelEpisodeTask, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext,
-    GumbelRootTask, GumbelSearchContext, SearchAction, SearchPoll, SearchWork, SearchWorkResult,
-    WorkToken,
+    EngineIdentity, EvalWork, ExpandResult, ExpandedCandidate, GumbelEpisodeContext,
+    GumbelEpisodeTask, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext, GumbelRootTask,
+    GumbelSearchContext, GumbelValueMode, PolicyRollout, PolicyRolloutConfig, PolicyRolloutContext,
+    PolicyRolloutEpisodeTask, SearchAction, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
 };
 use std::num::NonZeroUsize;
 
@@ -27,6 +27,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: GumbelValueMode::Competitive,
         candidate_options: CandidateOptions::default(),
         measure_options: measure_options(),
     }
@@ -123,7 +124,7 @@ fn root_task_first_emits_expand_then_eval() {
 }
 
 #[test]
-fn categorical_policy_task_ranks_once_and_skips_rejected_actions() {
+fn policy_rollout_task_ranks_once_and_skips_rejected_actions() {
     let mut engine = TestEngine::new()
         .candidates(0, [1, 2])
         .rejected(0, 1)
@@ -131,15 +132,20 @@ fn categorical_policy_task_ranks_once_and_skips_rejected_actions() {
         .reward(2, 7.0);
     let mut rollout_config = config(1);
     rollout_config.no_backtrack = true;
-    let search = GumbelMcts::new(rollout_config).categorical_policy_rollout();
-    let mut task = CategoricalPolicyEpisodeTask::new(
+    let search = PolicyRollout::new(PolicyRolloutConfig {
+        max_steps: rollout_config.max_steps,
+        seed: rollout_config.seed,
+        export_position: rollout_config.export_position,
+        mask_stop: rollout_config.mask_stop,
+        no_backtrack: rollout_config.no_backtrack,
+        candidate_options: rollout_config.candidate_options,
+        measure_options: rollout_config.measure_options,
+    });
+    let mut task = PolicyRolloutEpisodeTask::new(
         &search,
         EngineIdentity::from_engine(&engine),
         0,
-        GumbelEpisodeContext {
-            noise_seed: 19,
-            opponent: None,
-        },
+        PolicyRolloutContext { noise_seed: 19 },
     );
 
     let expand = match task.poll().unwrap() {

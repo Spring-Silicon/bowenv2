@@ -14,8 +14,10 @@ from gz.trainer.driver import (
     RunConfig,
     SamplePrefetcher,
     WandbRun,
+    _checkpoint_due,
     _dataclass_from_dict,
     _load_config_table,
+    _permanent_checkpoint_pointers,
     _resolved_trainer_seeds,
     _seed_model,
     check_child,
@@ -189,6 +191,10 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
                 arch=config.arch,
                 training_step=training_step,
                 run_id=config.paths.run_dir.name,
+                checkpoint_pointers=_permanent_checkpoint_pointers(
+                    config.trainer,
+                    training_step,
+                ),
             )
             param_norm, update_norm = ema.norms(published_snapshot)
             published_snapshot = ema.state_dict()
@@ -236,13 +242,13 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
                     "label_mean": step_metrics.label_mean,
                     "learner_win_rate": step_metrics.learner_win_rate,
                     "produced_rows": distill.states,
-                    "samples_per_row": (step + 1)
-                    * config.trainer.batch
-                    / distill.states,
+                    "produced_policy_rows": distill.states,
+                    "policy_reuse": (step + 1) * config.trainer.batch / distill.states,
                     **window.drain(distill.states, distill.states),
                 }
+                record.update(step_metrics.logging_fields())
                 metrics.write(record)
-            if (step + 1) % config.trainer.publish_interval == 0:
+            if _checkpoint_due(config.trainer, step + 1):
                 publish(step + 1)
             if config.trainer.step_sleep:
                 time.sleep(config.trainer.step_sleep)
@@ -250,7 +256,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
         if prefetcher is not None:
             prefetcher.stop()
             prefetcher = None
-        if config.trainer.total_steps % config.trainer.publish_interval != 0:
+        if not _checkpoint_due(config.trainer, config.trainer.total_steps):
             publish(config.trainer.total_steps)
         clean = True
     finally:

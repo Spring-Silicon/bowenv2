@@ -24,11 +24,13 @@ fn write_targets(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         RowTargets {
             policy: vec![0.75, 0.25, 0.0],
             value: Some(1.0),
+            horizon_value: Some([0.5, 0.25]),
             reward: 2.5,
         },
         RowTargets {
             policy: vec![1.0, 0.0, 0.0],
             value: Some(-1.0),
+            horizon_value: Some([-0.5, -0.25]),
             reward: -3.0,
         },
     ];

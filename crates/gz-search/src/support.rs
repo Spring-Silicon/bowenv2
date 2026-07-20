@@ -42,6 +42,14 @@ pub(crate) fn score<G>(measure: &MeasureResult<G>) -> Option<f32> {
     }
 }
 
+pub(crate) fn budget_fraction(max_steps: usize, step: usize) -> f32 {
+    if max_steps == 0 {
+        1.0
+    } else {
+        max_steps.saturating_sub(step) as f32 / max_steps as f32
+    }
+}
+
 pub(crate) fn step_ref(
     before: ReplayGraphContext,
     action: PortableSearchActionRef,

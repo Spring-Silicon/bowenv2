@@ -8,8 +8,10 @@ mod greedy;
 mod gumbel;
 mod hash;
 mod mcts;
+mod policy_rollout;
 mod puct;
 mod random;
+mod sampling;
 mod scratch;
 mod support;
 mod work;
@@ -17,21 +19,30 @@ mod work;
 pub use beam::{
     BeamEntrySummary, BeamEpisode, BeamLayer, BeamSearch, BeamSearchConfig, BeamStopReason,
 };
-pub use episode::{SearchAction, SearchCandidateSummary, SearchEpisode, SearchStep};
+pub use episode::{
+    SearchAction, SearchCandidateSummary, SearchEpisode, SearchHandleBatch, SearchStep,
+};
 pub use greedy::{GreedyEpisode, GreedySearch, GreedySearchConfig, GreedyStopReason};
 pub use gumbel::{
-    CategoricalPolicyEpisodeTask, GumbelCompetitiveTrace, GumbelEpisode, GumbelEpisodeContext,
-    GumbelEpisodeTask, GumbelHandleBatch, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext,
-    GumbelPlayer, GumbelRootResult, GumbelRootStats, GumbelRootTask, GumbelSearchContext,
-    GumbelStep, GumbelStopReason, SampledTreeEpisodeTask, SampledTreeRootTask,
-    considered_visit_sequence,
+    GumbelCompetitiveTrace, GumbelEpisode, GumbelEpisodeContext, GumbelEpisodeTask,
+    GumbelHandleBatch, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext, GumbelPlayer,
+    GumbelRootResult, GumbelRootStats, GumbelRootTask, GumbelSearchContext, GumbelStep,
+    GumbelStopReason, GumbelValueMode, SampledTreeEpisodeTask, SampledTreeRootTask,
+    SymmetricActorTrace, SymmetricEpisode, SymmetricRootAction, SymmetricRootResult,
+    SymmetricSelfplayEpisodeTask, SymmetricSelfplayRootTask, considered_visit_sequence,
 };
 pub use hash::{
-    beam_search_config_hash, categorical_policy_config_hash, greedy_search_config_hash,
-    gumbel_search_config_hash, puct_search_config_hash, random_search_config_hash,
+    beam_search_config_hash, greedy_search_config_hash, gumbel_search_config_hash,
+    policy_rollout_config_hash, puct_search_config_hash, random_search_config_hash,
     reducing_uniform_distill_config_hash, sampled_tree_search_config_hash,
+    symmetric_selfplay_search_config_hash,
 };
 pub use mcts::{MctsHandleBatch, MctsOpponentContext};
+pub use policy_rollout::{
+    PolicyRollout, PolicyRolloutConfig, PolicyRolloutContext, PolicyRolloutEpisode,
+    PolicyRolloutEpisodeTask, PolicyRolloutHandleBatch, PolicyRolloutRootStats, PolicyRolloutStep,
+    PolicyRolloutStopReason,
+};
 pub use puct::{
     PuctEpisode, PuctEpisodeContext, PuctEpisodeTask, PuctHandleBatch, PuctMcts, PuctMctsConfig,
     PuctOpponentContext, PuctRootResult, PuctRootStats, PuctRootTask, PuctSearchContext, PuctStep,

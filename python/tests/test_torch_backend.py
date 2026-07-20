@@ -26,6 +26,7 @@ from gz.proto import (
     FRAME_HELLO_ACK,
     Hello,
     PROTOCOL_VERSION,
+    ProtocolError,
     decode_error,
     read_frame,
     write_frame,
@@ -44,17 +45,31 @@ def test_torch_backend_serves_checkpoint_and_rejects_wrong_schema(tmp_path: Path
 
     client, thread, backend = start_torch_client(tmp_path, view, manifest.feature_schema_hash)
     try:
-        write_frame(client, FRAME_EVAL, struct.pack("<Q", 44), batch)
+        write_frame(
+            client,
+            FRAME_EVAL,
+            struct.pack("<Q", 44),
+            bytes(manifest.model_version),
+            batch,
+        )
         frame_type, payload = read_frame(client, bytearray())
         first = bytes(payload)
         assert frame_type == FRAME_EVAL_RESULT
         assert struct.unpack_from("<Q", payload, 0)[0] == 44
         assert bytes(payload[8:24]) == bytes(manifest.model_version)
-        assert output_shape(bytes(payload[24:])) == (view.row_count, view.max_actions)
-        assert output_is_finite(bytes(payload[24:]), view.action_count[: view.row_count])
+        assert struct.unpack_from("<Q", payload, 24)[0] == 1
+        assert bytes(payload[32:48]) == bytes(manifest.model_version)
+        assert output_shape(bytes(payload[48:])) == (view.row_count, view.max_actions)
+        assert output_is_finite(bytes(payload[48:]), view.action_count[: view.row_count])
         del payload
 
-        write_frame(client, FRAME_EVAL, struct.pack("<Q", 45), batch)
+        write_frame(
+            client,
+            FRAME_EVAL,
+            struct.pack("<Q", 45),
+            bytes(manifest.model_version),
+            batch,
+        )
         frame_type, payload = read_frame(client, bytearray())
         assert frame_type == FRAME_EVAL_RESULT
         assert bytes(payload[8:]) == first[8:]
@@ -88,14 +103,20 @@ def test_torch_backend_hot_swaps_to_new_checkpoint(tmp_path: Path) -> None:
         compile_model=False,
     )
     try:
-        first_payload = eval_once(client, 1, batch)
+        first_payload = eval_once(client, 1, batch, first.model_version)
         assert result_version(first_payload) == first.model_version
 
         second = publish_random_checkpoint(tmp_path, view, seed=12, value_input="pair")
-        second_payload = wait_for_version(client, batch, second.model_version, deadline=60.0)
+        second_payload = wait_for_version(
+            client,
+            batch,
+            first.model_version,
+            second.model_version,
+            deadline=60.0,
+        )
 
         assert result_version(second_payload) == second.model_version
-        assert second_payload[24:] != first_payload[24:]
+        assert second_payload[48:] != first_payload[48:]
     finally:
         backend.stop_polling()
         client.close()
@@ -114,13 +135,19 @@ def test_torch_backend_rejects_bad_swap_once_and_keeps_serving(tmp_path: Path, c
         compile_model=False,
     )
     try:
-        assert result_version(eval_once(client, 1, batch)) == first.model_version
+        assert (
+            result_version(eval_once(client, 1, batch, first.model_version))
+            == first.model_version
+        )
         bad_hash = FeatureSchemaHash.from_bytes(b"z" * 32)
         publish_random_checkpoint(tmp_path, view, seed=12, feature_schema_hash=bad_hash, schema_name="bad")
 
         for batch_id in range(2, 8):
             time.sleep(0.06)
-            assert result_version(eval_once(client, batch_id, batch)) == first.model_version
+            assert (
+                result_version(eval_once(client, batch_id, batch, first.model_version))
+                == first.model_version
+            )
 
         captured = capfd.readouterr().err
         assert captured.count("event=checkpoint_rejected") == 1
@@ -146,7 +173,10 @@ def test_torch_backend_ignores_broken_latest_and_keeps_serving(tmp_path: Path) -
         (tmp_path / "version_0" / "manifest.json").unlink()
         for batch_id in range(1, 5):
             time.sleep(0.06)
-            assert result_version(eval_once(client, batch_id, batch)) == first.model_version
+            assert (
+                result_version(eval_once(client, batch_id, batch, first.model_version))
+                == first.model_version
+            )
     finally:
         backend.stop_polling()
         client.close()
@@ -165,10 +195,16 @@ def test_torch_backend_poll_interval_zero_keeps_static_model(tmp_path: Path) -> 
         compile_model=False,
     )
     try:
-        assert result_version(eval_once(client, 1, batch)) == first.model_version
+        assert (
+            result_version(eval_once(client, 1, batch, first.model_version))
+            == first.model_version
+        )
         publish_random_checkpoint(tmp_path, view, seed=12)
         time.sleep(0.2)
-        assert result_version(eval_once(client, 2, batch)) == first.model_version
+        assert (
+            result_version(eval_once(client, 2, batch, first.model_version))
+            == first.model_version
+        )
     finally:
         backend.stop_polling()
         client.close()
@@ -197,6 +233,7 @@ def test_torch_backend_warms_three_times(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(backend, "_run_runner", counted)
 
     assert backend.handshake(make_hello(view, first.feature_schema_hash)) == first.model_version
+    first_generation, _ = backend.model_generation()
     assert calls == 3
     assert len(backend._stagers) == PIPELINE_DEPTH
     assert all(stager is not backend.stager for stager in backend._stagers)
@@ -208,6 +245,18 @@ def test_torch_backend_warms_three_times(tmp_path: Path, monkeypatch: pytest.Mon
     backend.apply_pending_swap()
     assert calls == 6
     assert backend._active.model_version == second.model_version
+    assert backend.stage(view, first.model_version).serving.model_version == first.model_version
+
+    third = publish_random_checkpoint(tmp_path, view, seed=13)
+    backend._poll_once()
+    assert backend._pending is None
+
+    backend.release_model_generation(first_generation, first.model_version)
+    with pytest.raises(ProtocolError, match="unavailable"):
+        backend.stage(view, first.model_version)
+    backend._poll_once()
+    assert backend._pending is not None
+    assert backend._pending.model_version == third.model_version
 
 
 def test_pair_backend_caches_stable_opponent_rows(
@@ -269,6 +318,76 @@ def test_pair_backend_caches_stable_opponent_rows(
     backend.eval(uncached)
     assert opponent_calls == 6
     assert observed_flags[-2:] == [True, True]
+
+
+def test_joint_board_backend_stages_raw_opponent_for_every_eval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    view = BatchView.parse(
+        batch_with_opponent_refs((FIXTURES / "batch_expander.gzfb").read_bytes())
+    )
+    manifest = publish_random_checkpoint(
+        tmp_path,
+        view,
+        state_input="joint-board",
+        value_input="single",
+    )
+    backend = TorchBackend(
+        DirectorySource(tmp_path),
+        device="cpu",
+        compile_model=False,
+        max_batch=view.batch_capacity,
+        poll_interval=0.0,
+        required_state_input="joint-board",
+        required_value_input="single",
+    )
+    backend.handshake(make_hello(view, manifest.feature_schema_hash))
+
+    original_copy = BatchStager.copy
+    observed_flags: list[bool] = []
+
+    def observed_copy(
+        stager: BatchStager,
+        batch: BatchView,
+        *,
+        copy_opponent: bool = True,
+    ):
+        observed_flags.append(copy_opponent)
+        return original_copy(stager, batch, copy_opponent=copy_opponent)
+
+    monkeypatch.setattr(BatchStager, "copy", observed_copy)
+    backend.eval(view)
+    backend.eval(view)
+
+    assert backend._active.raw_opponent
+    assert backend._active.opponent_runner is None
+    assert observed_flags == [True, True]
+
+
+def test_backend_rejects_checkpoint_with_incompatible_required_architecture(
+    tmp_path: Path,
+) -> None:
+    view = BatchView.parse(
+        batch_with_opponent_refs((FIXTURES / "batch_expander.gzfb").read_bytes())
+    )
+    publish_random_checkpoint(
+        tmp_path,
+        view,
+        state_input="single-graph",
+        value_input="single",
+    )
+
+    with pytest.raises(ValueError, match="state_input must be 'joint-board'"):
+        TorchBackend(
+            DirectorySource(tmp_path),
+            device="cpu",
+            compile_model=False,
+            max_batch=view.batch_capacity,
+            poll_interval=0.0,
+            required_state_input="joint-board",
+            required_value_input="single",
+        )
 
 
 def test_policy_only_pair_backend_matches_policy_logits_and_skips_value_path(
@@ -358,6 +477,7 @@ def publish_random_checkpoint(
     feature_schema_hash: FeatureSchemaHash | None = None,
     schema_name: str = "expander-test",
     value_activation: str = "logit",
+    state_input: str = "single-graph",
     value_input: str = "single",
     value_head: str = "scalar",
 ):
@@ -381,6 +501,7 @@ def publish_random_checkpoint(
         ffn_dim=32,
         dropout=0.0,
         value_activation=value_activation,
+        state_input=state_input,
         value_input=value_input,
         value_head=value_head,
     )
@@ -477,28 +598,50 @@ def output_is_finite(payload: bytes, action_counts: np.ndarray) -> bool:
     return bool(np.isfinite(values).all() and np.isfinite(logits).all())
 
 
-def eval_once(client: socket.socket, batch_id: int, batch: bytes) -> bytes:
-    write_frame(client, FRAME_EVAL, struct.pack("<Q", batch_id), batch)
+def eval_once(
+    client: socket.socket,
+    batch_id: int,
+    batch: bytes,
+    model_version: ModelVersion,
+) -> bytes:
+    write_frame(
+        client,
+        FRAME_EVAL,
+        struct.pack("<Q", batch_id),
+        bytes(model_version),
+        batch,
+    )
     frame_type, payload = read_frame(client, bytearray())
     assert frame_type == FRAME_EVAL_RESULT
     return bytes(payload)
 
 
-def wait_for_version(client: socket.socket, batch: bytes, version: ModelVersion, *, deadline: float = 5.0) -> bytes:
+def wait_for_version(
+    client: socket.socket,
+    batch: bytes,
+    current_version: ModelVersion,
+    version: ModelVersion,
+    *,
+    deadline: float = 5.0,
+) -> bytes:
     deadline = time.monotonic() + deadline
     batch_id = 100
     last = b""
     while time.monotonic() < deadline:
         time.sleep(0.06)
-        last = eval_once(client, batch_id, batch)
-        if result_version(last) == version:
-            return last
+        last = eval_once(client, batch_id, batch, current_version)
+        if active_version(last) == version:
+            return eval_once(client, batch_id + 1, batch, version)
         batch_id += 1
     raise AssertionError(f"timed out waiting for model version {version}")
 
 
 def result_version(payload: bytes) -> ModelVersion:
     return ModelVersion.from_bytes(payload[8:24])
+
+
+def active_version(payload: bytes) -> ModelVersion:
+    return ModelVersion.from_bytes(payload[32:48])
 
 
 def batch_with_opponent_refs(batch: bytes) -> bytes:

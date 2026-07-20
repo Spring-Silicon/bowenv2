@@ -1,17 +1,14 @@
-use super::schedule::{GumbelRng, budget_fraction, root_seed, sample_root_gumbels};
-use super::{
-    GumbelEpisode, GumbelEpisodeContext, GumbelHandleBatch, GumbelMcts, GumbelMctsConfig,
-    GumbelRootStats, GumbelStep, GumbelStopReason,
-};
-use crate::support::{internal, step_ref};
+use crate::sampling::{SearchRng, root_seed, sample_unit_gumbels};
+use crate::support::{budget_fraction, internal, step_ref};
 use crate::work::{
     ApplyWork, EngineIdentity, EvalWork, ExpandResult, ExpandWork, MeasureWork, SearchPoll,
     SearchWork, SearchWorkResult, WorkToken,
 };
-use crate::{SearchAction, SearchCandidateSummary};
+use crate::{SearchAction, SearchCandidateSummary, SearchHandleBatch};
 use gz_engine::{
-    ApplyResult, EngineResult, PortableCandidateRef, PortableSearchActionRef, ReplayGraphContext,
-    SearchConfigHash,
+    ApplyResult, CandidateOptions, EngineResult, MeasureOptions, MeasureResult, ModelVersion,
+    PortableCandidateRef, PortableSearchActionRef, ReplayGraphContext, SearchConfigHash,
+    SearchStepRef,
 };
 use gz_eval::{
     EvalAction, EvalOutput, EvalPositionContext, EvalRequest, eval_error_to_engine_error,
@@ -19,53 +16,143 @@ use gz_eval::{
 use std::collections::HashSet;
 use std::hash::Hash;
 
-/// Direct categorical policy rollout used by sampled-trajectory opponents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct PolicyRolloutConfig {
+    pub max_steps: usize,
+    pub seed: u64,
+    pub export_position: bool,
+    pub mask_stop: bool,
+    pub no_backtrack: bool,
+    pub candidate_options: CandidateOptions,
+    pub measure_options: MeasureOptions,
+}
+
+pub struct PolicyRollout {
+    config: PolicyRolloutConfig,
+    search_config_hash: SearchConfigHash,
+}
+
+impl PolicyRollout {
+    #[must_use]
+    pub fn new(config: PolicyRolloutConfig) -> Self {
+        let search_config_hash = crate::policy_rollout_config_hash(
+            config.max_steps,
+            config.seed,
+            config.mask_stop,
+            config.no_backtrack,
+            config.candidate_options,
+            config.measure_options,
+        );
+        Self {
+            config,
+            search_config_hash,
+        }
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> PolicyRolloutConfig {
+        self.config
+    }
+
+    #[must_use]
+    pub const fn search_config_hash(&self) -> SearchConfigHash {
+        self.search_config_hash
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PolicyRolloutContext {
+    pub noise_seed: u64,
+}
+
+pub type PolicyRolloutHandleBatch<G, C> = SearchHandleBatch<G, C>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyRolloutRootStats {
+    pub expanded_nodes: usize,
+    pub eval_count: usize,
+    pub portable_contexts: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyRolloutStep<G, C> {
+    pub before: G,
+    pub after: G,
+    pub action: SearchAction<C>,
+    pub step_ref: SearchStepRef,
+    pub selected_action: PortableSearchActionRef,
+    pub selected_candidate: Option<SearchCandidateSummary>,
+    pub engine_candidate_count: usize,
+    pub action_count: usize,
+    pub selected_rank: usize,
+    pub legal_actions: Vec<PortableSearchActionRef>,
+    pub policy_target: Vec<f32>,
+    pub considered_action_indices: Vec<usize>,
+    pub root_value: f32,
+    pub model_version: ModelVersion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyRolloutStopReason {
+    MaxSteps,
+    SelectedStop,
+}
+
+#[derive(Clone, Debug)]
+pub struct PolicyRolloutEpisode<G, C> {
+    pub root: G,
+    pub final_graph: G,
+    pub root_context: ReplayGraphContext,
+    pub final_context: ReplayGraphContext,
+    pub steps: Vec<PolicyRolloutStep<G, C>>,
+    pub root_stats: Vec<PolicyRolloutRootStats>,
+    pub created_graphs: Vec<G>,
+    pub created_candidates: Vec<C>,
+    pub final_measure: MeasureResult<G>,
+    pub stop_reason: PolicyRolloutStopReason,
+    pub search_config_hash: SearchConfigHash,
+}
+
+/// Direct categorical policy rollout used by sampled trajectories.
 /// It evaluates each played root once, ranks actions by logit + unit Gumbel,
 /// and tries that fixed ranking until an action passes apply/history masks.
-pub struct CategoricalPolicyEpisodeTask<G, C> {
-    config: GumbelMctsConfig,
+pub struct PolicyRolloutEpisodeTask<G, C> {
+    config: PolicyRolloutConfig,
     search_config_hash: SearchConfigHash,
     identity: EngineIdentity,
     root: G,
-    context: GumbelEpisodeContext,
+    context: PolicyRolloutContext,
     current: G,
     current_context: Option<ReplayGraphContext>,
     root_context: Option<ReplayGraphContext>,
     visited: HashSet<ReplayGraphContext>,
-    steps: Vec<GumbelStep<G, C>>,
-    root_stats: Vec<GumbelRootStats>,
+    steps: Vec<PolicyRolloutStep<G, C>>,
+    root_stats: Vec<PolicyRolloutRootStats>,
     created_graphs: Vec<G>,
     created_candidates: Vec<C>,
-    releasable: GumbelHandleBatch<G, C>,
+    releasable: PolicyRolloutHandleBatch<G, C>,
     step_index: usize,
     next_token: u64,
     pending: Option<Pending<G, C>>,
     state: State<G, C>,
 }
 
-impl<G, C> CategoricalPolicyEpisodeTask<G, C>
+impl<G, C> PolicyRolloutEpisodeTask<G, C>
 where
     G: Copy + Eq + Hash,
     C: Copy + Eq + Hash,
 {
     #[must_use]
     pub fn new(
-        search: &GumbelMcts,
+        search: &PolicyRollout,
         identity: EngineIdentity,
         root: G,
-        context: GumbelEpisodeContext,
+        context: PolicyRolloutContext,
     ) -> Self {
         let config = search.config();
         Self {
             config,
-            search_config_hash: crate::categorical_policy_config_hash(
-                config.max_steps,
-                config.seed,
-                config.mask_stop,
-                config.no_backtrack,
-                config.candidate_options,
-                config.measure_options,
-            ),
+            search_config_hash: search.search_config_hash(),
             identity,
             root,
             context,
@@ -77,7 +164,7 @@ where
             root_stats: Vec::new(),
             created_graphs: Vec::new(),
             created_candidates: Vec::new(),
-            releasable: GumbelHandleBatch::default(),
+            releasable: PolicyRolloutHandleBatch::default(),
             step_index: 0,
             next_token: 0,
             pending: None,
@@ -85,7 +172,7 @@ where
         }
     }
 
-    pub fn poll(&mut self) -> EngineResult<SearchPoll<G, C, GumbelEpisode<G, C>>> {
+    pub fn poll(&mut self) -> EngineResult<SearchPoll<G, C, PolicyRolloutEpisode<G, C>>> {
         if self.pending.is_some() {
             return Ok(SearchPoll::Blocked);
         }
@@ -95,7 +182,7 @@ where
             match state {
                 State::Start => {
                     self.state = if self.config.max_steps == 0 {
-                        State::Measure(GumbelStopReason::MaxSteps)
+                        State::Measure(PolicyRolloutStopReason::MaxSteps)
                     } else {
                         State::Expand
                     };
@@ -115,7 +202,7 @@ where
                         root.eval_actions.clone(),
                         self.position(),
                     )
-                    .map_err(|_| internal("invalid categorical eval request"))?;
+                    .map_err(|_| internal("invalid policy rollout eval request"))?;
                     let token = self.next_token();
                     let work = EvalWork {
                         token,
@@ -204,7 +291,7 @@ where
                     .current_context
                     .unwrap_or_else(|| self.identity.context(measure.graph_hash));
                 let root_context = self.root_context.unwrap_or(final_context);
-                self.state = State::DoneResult(Box::new(GumbelEpisode {
+                self.state = State::DoneResult(Box::new(PolicyRolloutEpisode {
                     root: self.root,
                     final_graph: self.current,
                     root_context,
@@ -216,7 +303,6 @@ where
                     final_measure: measure,
                     stop_reason,
                     search_config_hash: self.search_config_hash,
-                    competitive: None,
                 }));
                 Ok(())
             }
@@ -232,7 +318,7 @@ where
         self.step_index
     }
 
-    pub fn take_releasable(&mut self) -> GumbelHandleBatch<G, C> {
+    pub fn take_releasable(&mut self) -> PolicyRolloutHandleBatch<G, C> {
         std::mem::take(&mut self.releasable)
     }
 
@@ -240,7 +326,7 @@ where
         self.created_graphs.push(self.root);
     }
 
-    pub fn take_all_handles(&mut self) -> GumbelHandleBatch<G, C> {
+    pub fn take_all_handles(&mut self) -> PolicyRolloutHandleBatch<G, C> {
         let mut handles = self.take_releasable();
         handles.graphs.append(&mut self.created_graphs);
         handles.candidates.append(&mut self.created_candidates);
@@ -304,11 +390,11 @@ where
         output
             .validate_for(&request)
             .map_err(eval_error_to_engine_error)?;
-        let mut rng = GumbelRng::new(root_seed(
+        let mut rng = SearchRng::new(root_seed(
             self.config.seed ^ self.context.noise_seed,
             self.step_index as u32,
         ));
-        let gumbels = sample_root_gumbels(output.policy_logits.len(), 1.0, &mut rng);
+        let gumbels = sample_unit_gumbels(output.policy_logits.len(), &mut rng);
         let stop = root.candidates.len();
         let mut ranking = (0..output.policy_logits.len()).collect::<Vec<_>>();
         ranking.sort_by(|&left, &right| {
@@ -361,7 +447,7 @@ where
         let before = self.current;
         let before_context = self
             .current_context
-            .ok_or_else(|| internal("missing categorical root context"))?;
+            .ok_or_else(|| internal("missing policy rollout root context"))?;
         let entry = choice.root.candidates[action];
         self.push_step(
             before,
@@ -381,7 +467,7 @@ where
         self.current_context = Some(after_context);
         self.step_index += 1;
         self.state = if self.step_index >= self.config.max_steps {
-            State::Measure(GumbelStopReason::MaxSteps)
+            State::Measure(PolicyRolloutStopReason::MaxSteps)
         } else {
             State::Expand
         };
@@ -391,7 +477,7 @@ where
     fn select_stop(&mut self, root: RootData<C>, output: EvalOutput) -> EngineResult<()> {
         let context = self
             .current_context
-            .ok_or_else(|| internal("missing categorical root context"))?;
+            .ok_or_else(|| internal("missing policy rollout root context"))?;
         let stop = root.candidates.len();
         let choice = Choice {
             root,
@@ -411,7 +497,7 @@ where
             &choice,
         )?;
         self.step_index += 1;
-        self.state = State::Measure(GumbelStopReason::SelectedStop);
+        self.state = State::Measure(PolicyRolloutStopReason::SelectedStop);
         Ok(())
     }
 
@@ -438,7 +524,7 @@ where
         legal_actions.push(PortableSearchActionRef::stop(before_context));
         let mut policy_target = vec![0.0; action_count];
         policy_target[selected] = 1.0;
-        self.steps.push(GumbelStep {
+        self.steps.push(PolicyRolloutStep {
             before,
             after,
             action,
@@ -452,17 +538,12 @@ where
             policy_target,
             considered_action_indices: vec![selected],
             root_value: choice.output.value,
-            root_search_value: choice.output.value,
-            root_q_max: choice.output.value,
             model_version: choice.output.model_version,
         });
-        self.root_stats.push(GumbelRootStats {
-            simulations: 0,
+        self.root_stats.push(PolicyRolloutRootStats {
             expanded_nodes: 1,
             eval_count: 1,
             portable_contexts: 1,
-            carried_nodes: 0,
-            carried_root_visits: 0,
         });
         Ok(())
     }
@@ -518,8 +599,8 @@ enum State<G, C> {
     Expand,
     Eval(RootData<C>),
     Choose(Box<Choice<C>>),
-    Measure(GumbelStopReason),
-    DoneResult(Box<GumbelEpisode<G, C>>),
+    Measure(PolicyRolloutStopReason),
+    DoneResult(Box<PolicyRolloutEpisode<G, C>>),
     Done,
 }
 
@@ -539,7 +620,7 @@ enum Pending<G, C> {
     },
     Measure {
         token: WorkToken,
-        stop_reason: GumbelStopReason,
+        stop_reason: PolicyRolloutStopReason,
     },
     #[allow(dead_code)]
     Marker(std::marker::PhantomData<G>),

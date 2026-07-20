@@ -14,6 +14,8 @@ class TrainingBatch(NamedTuple):
     policy: object
     value: object
     value_valid: object
+    horizon_value: object
+    horizon_value_valid: object
     reward: object
     row_count: int
 
@@ -31,11 +33,19 @@ class TrainingStager:
     close, with the event standing in for its bounded pipeline.
     """
 
-    def __init__(self, schema: FeatureSchemaConfig, capacity: int, device: str | object, pinned_staging: bool = True) -> None:
+    def __init__(
+        self,
+        schema: FeatureSchemaConfig,
+        capacity: int,
+        device: str | object,
+        pinned_staging: bool = True,
+        validate_terminal_score: bool = False,
+    ) -> None:
         torch = _torch()
         self.schema = schema
         self.capacity = capacity
         self.device = torch.device(device)
+        self.validate_terminal_score = validate_terminal_score
         self._sets = [
             _StagerSet(schema, capacity, self.device, pinned_staging) for _ in range(2)
         ]
@@ -48,6 +58,8 @@ class TrainingStager:
             raise ValueError("row count mismatch")
         if batch.max_actions != targets.max_actions:
             raise ValueError("max action mismatch")
+        if self.validate_terminal_score:
+            _validate_terminal_scores(targets, self.schema.max_nodes)
         staging = self._sets[self._index]
         self._index = 1 - self._index
         return staging.copy(batch, targets)
@@ -61,6 +73,10 @@ class _StagerSet:
         self.policy = _StagedTensor((capacity, schema.max_actions), torch.float32, device, pin)
         self.value = _StagedTensor((capacity,), torch.float32, device, pin)
         self.value_valid = _StagedTensor((capacity,), torch.float32, device, pin)
+        self.horizon_value = _StagedTensor((capacity, 2), torch.float32, device, pin)
+        self.horizon_value_valid = _StagedTensor(
+            (capacity,), torch.float32, device, pin
+        )
         self.reward = _StagedTensor((capacity,), torch.float32, device, pin)
         self.event = torch.cuda.Event() if device.type == "cuda" else None
         self._recorded = False
@@ -73,6 +89,10 @@ class _StagerSet:
         self.policy.copy(targets.policy)
         self.value.copy(targets.value)
         self.value_valid.copy(targets.value_valid.astype(np.float32, copy=False))
+        self.horizon_value.copy(targets.horizon_value)
+        self.horizon_value_valid.copy(
+            targets.horizon_value_valid.astype(np.float32, copy=False)
+        )
         self.reward.copy(targets.reward)
         features = self.features.copy(batch)
         if self.event is not None:
@@ -83,6 +103,8 @@ class _StagerSet:
             policy=self.policy.device_tensor,
             value=self.value.device_tensor,
             value_valid=self.value_valid.device_tensor,
+            horizon_value=self.horizon_value.device_tensor,
+            horizon_value_valid=self.horizon_value_valid.device_tensor,
             reward=self.reward.device_tensor,
             row_count=targets.row_count,
         )
@@ -103,6 +125,17 @@ class _StagedTensor:
     def copy(self, array: np.ndarray) -> None:
         np.copyto(self.cpu.numpy(), array, casting="unsafe")
         self.device_tensor.copy_(self.cpu, non_blocking=self.non_blocking)
+
+
+def _validate_terminal_scores(targets: TargetsView, max_nodes: int) -> None:
+    valid = targets.horizon_value_valid[: targets.row_count] > 0
+    terminal_nodes = -targets.reward[: targets.row_count][valid]
+    if not np.isfinite(terminal_nodes).all():
+        raise ValueError("terminal score targets must be finite")
+    if not np.equal(terminal_nodes, np.rint(terminal_nodes)).all():
+        raise ValueError("terminal score targets must be integral node counts")
+    if ((terminal_nodes < 0.0) | (terminal_nodes > float(max_nodes))).any():
+        raise ValueError("terminal score targets exceed feature schema bounds")
 
 
 def _torch():

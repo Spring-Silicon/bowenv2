@@ -10,7 +10,7 @@ the Python side.
 ## Constants
 
 ```text
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 ENCODING_VERSION = 1
 MAX_FRAME = 256 MiB
 ```
@@ -52,14 +52,18 @@ malformed frames are fatal; no resync.
 2 HELLO_ACK   server -> client:
               protocol_version u32
               model_version 16B
+              model_generation u64
 
 3 EVAL        client -> server:
               batch_id u64
+              requested_model_version 16B
               GZFB bytes
 
 4 EVAL_RESULT server -> client:
               batch_id u64
-              model_version 16B
+              served_model_version 16B
+              active_model_generation u64
+              active_model_version 16B
               GZFO bytes
 
 5 PING        client -> server:
@@ -72,6 +76,10 @@ malformed frames are fatal; no resync.
               code u32
               msg_len u16
               utf8 message, bounded to 512 bytes
+
+8 MODEL_RELEASE client -> server, no success response:
+              model_generation u64
+              model_version 16B
 ```
 
 The server closes after sending ERROR.
@@ -113,6 +121,7 @@ stub accepts any engine tags.
 EVAL validation:
 
 ```text
+requested_model_version must identify a resident model slot.
 GZFB magic and encoding_version must match.
 GZFB feature_schema_hash must equal the adopted schema hash.
 GZFB batch_capacity must equal the adopted capacity.
@@ -120,8 +129,17 @@ GZFB row_count must be <= batch_capacity.
 GZFB section dimensions and total byte length must be valid.
 ```
 
-Responses arrive in request order. A client with one in-flight EVAL must see
-the same `batch_id` in EVAL_RESULT that it sent in EVAL.
+Responses arrive in request order. `served_model_version` must equal the
+request's `requested_model_version`; the active fields advertise the generation
+that new episodes should lease. A generation identifier is nonzero and scoped
+to one evaluator connection.
+
+The evaluator retains the previous model after activating a replacement. The
+client may continue targeting that previous version until it sends
+MODEL_RELEASE after its final episode lease and in-flight request are gone.
+MODEL_RELEASE for the active or an unknown generation is a protocol error. The
+serving implementation bounds residency to the active and one retained
+generation; it does not load a third until the retained generation is released.
 
 ## Stub Model
 

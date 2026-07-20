@@ -34,13 +34,21 @@ gz/proto/hello.py
 gz/trainer/__init__.py
 gz/trainer/__main__.py
 gz/trainer/data.py
+gz/trainer/diagnostics.py
+gz/trainer/distill.py
 gz/trainer/driver.py
+gz/trainer/episode_schedule.py
+gz/trainer/episode_stages.py
 gz/trainer/loop.py
+gz/trainer/optim.py
 gz/trainer/publish.py
 gz/trainer/sampler.py
+tests/test_ablation_queue.py
 tests/test_checkpoints.py
 tests/test_codec.py
 tests/test_common.py
+tests/test_distill.py
+tests/test_driver_stats.py
 tests/test_fixtures.py
 tests/test_layering.py
 tests/test_model_torch.py
@@ -52,4 +60,5 @@ tests/test_targets.py
 tests/test_torch_backend.py
 tests/test_trainer_driver.py
 tests/test_trainer_loop.py
+tests/test_trainer_optim.py
 tests/test_trainer_publish.py

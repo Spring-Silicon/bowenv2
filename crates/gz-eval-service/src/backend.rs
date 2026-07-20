@@ -3,8 +3,26 @@ use gz_engine::ModelVersion;
 use gz_features::{FeatureBatchView, RowOutput};
 use std::num::NonZeroUsize;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ModelGeneration {
+    /// Nonzero evaluator-connection-local generation identifier.
+    pub id: u64,
+    /// Immutable identity of the model weights in this generation.
+    pub version: ModelVersion,
+}
+
+impl ModelGeneration {
+    #[must_use]
+    pub const fn initial(version: ModelVersion) -> Self {
+        Self { id: 1, version }
+    }
+}
+
 pub trait FeatureEvalBackend {
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs>;
+
+    /// Generation that a newly admitted episode should lease.
+    fn model_generation(&self) -> ModelGeneration;
 
     /// Fixed batch capacity negotiated with a remote backend. In-process
     /// backends return None and use the orchestrator's configured capacity.
@@ -21,12 +39,34 @@ pub trait FeatureEvalBackend {
 
     /// Submits a batch without waiting for its outputs; pair with
     /// `receive`. Backends that cannot overlap compute simply evaluate
-    /// here (the default), so callers may pipeline unconditionally:
-    /// submit the next batch, then receive the previous one. At most one
-    /// batch may be pending per backend, and submit/receive alternate
-    /// FIFO.
+    /// here (the default), so callers may pipeline unconditionally.
+    /// Submitted batches must be received in FIFO order.
     fn submit(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<PendingBatch> {
         Ok(PendingBatch::Ready(self.eval(batch_bytes, action_counts)?))
+    }
+
+    /// Submits against an exact leased generation. A backend must fail rather
+    /// than silently serve another version when the generation is unavailable.
+    fn submit_for_model(
+        &mut self,
+        model: ModelGeneration,
+        batch_bytes: &[u8],
+        action_counts: &[u32],
+    ) -> ServiceResult<PendingBatch> {
+        let outputs = self.eval(batch_bytes, action_counts)?;
+        if outputs.model_version != model.version {
+            return Err(ServiceError::backend(
+                1,
+                "evaluator served the wrong model version",
+            ));
+        }
+        Ok(PendingBatch::Ready(outputs))
+    }
+
+    /// Releases a non-active generation after its final episode and in-flight
+    /// request are gone. Static backends need no release work.
+    fn release_model_generation(&mut self, _model: ModelGeneration) -> ServiceResult<()> {
+        Ok(())
     }
 
     fn receive(&mut self, pending: PendingBatch) -> ServiceResult<BackendOutputs> {
@@ -48,12 +88,14 @@ pub enum PendingBatch {
     InFlight {
         batch_id: u64,
         action_counts: Vec<u32>,
+        model: ModelGeneration,
     },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendOutputs {
     pub model_version: ModelVersion,
+    pub active_generation: ModelGeneration,
     pub rows: Vec<RowOutput>,
 }
 
@@ -61,12 +103,17 @@ pub struct BackendOutputs {
 pub struct StubBackend;
 
 impl FeatureEvalBackend for StubBackend {
+    fn model_generation(&self) -> ModelGeneration {
+        ModelGeneration::initial(STUB_MODEL_VERSION)
+    }
+
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
         let view = FeatureBatchView::parse(batch_bytes)
             .map_err(|error| ServiceError::protocol(error.to_string()))?;
         validate_action_counts(&view, action_counts)?;
         Ok(BackendOutputs {
             model_version: STUB_MODEL_VERSION,
+            active_generation: self.model_generation(),
             rows: stub_row_outputs(&view),
         })
     }

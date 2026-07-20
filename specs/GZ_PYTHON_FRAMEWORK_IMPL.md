@@ -97,7 +97,8 @@ validates schema hash against its checkpoint instead of adopting
 the ERROR codes (1 protocol, 2 encoding, 3 schema, 4 capacity,
 5 malformed)
 the stub model formulas and the stub ModelVersion constant, verbatim
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 1 for this original work order; GZ_EVAL_PROTOCOL.md v2
+supersedes it with episode model leases and MODEL_RELEASE
 ```
 
 GZ_EVAL_SERVICE.md keeps its Rust-crate and orchestrator sections and gains

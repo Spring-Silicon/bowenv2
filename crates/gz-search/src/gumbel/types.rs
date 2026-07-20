@@ -8,6 +8,14 @@ use std::num::NonZeroUsize;
 pub type GumbelHandleBatch<G, C> = crate::mcts::types::MctsHandleBatch<G, C>;
 pub type GumbelOpponentContext = crate::mcts::types::MctsOpponentContext;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GumbelValueMode {
+    #[default]
+    Competitive,
+    SingleVanilla,
+    SymmetricSelfplay,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GumbelMctsConfig {
     pub max_steps: usize,
@@ -28,7 +36,8 @@ pub struct GumbelMctsConfig {
     /// Shift the selected child subtree into the next root. This carries
     /// cached graph/candidate/eval bodies and the subtree's visit/Q ledgers;
     /// the next root still receives a fresh simulation budget, counted
-    /// relative to the carried visit baseline.
+    /// relative to the carried visit baseline. Symmetric selfplay follows the
+    /// same carry-all root-statistics contract.
     pub tree_reuse: bool,
     /// Export real position features (root_step, leaf_depth, budget) to
     /// evals and feature rows. Off zeroes the exported values so the
@@ -48,6 +57,10 @@ pub struct GumbelMctsConfig {
     /// Within-simulation cycles are already handled by the descent seen
     /// set. Part of the search config hash.
     pub no_backtrack: bool,
+    /// Controls how completed Q values are interpreted by Gumbel search.
+    /// Single Vanilla normalizes them with fresh per-root running bounds and
+    /// treats the search horizon as a value-predicted terminal boundary.
+    pub value_mode: GumbelValueMode,
     pub candidate_options: CandidateOptions,
     pub measure_options: MeasureOptions,
 }
@@ -148,6 +161,14 @@ impl GumbelPlayer {
         match self {
             Self::One => Self::Two,
             Self::Two => Self::One,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::One => 0,
+            Self::Two => 1,
         }
     }
 }

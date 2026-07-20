@@ -13,6 +13,7 @@ const TARGET_HEADER_LEN: usize = 20;
 pub struct RowTargets {
     pub policy: Vec<f32>,
     pub value: Option<f32>,
+    pub horizon_value: Option<[f32; 2]>,
     pub reward: f32,
 }
 
@@ -24,6 +25,8 @@ pub struct TrainingTargetsView {
     pub policy: Vec<f32>,
     pub value: Vec<f32>,
     pub value_valid: Vec<u8>,
+    pub horizon_value: Vec<f32>,
+    pub horizon_value_valid: Vec<u8>,
     pub reward: Vec<f32>,
 }
 
@@ -42,6 +45,10 @@ impl TrainingTargetsView {
             policy: read_f32_vec(bytes, layout.policy, layout.b * layout.a)?,
             value: read_f32_vec(bytes, layout.value, layout.b)?,
             value_valid: bytes[layout.value_valid..layout.value_valid + layout.b].to_vec(),
+            horizon_value: read_f32_vec(bytes, layout.horizon_value, layout.b * 2)?,
+            horizon_value_valid: bytes
+                [layout.horizon_value_valid..layout.horizon_value_valid + layout.b]
+                .to_vec(),
             reward: read_f32_vec(bytes, layout.reward, layout.b)?,
         })
     }
@@ -366,9 +373,18 @@ pub fn encode_training_targets(
             return Err(FeatureError::InvalidEncoding("non-finite policy target"));
         }
         if let Some(value) = target.value
-            && (!value.is_finite() || !(-1.0..=1.0).contains(&value))
+            && !value.is_finite()
         {
             return Err(FeatureError::InvalidEncoding("invalid value target"));
+        }
+        if let Some(values) = target.horizon_value
+            && values
+                .iter()
+                .any(|value| !value.is_finite() || !(-1.0..=1.0).contains(value))
+        {
+            return Err(FeatureError::InvalidEncoding(
+                "invalid horizon value target",
+            ));
         }
         if !target.reward.is_finite() {
             return Err(FeatureError::InvalidEncoding("non-finite reward target"));
@@ -395,6 +411,16 @@ pub fn encode_training_targets(
         if let Some(value) = target.value {
             write_f32_at(out, layout.value + row_index * 4, value);
             out[layout.value_valid + row_index] = 1;
+        }
+        if let Some(values) = target.horizon_value {
+            for (head, value) in values.into_iter().enumerate() {
+                write_f32_at(
+                    out,
+                    layout.horizon_value + (row_index * 2 + head) * 4,
+                    value,
+                );
+            }
+            out[layout.horizon_value_valid + row_index] = 1;
         }
         write_f32_at(out, layout.reward + row_index * 4, target.reward);
     }
@@ -448,6 +474,8 @@ struct TargetLayout {
     policy: usize,
     value: usize,
     value_valid: usize,
+    horizon_value: usize,
+    horizon_value_valid: usize,
     reward: usize,
     total_len: usize,
 }
@@ -461,10 +489,16 @@ impl TargetLayout {
         let value_len = capacity
             .checked_mul(4)
             .ok_or(FeatureError::InvalidEncoding("target length overflow"))?;
+        let horizon_value_len = capacity
+            .checked_mul(2)
+            .and_then(|count| count.checked_mul(4))
+            .ok_or(FeatureError::InvalidEncoding("target length overflow"))?;
         let mut cursor = TARGET_HEADER_LEN;
         let policy = section(&mut cursor, policy_len);
         let value = section(&mut cursor, value_len);
         let value_valid = section(&mut cursor, capacity);
+        let horizon_value = section(&mut cursor, horizon_value_len);
+        let horizon_value_valid = section(&mut cursor, capacity);
         let reward = section(&mut cursor, value_len);
         let total_len = align4(cursor);
         Ok(Self {
@@ -473,6 +507,8 @@ impl TargetLayout {
             policy,
             value,
             value_valid,
+            horizon_value,
+            horizon_value_valid,
             reward,
             total_len,
         })

@@ -4,9 +4,9 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Row/targets encoding version: rows persist in replay stores, so this
-/// only moves with a store schema bump. v4 = v3 plus optional opponent
-/// graph-state sections for paired value inputs.
-pub const ENCODING_VERSION: u32 = 4;
+/// only moves with a store schema bump. v5 adds V8/V32 horizon targets to
+/// the training-target encoding; the feature-row body is unchanged.
+pub const ENCODING_VERSION: u32 = 5;
 /// Eval-wire batch/output encoding version. v5 = v4 plus transient opponent
 /// trajectory identity and row sections used by serving-side readout caches.
 pub const BATCH_ENCODING_VERSION: u32 = 5;

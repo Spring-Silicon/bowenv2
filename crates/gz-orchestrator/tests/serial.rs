@@ -18,6 +18,7 @@ fn search(engine: &WhittleEngine, tree_reuse: bool) -> GumbelMcts {
         tree_reuse,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: gz_search::GumbelValueMode::Competitive,
         candidate_options: gz_engine::CandidateOptions::default(),
         export_position: true,
         measure_options: engine.measure_options(),

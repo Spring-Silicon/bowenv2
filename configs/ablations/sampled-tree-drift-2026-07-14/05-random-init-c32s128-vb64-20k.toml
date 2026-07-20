@@ -1,0 +1,24 @@
+extends = "../../bases/whittle-generated-exphormer-v2-sampled-tree.toml"
+
+[arch]
+value_head = "scalar"
+
+[trainer]
+total_steps = 20000
+value_batch = 64
+resume = false
+init_checkpoint = ""
+init_checkpoint_scope = "all"
+
+[selfplay]
+workers_per_lane = 12
+simulations = 128
+max_considered = 32
+value_reward = "sign"
+
+[wandb]
+run_name = "whittle-generated-exphormer-v2-sampled-tree-2-c32s128-sign-random-init-vb64-20k-1"
+
+[paths]
+run_dir = "runs/gz-c32s128-rinit-s42-vb64-20k-1"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/gz-c32s128-rinit-s42-vb64-20k-1"

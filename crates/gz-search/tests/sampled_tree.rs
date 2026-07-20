@@ -6,8 +6,8 @@ use gz_engine::{CandidateOptions, GraphEngine, ModelVersion};
 use gz_eval::EvalOutput;
 use gz_search::{
     EngineIdentity, EvalModel, ExpandResult, ExpandedCandidate, GumbelEpisode,
-    GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelPlayer, SampledTreeEpisodeTask,
-    SampledTreeRootTask, SearchPoll, SearchWork, SearchWorkResult,
+    GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelPlayer, GumbelValueMode,
+    SampledTreeEpisodeTask, SampledTreeRootTask, SearchPoll, SearchWork, SearchWorkResult,
 };
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -27,6 +27,7 @@ fn config(max_steps: usize, simulations: usize) -> GumbelMctsConfig {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: GumbelValueMode::Competitive,
         candidate_options: CandidateOptions::default(),
         measure_options: measure_options(),
     }

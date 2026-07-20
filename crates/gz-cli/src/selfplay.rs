@@ -21,7 +21,8 @@ use gz_orchestrator::{
 use gz_replay::{ReplayCounters, ReplayDataMode, ReplayEpisodeId, ReplayRootInfo, ReplayStore};
 use gz_search::{
     BeamSearch, BeamSearchConfig, GreedySearch, GreedySearchConfig, GumbelEpisodeContext,
-    GumbelMcts, GumbelMctsConfig, RandomSearch, RandomSearchConfig,
+    GumbelMcts, GumbelMctsConfig, GumbelValueMode, PolicyRolloutConfig, RandomSearch,
+    RandomSearchConfig,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ pub struct SelfplayConfig {
     pub episodes: u64,
     pub lanes: usize,
     pub workers_per_lane: usize,
+    pub training_mode: TrainingMode,
     pub reference: ReferenceMode,
     pub root_mode: RootMode,
     pub reference_ema_decay: f32,
@@ -120,6 +122,8 @@ pub struct SelfplayConfig {
     pub admission_stagger_ms: u64,
     /// Pace learner-root admissions at measured evaluator capacity.
     pub admission_smoothing: bool,
+    /// Evaluate independent symmetric MCTS root branches concurrently.
+    pub wave_batching: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +167,7 @@ impl Default for SelfplayConfig {
             episodes: 16,
             lanes: 2,
             workers_per_lane: 8,
+            training_mode: TrainingMode::Competitive,
             reference: ReferenceMode::Root,
             root_mode: RootMode::Generated,
             reference_ema_decay: 0.99,
@@ -205,6 +210,7 @@ impl Default for SelfplayConfig {
             eval_processes: 1,
             admission_stagger_ms: 0,
             admission_smoothing: false,
+            wave_batching: false,
         }
     }
 }
@@ -270,6 +276,83 @@ impl SelfplayConfig {
             || self.reference_gamma >= 1.0
         {
             return Err("--reference-gamma must be in [0, 1)".to_owned());
+        }
+        if self.training_mode == TrainingMode::SingleVanilla {
+            if self.reference != ReferenceMode::None
+                || self.reference_ema_decay != 0.0
+                || self.reference_gamma != 0.0
+                || self.reference_trajectory_pool != 0
+                || self.reference_arena_size != 0
+                || self.reference_checkpoint_pointer.is_some()
+                || self.reference_challenger_checkpoint_pointer.is_some()
+                || self.policy_opponent_mode.is_some()
+                || self.reference_mask_stop.is_some()
+                || self.reference_max_batch.is_some()
+                || self.challenger_max_batch.is_some()
+            {
+                return Err(
+                    "--training-mode single-vanilla requires all reference and arena settings disabled"
+                        .to_owned(),
+                );
+            }
+            if self.tree_reuse {
+                return Err("--training-mode single-vanilla requires --tree-reuse false".to_owned());
+            }
+            if self.mask_stop {
+                return Err("--training-mode single-vanilla requires --mask-stop false".to_owned());
+            }
+            if self.length_tiebreak {
+                return Err(
+                    "--training-mode single-vanilla requires --length-tiebreak false".to_owned(),
+                );
+            }
+            if self.value_reward != ValueReward::Sign {
+                return Err(
+                    "--training-mode single-vanilla requires --value-reward sign".to_owned(),
+                );
+            }
+        }
+        if self.training_mode == TrainingMode::SymmetricSelfplay {
+            if self.reference != ReferenceMode::None
+                || self.reference_ema_decay != 0.0
+                || self.reference_gamma != 0.0
+                || self.reference_trajectory_pool != 0
+                || self.reference_arena_size != 0
+                || self.reference_checkpoint_pointer.is_some()
+                || self.reference_challenger_checkpoint_pointer.is_some()
+                || self.policy_opponent_mode.is_some()
+                || self.reference_mask_stop.is_some()
+                || self.reference_max_batch.is_some()
+                || self.challenger_max_batch.is_some()
+            {
+                return Err(
+                    "--training-mode symmetric-selfplay requires all reference and arena settings disabled"
+                        .to_owned(),
+                );
+            }
+            if !self.mask_stop && !self.position_features {
+                return Err(
+                    "STOP-enabled symmetric-selfplay requires --position-features true".to_owned(),
+                );
+            }
+            if !self.length_tiebreak {
+                return Err(
+                    "--training-mode symmetric-selfplay requires --length-tiebreak true".to_owned(),
+                );
+            }
+            if self.value_reward != ValueReward::Sign {
+                return Err(
+                    "--training-mode symmetric-selfplay requires --value-reward sign".to_owned(),
+                );
+            }
+            if self.evaluator == EvaluatorMode::Random {
+                return Err(
+                    "--training-mode symmetric-selfplay requires a featurized evaluator".to_owned(),
+                );
+            }
+        }
+        if self.wave_batching && self.training_mode != TrainingMode::SymmetricSelfplay {
+            return Err("--wave-batching requires --training-mode symmetric-selfplay".to_owned());
         }
         if let Some(mode) = self.policy_opponent_mode {
             match mode {
@@ -545,6 +628,14 @@ impl SelfplayConfig {
                     args.push("--poll-interval".to_owned());
                     args.push(interval.to_string());
                 }
+                if self.training_mode == TrainingMode::SymmetricSelfplay {
+                    args.extend([
+                        "--require-state-input".to_owned(),
+                        "joint-board".to_owned(),
+                        "--require-value-input".to_owned(),
+                        "single".to_owned(),
+                    ]);
+                }
                 args
             }
         }
@@ -579,6 +670,27 @@ impl SelfplayConfig {
 pub enum RootMode {
     Generated,
     Fixed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrainingMode {
+    #[default]
+    Competitive,
+    SingleVanilla,
+    SymmetricSelfplay,
+}
+
+impl FromStr for TrainingMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "competitive" => Ok(Self::Competitive),
+            "single-vanilla" => Ok(Self::SingleVanilla),
+            "symmetric-selfplay" => Ok(Self::SymmetricSelfplay),
+            _ => Err(format!("unknown training mode: {value}")),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -833,6 +945,9 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
 }
 
 fn value_target_config(config: &SelfplayConfig) -> ValueTargetConfig {
+    if config.training_mode == TrainingMode::SingleVanilla {
+        return ValueTargetConfig::SingleVanilla;
+    }
     match config.value_reward {
         ValueReward::Sign => ValueTargetConfig::Sign,
         ValueReward::Graded => ValueTargetConfig::graded(config.value_reward_scale),
@@ -840,6 +955,16 @@ fn value_target_config(config: &SelfplayConfig) -> ValueTargetConfig {
 }
 
 fn replay_data_mode(config: &SelfplayConfig) -> Result<ReplayDataMode, String> {
+    if config.training_mode == TrainingMode::SingleVanilla {
+        return Ok(ReplayDataMode::SingleVanilla);
+    }
+    if config.training_mode == TrainingMode::SymmetricSelfplay {
+        return Ok(if config.mask_stop {
+            ReplayDataMode::SymmetricSelfplay
+        } else {
+            ReplayDataMode::SymmetricSelfplayStop
+        });
+    }
     let sampled_tree = config.policy_opponent_mode == Some(PolicyOpponentMode::SampledTree);
     match config.value_reward {
         ValueReward::Sign if sampled_tree => Ok(ReplayDataMode::SampledTree),
@@ -862,6 +987,7 @@ fn run_random(
         ..RandomValueEvaluatorConfig::default()
     })
     .map_err(|error| error.to_string())?;
+    let policy_rollout = policy_rollout_config(&engines[0], &config);
     let orchestrator = ThreadedGumbelOrchestrator::new(
         engines,
         evaluator,
@@ -876,7 +1002,8 @@ fn run_random(
             // in-flight pool refills within this window.
             flush_after: Duration::from_millis(3),
         },
-    );
+    )
+    .with_policy_rollout(policy_rollout);
     let run = orchestrator
         .run_with_replay(
             roots,
@@ -906,12 +1033,14 @@ fn run_stub(
         .iter()
         .map(|engine| feature_extractor(engine, &config))
         .collect::<Vec<_>>();
+    let policy_rollout = policy_rollout_config(&engines[0], &config);
     let orchestrator = ThreadedGumbelOrchestrator::new(
         engines,
         random_placeholder(&config)?,
         search,
         threaded_config(&config)?,
-    );
+    )
+    .with_policy_rollout(policy_rollout);
     let run = orchestrator
         .run_featurized_with_replay(
             roots,
@@ -1144,12 +1273,14 @@ fn run_process(
         )?),
         _ => None,
     };
+    let policy_rollout = policy_rollout_config(&engines[0], &config);
     let orchestrator = ThreadedGumbelOrchestrator::new(
         engines,
         random_placeholder(&config)?,
         search,
         threaded_config(&config)?,
-    );
+    )
+    .with_policy_rollout(policy_rollout);
     let run = orchestrator
         .run_featurized_with_replay(
             roots,
@@ -1189,7 +1320,7 @@ fn summarize(
     model_version: Option<ModelVersion>,
 ) -> Result<SelfplaySummary, String> {
     let counters = store.counters();
-    let (wins, losses, ties) = label_counts(store, run.episodes_appended)?;
+    let (wins, losses, ties) = label_counts(store)?;
     let evals = run.batch_sizes.iter().sum::<usize>();
     let mean_eval_batch_size = if run.batch_sizes.is_empty() {
         0.0
@@ -1246,7 +1377,14 @@ fn admission_smoothing(
         .map_err(|_| "max_steps exceeds admission work range".to_owned())?;
     let simulations = u64::try_from(config.simulations)
         .map_err(|_| "simulations exceeds admission work range".to_owned())?;
+    let actor_trajectories = if config.training_mode == TrainingMode::SymmetricSelfplay {
+        2
+    } else {
+        1
+    };
     let initial_episode_eval_work = max_steps
+        .checked_mul(actor_trajectories)
+        .ok_or_else(|| "admission work estimate overflow".to_owned())?
         .checked_mul(
             simulations
                 .checked_add(1)
@@ -1317,6 +1455,11 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
         export_position: config.position_features,
         mask_stop: config.mask_stop,
         no_backtrack: config.no_backtrack,
+        value_mode: match config.training_mode {
+            TrainingMode::Competitive => GumbelValueMode::Competitive,
+            TrainingMode::SingleVanilla => GumbelValueMode::SingleVanilla,
+            TrainingMode::SymmetricSelfplay => GumbelValueMode::SymmetricSelfplay,
+        },
         candidate_options: match config.evaluator {
             EvaluatorMode::Random => CandidateOptions::default(),
             EvaluatorMode::Stub | EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {
@@ -1324,11 +1467,29 @@ fn search(engine: &WhittleEngine, config: &SelfplayConfig) -> Result<GumbelMcts,
             }
         },
         measure_options: engine.measure_options(),
-    });
+    })
+    .with_symmetric_wave_batching(config.wave_batching);
     Ok(match config.reference_mask_stop {
         Some(mask_stop) => search.with_policy_rollout_mask_stop(mask_stop),
         None => search,
     })
+}
+
+fn policy_rollout_config(engine: &WhittleEngine, config: &SelfplayConfig) -> PolicyRolloutConfig {
+    PolicyRolloutConfig {
+        max_steps: config.max_steps,
+        seed: config.seed,
+        export_position: config.position_features,
+        mask_stop: config.reference_mask_stop.unwrap_or(config.mask_stop),
+        no_backtrack: config.no_backtrack,
+        candidate_options: match config.evaluator {
+            EvaluatorMode::Random => CandidateOptions::default(),
+            EvaluatorMode::Stub | EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {
+                feature_candidate_options(config)
+            }
+        },
+        measure_options: engine.measure_options(),
+    }
 }
 
 fn feature_candidate_options(config: &SelfplayConfig) -> CandidateOptions {
@@ -1529,12 +1690,19 @@ fn whittle_generator_config() -> WhittleGraphGeneratorConfig {
     WhittleGraphGeneratorConfig::default()
 }
 
-fn label_counts(store: &ReplayStore, episodes: u64) -> Result<(u64, u64, u64), String> {
+fn label_counts(store: &ReplayStore) -> Result<(u64, u64, u64), String> {
+    if store
+        .data_mode()
+        .map_err(|error| error.to_string())?
+        .is_single_vanilla()
+    {
+        return Ok((0, 0, 0));
+    }
     let mut wins = 0;
     let mut losses = 0;
     let mut ties = 0;
 
-    for id in 0..episodes {
+    for id in 0..store.episode_sequence_end() {
         let Some(record) = store
             .episode(ReplayEpisodeId::new(id))
             .map_err(|error| error.to_string())?

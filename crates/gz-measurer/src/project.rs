@@ -21,6 +21,8 @@ pub struct CompletedEpisodeStep {
     pub selected_action: PortableSearchActionRef,
     pub legal_actions: Vec<PortableSearchActionRef>,
     pub policy_target: Vec<f32>,
+    pub root_value: Option<f32>,
+    pub root_search_value: Option<f32>,
     pub model_version: Option<ModelVersion>,
 }
 
@@ -59,15 +61,18 @@ pub enum ProjectionMode {
 pub enum MeasurerError {
     Unmeasured,
     MissingReference,
+    UnexpectedReference,
     FeatureRowCountMismatch,
     StepCountOverflow,
     InvalidValueTargetConfig,
+    InvalidRootSearchValue,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum ValueTargetConfig {
     #[default]
     Sign,
+    SingleVanilla,
     Graded {
         reward_scale: f32,
     },
@@ -82,7 +87,7 @@ impl ValueTargetConfig {
     #[must_use]
     pub fn is_valid(self) -> bool {
         match self {
-            Self::Sign => true,
+            Self::Sign | Self::SingleVanilla => true,
             Self::Graded { reward_scale } => reward_scale.is_finite() && reward_scale > 0.0,
         }
     }
@@ -132,20 +137,27 @@ pub fn project_episode_with_value_target(
         return Err(MeasurerError::FeatureRowCountMismatch);
     }
 
-    let value_target = reference.map(|reference| {
-        let reference_len =
-            (length_tiebreak && reference.step_count > 0).then(|| reference.step_count - 1);
-        outcome_target(
-            value_target_config,
-            learner_reward,
-            reference.final_reward,
-            root_reward,
-            artifact.steps.len(),
-            reference_len,
-            length_tiebreak,
-            episode_id,
-        )
-    });
+    let value_target = if value_target_config == ValueTargetConfig::SingleVanilla {
+        if reference.is_some() {
+            return Err(MeasurerError::UnexpectedReference);
+        }
+        Some(learner_reward)
+    } else {
+        reference.map(|reference| {
+            let reference_len =
+                (length_tiebreak && reference.step_count > 0).then(|| reference.step_count - 1);
+            outcome_target(
+                value_target_config,
+                learner_reward,
+                reference.final_reward,
+                root_reward,
+                artifact.steps.len(),
+                reference_len,
+                length_tiebreak,
+                episode_id,
+            )
+        })
+    };
     let replay_reference = reference.map(|reference| ReplayReference {
         kind: reference.kind,
         reward: reference.final_reward,
@@ -172,6 +184,7 @@ pub fn project_episode_with_value_target(
             policy_target: step.policy_target.clone(),
             selected_action: step.selected_action,
             value_target,
+            horizon_value_targets: None,
             reward_target: Some(learner_reward),
             final_measure: artifact.final_measure.clone(),
             model_version: step.model_version,
@@ -211,6 +224,31 @@ pub fn episode_reward(artifact: &CompletedEpisodeArtifact) -> Option<f32> {
         Some(reward) if reward.is_finite() => Some(reward),
         _ => None,
     }
+}
+
+pub fn horizon_value_targets(
+    artifact: &CompletedEpisodeArtifact,
+    terminal_target: f32,
+) -> Result<Vec<[f32; 2]>, MeasurerError> {
+    const LAMBDAS: [f32; 2] = [8.0 / 9.0, 32.0 / 33.0];
+
+    if !terminal_target.is_finite() || !(-1.0..=1.0).contains(&terminal_target) {
+        return Err(MeasurerError::InvalidRootSearchValue);
+    }
+
+    let mut targets = vec![[terminal_target; 2]; artifact.steps.len()];
+    let mut next = [terminal_target; 2];
+    for (step, target) in artifact.steps.iter().zip(&mut targets).rev() {
+        let search_value = step
+            .root_search_value
+            .filter(|value| value.is_finite() && (-1.0..=1.0).contains(value))
+            .ok_or(MeasurerError::InvalidRootSearchValue)?;
+        for (value, lambda) in next.iter_mut().zip(LAMBDAS) {
+            *value = (1.0 - lambda) * search_value + lambda * *value;
+        }
+        *target = next;
+    }
+    Ok(targets)
 }
 
 pub fn sign_target(
@@ -259,6 +297,7 @@ pub fn outcome_target(
         ValueTargetConfig::Sign => {
             sign_target(learner, reference, learner_len, reference_len, episode_id)
         }
+        ValueTargetConfig::SingleVanilla => learner,
         ValueTargetConfig::Graded { reward_scale } => {
             let denominator = root_reward.abs().max(1.0);
             let mut margin = (learner - reference) / denominator;

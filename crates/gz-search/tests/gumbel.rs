@@ -5,7 +5,7 @@ use gz_engine::ModelVersion;
 use gz_eval::{EvalOutput, EvalRequest, EvalResult, Evaluator};
 use gz_search::{
     GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, GumbelOpponentContext, GumbelSearchContext,
-    GumbelStopReason, SearchAction, considered_visit_sequence,
+    GumbelStopReason, GumbelValueMode, SearchAction, considered_visit_sequence,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -78,6 +78,7 @@ fn config(max_steps: usize) -> GumbelMctsConfig {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: GumbelValueMode::Competitive,
         candidate_options: gz_engine::CandidateOptions::default(),
         measure_options: measure_options(),
     }
@@ -777,4 +778,80 @@ fn tree_reuse_carries_shifted_root_ledgers() {
         fresh_episode.steps[1].root_search_value,
         reuse_episode.steps[1].root_search_value
     );
+}
+
+#[test]
+fn single_vanilla_uses_a_predicted_horizon_and_measures_once() {
+    let mut engine = TestEngine::new()
+        .candidates(0, [1])
+        .candidates(10, [2])
+        .candidates(20, [])
+        .apply(0, 1, 10)
+        .apply(10, 2, 20)
+        .reward(10, -10.0);
+    let mut evaluator = RecordedEvaluator::default()
+        .row(0, [8.0, -8.0], -20.0)
+        .row(10, [8.0, -8.0], -10.0)
+        .row(20, [0.0], -1.0);
+    let mut cfg = config(1);
+    cfg.simulations = NonZeroUsize::new(8).unwrap();
+    cfg.max_considered_actions = NonZeroUsize::new(2).unwrap();
+    cfg.value_mode = GumbelValueMode::SingleVanilla;
+
+    let episode = GumbelMcts::new(cfg)
+        .run(
+            &mut engine,
+            &mut evaluator,
+            0,
+            GumbelEpisodeContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(episode.final_graph, 10);
+    assert_eq!(engine.measure_calls, vec![10]);
+    let evaluated_graphs = evaluator
+        .requests
+        .iter()
+        .map(|request| request.context.graph.graph_hash.as_bytes()[0])
+        .collect::<Vec<_>>();
+    assert_eq!(evaluated_graphs, vec![0, 10]);
+}
+
+#[test]
+fn single_vanilla_policy_is_invariant_to_positive_affine_values() {
+    fn run(root_value: f32, left_value: f32, right_value: f32) -> Vec<f32> {
+        let mut engine = TestEngine::new()
+            .candidates(0, [1, 2])
+            .candidates(10, [])
+            .candidates(20, [])
+            .apply(0, 1, 10)
+            .apply(0, 2, 20);
+        let mut evaluator = RecordedEvaluator::default()
+            .row(0, [0.2, 0.1, -2.0], root_value)
+            .row(10, [0.0], left_value)
+            .row(20, [0.0], right_value);
+        let mut cfg = config(1);
+        cfg.simulations = NonZeroUsize::new(12).unwrap();
+        cfg.max_considered_actions = NonZeroUsize::new(3).unwrap();
+        cfg.value_mode = GumbelValueMode::SingleVanilla;
+
+        GumbelMcts::new(cfg)
+            .run(
+                &mut engine,
+                &mut evaluator,
+                0,
+                GumbelEpisodeContext::default(),
+            )
+            .unwrap()
+            .steps[0]
+            .policy_target
+            .clone()
+    }
+
+    let original = run(-5.0, -4.0, -2.0);
+    let transformed = run(50.0, 60.0, 80.0);
+    assert_eq!(original.len(), transformed.len());
+    for (left, right) in original.iter().zip(transformed) {
+        assert!((left - right).abs() < 1e-6, "{left} != {right}");
+    }
 }

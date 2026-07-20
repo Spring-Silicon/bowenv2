@@ -4,8 +4,8 @@ use gz_engine_whittle::{
 };
 use gz_eval::{RandomValueEvaluator, RandomValueEvaluatorConfig};
 use gz_eval_service::{
-    BackendOutputs, FeatureEvalBackend, STUB_MODEL_VERSION, ServiceError, ServiceResult,
-    StubBackend,
+    BackendOutputs, FeatureEvalBackend, ModelGeneration, PendingBatch, STUB_MODEL_VERSION,
+    ServiceError, ServiceResult, StubBackend,
 };
 use gz_features::{
     FeatureBatchView, FeatureExtractor, FeatureResult, FeatureRow, FeatureSchema,
@@ -21,7 +21,7 @@ use gz_orchestrator::{
     ThreadedOrchestratorConfig,
 };
 use gz_replay::{ReplayReferenceKind, ReplayStore, SampleConfig, SampleKind};
-use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig};
+use gz_search::{GumbelEpisodeContext, GumbelMcts, GumbelMctsConfig, PolicyRolloutConfig};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,6 +67,19 @@ fn roots(count: u64) -> Roots {
     CountedRoots::new(count, root_factory)
 }
 
+fn policy_rollout_config(search: &GumbelMcts) -> PolicyRolloutConfig {
+    let config = search.config();
+    PolicyRolloutConfig {
+        max_steps: config.max_steps,
+        seed: config.seed,
+        export_position: config.export_position,
+        mask_stop: config.mask_stop,
+        no_backtrack: config.no_backtrack,
+        candidate_options: config.candidate_options,
+        measure_options: config.measure_options,
+    }
+}
+
 struct FixedRoots {
     remaining: u64,
 }
@@ -110,9 +123,48 @@ fn search(engine: &WhittleEngine) -> GumbelMcts {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: gz_search::GumbelValueMode::Competitive,
         candidate_options: CandidateOptions::default(),
         measure_options: engine.measure_options(),
     })
+}
+
+fn symmetric_search(engine: &WhittleEngine) -> GumbelMcts {
+    GumbelMcts::new(GumbelMctsConfig {
+        max_steps: 1,
+        simulations: NonZeroUsize::new(2).unwrap(),
+        max_considered_actions: NonZeroUsize::new(4).unwrap(),
+        seed: 11,
+        gumbel_scale: 0.0,
+        gumbel_noise_overlap: -1.0,
+        c_visit: 50.0,
+        c_scale: 1.0,
+        temperature_moves: 0,
+        tree_reuse: false,
+        export_position: true,
+        mask_stop: true,
+        no_backtrack: false,
+        value_mode: gz_search::GumbelValueMode::SymmetricSelfplay,
+        candidate_options: CandidateOptions::default(),
+        measure_options: engine.measure_options(),
+    })
+}
+
+struct StopBackend;
+
+impl FeatureEvalBackend for StopBackend {
+    fn model_generation(&self) -> ModelGeneration {
+        ModelGeneration::initial(STUB_MODEL_VERSION)
+    }
+
+    fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
+        let mut outputs = StubBackend.eval(batch_bytes, action_counts)?;
+        for row in &mut outputs.rows {
+            row.policy_logits.fill(-100.0);
+            *row.policy_logits.last_mut().expect("STOP action exists") = 100.0;
+        }
+        Ok(outputs)
+    }
 }
 
 fn config(workers_per_lane: usize) -> ThreadedOrchestratorConfig {
@@ -205,6 +257,171 @@ fn featurized_replay_appends_rows() {
     }
 }
 
+#[test]
+fn symmetric_selfplay_appends_both_players_without_stop_targets() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let search = symmetric_search(&engines[0]);
+    let extractors = extractors(&engines);
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+    let run = orchestrator
+        .run_featurized_with_replay(
+            vec![roots(1)],
+            GumbelEpisodeContext::default(),
+            FeaturizedRuntime {
+                extractors,
+                backends: vec![StubBackend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
+            },
+            ReplayRuntime {
+                store: &store,
+                providers: vec![NoReferenceProvider],
+                backpressure: None,
+                length_tiebreak: true,
+                value_target: ValueTargetConfig::Sign,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(run.episodes_appended, 1);
+    assert_eq!(
+        store.data_mode().unwrap(),
+        gz_replay::ReplayDataMode::SymmetricSelfplay
+    );
+    assert_eq!(store.counters().produced_rows, 2);
+    let rows = store
+        .sample_rows(SampleConfig {
+            batch: NonZeroUsize::new(2).unwrap(),
+            window_rows: std::num::NonZeroU64::new(2).unwrap(),
+            seed: 0,
+        })
+        .unwrap();
+    for (episode_id, row) in rows {
+        let record = store.episode(episode_id).unwrap().unwrap();
+        let feature_row = decode_feature_row(row.feature_row.as_ref().unwrap()).unwrap();
+        assert_eq!(feature_row.actions.len(), row.legal_actions.len() + 1);
+        assert_eq!(feature_row.actions.last().unwrap().kind_token, 1);
+        assert!(feature_row.opponent.is_some());
+        assert_eq!(row.value_target, Some(0.0));
+        assert!(record.outcome.reference.is_none());
+        assert!(!record.outcome.stopped);
+    }
+}
+
+#[test]
+fn symmetric_selfplay_trains_stop_and_keeps_rewrite_tiebreak_counts() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let mut search_config = symmetric_search(&engines[0]).config();
+    search_config.max_steps = 4;
+    search_config.mask_stop = false;
+    search_config.tree_reuse = true;
+    let search = GumbelMcts::new(search_config);
+    let extractors = extractors(&engines);
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+
+    let run = orchestrator
+        .run_featurized_with_replay(
+            vec![roots(1)],
+            GumbelEpisodeContext::default(),
+            FeaturizedRuntime {
+                extractors,
+                backends: vec![StopBackend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
+            },
+            ReplayRuntime {
+                store: &store,
+                providers: vec![NoReferenceProvider],
+                backpressure: None,
+                length_tiebreak: true,
+                value_target: ValueTargetConfig::Sign,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(run.episodes_appended, 1);
+    assert_eq!(
+        store.data_mode().unwrap(),
+        gz_replay::ReplayDataMode::SymmetricSelfplayStop
+    );
+    assert_eq!(store.counters().produced_rows, 2);
+    let rows = store
+        .sample_rows(SampleConfig {
+            batch: NonZeroUsize::new(2).unwrap(),
+            window_rows: std::num::NonZeroU64::new(2).unwrap(),
+            seed: 0,
+        })
+        .unwrap();
+    for (episode_id, row) in rows {
+        let record = store.episode(episode_id).unwrap().unwrap();
+        let feature_row = decode_feature_row(row.feature_row.as_ref().unwrap()).unwrap();
+        assert!(record.outcome.stopped);
+        assert!(matches!(
+            record.steps.last().unwrap().action,
+            gz_engine::PortableSearchActionRef::Stop { .. }
+        ));
+        assert_eq!(feature_row.actions.len(), row.legal_actions.len());
+        assert_eq!(feature_row.actions.last().unwrap().kind_token, 1);
+        assert!(matches!(
+            row.legal_actions.last(),
+            Some(gz_engine::PortableSearchActionRef::Stop { .. })
+        ));
+        assert_eq!(row.policy_target.len(), row.legal_actions.len());
+        assert_eq!(row.value_target, Some(0.0));
+        if episode_id.get() == 1 {
+            let opponent = &feature_row.opponent.as_ref().unwrap().position;
+            assert_eq!(opponent.root_step, 0);
+            assert_eq!(opponent.budget_fraction, 1.0);
+            assert!(opponent.budget_step.is_sign_negative());
+        }
+    }
+    let metrics = store.symmetric_selfplay_metrics().unwrap();
+    assert_eq!(metrics.p1_episode_len_ema, 0.0);
+    assert_eq!(metrics.p2_episode_len_ema, 0.0);
+}
+
+#[test]
+fn symmetric_wave_batching_submits_multiple_evals_from_one_worker() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let mut search_config = symmetric_search(&engines[0]).config();
+    search_config.max_steps = 2;
+    search_config.simulations = NonZeroUsize::new(8).unwrap();
+    search_config.max_considered_actions = NonZeroUsize::new(2).unwrap();
+    search_config.tree_reuse = true;
+    let search = GumbelMcts::new(search_config).with_symmetric_wave_batching(true);
+    let extractors = extractors(&engines);
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+
+    let run = orchestrator
+        .run_featurized_with_replay(
+            vec![roots(1)],
+            GumbelEpisodeContext::default(),
+            FeaturizedRuntime {
+                extractors,
+                backends: vec![StubBackend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
+            },
+            ReplayRuntime {
+                store: &store,
+                providers: vec![NoReferenceProvider],
+                backpressure: None,
+                length_tiebreak: true,
+                value_target: ValueTargetConfig::Sign,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(run.episodes_appended, 1);
+    assert!(run.batch_sizes.iter().copied().max().unwrap_or(0) > 1);
+}
+
 struct IdentifiedRootProvider {
     inner: RootBaselineProvider,
     ref_id: u64,
@@ -250,6 +467,10 @@ struct CapturingBackend {
 }
 
 impl FeatureEvalBackend for CapturingBackend {
+    fn model_generation(&self) -> ModelGeneration {
+        ModelGeneration::initial(STUB_MODEL_VERSION)
+    }
+
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
         let view = FeatureBatchView::parse(batch_bytes)
             .map_err(|error| ServiceError::protocol(error.to_string()))?;
@@ -309,6 +530,7 @@ fn featurized_eval_batches_carry_stable_opponent_refs() {
 struct SampledTrajectoryProvider {
     next_ref_id: Arc<AtomicU64>,
     finished: Arc<AtomicU64>,
+    observed_latest: Arc<Mutex<Vec<Option<ModelVersion>>>>,
 }
 
 impl<E: GraphEngine> ReferenceProvider<E> for SampledTrajectoryProvider {
@@ -318,6 +540,11 @@ impl<E: GraphEngine> ReferenceProvider<E> for SampledTrajectoryProvider {
 
     fn sampled_trajectory_mode(&self) -> bool {
         true
+    }
+
+    fn rollout_due(&self, latest: Option<ModelVersion>) -> bool {
+        self.observed_latest.lock().unwrap().push(latest);
+        false
     }
 
     fn finish_sampled_trajectory(&mut self, outcome: Option<RolloutOutcome>) -> Option<Reference> {
@@ -336,8 +563,10 @@ impl<E: GraphEngine> ReferenceProvider<E> for SampledTrajectoryProvider {
 }
 
 #[derive(Clone)]
-struct AlternatingVersionBackend {
+struct SwappingVersionBackend {
     calls: Arc<AtomicU64>,
+    requested: Arc<Mutex<Vec<ModelGeneration>>>,
+    released: Arc<Mutex<Vec<ModelGeneration>>>,
 }
 
 #[derive(Clone)]
@@ -347,11 +576,16 @@ struct VersionBackend {
 }
 
 impl FeatureEvalBackend for VersionBackend {
+    fn model_generation(&self) -> ModelGeneration {
+        ModelGeneration::initial(self.version)
+    }
+
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
         let mut outputs = StubBackend.eval(batch_bytes, action_counts)?;
         self.rows
             .fetch_add(action_counts.len() as u64, Ordering::Relaxed);
         outputs.model_version = self.version;
+        outputs.active_generation = self.model_generation();
         Ok(outputs)
     }
 }
@@ -380,10 +614,15 @@ struct BatchRecordingBackend {
 }
 
 impl FeatureEvalBackend for BatchRecordingBackend {
+    fn model_generation(&self) -> ModelGeneration {
+        ModelGeneration::initial(self.version)
+    }
+
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
         self.batches.lock().unwrap().push(action_counts.len());
         let mut outputs = StubBackend.eval(batch_bytes, action_counts)?;
         outputs.model_version = self.version;
+        outputs.active_generation = self.model_generation();
         Ok(outputs)
     }
 }
@@ -843,7 +1082,7 @@ fn trajectory_pool_routes_incumbent_rollout_and_current_learner_separately() {
 }
 
 #[test]
-fn sampled_tree_routes_models_and_appends_both_perspectives() {
+fn sampled_tree_routes_models_and_appends_learner_pairs() {
     let dir = TestDir::new();
     let store = ReplayStore::open(dir.path()).unwrap();
     let engines = engines(1);
@@ -889,10 +1128,12 @@ fn sampled_tree_routes_models_and_appends_both_perspectives() {
         .episode(gz_replay::ReplayEpisodeId::new(0))
         .unwrap()
         .unwrap();
-    let incumbent_record = store
-        .episode(gz_replay::ReplayEpisodeId::new(1))
-        .unwrap()
-        .unwrap();
+    assert!(
+        store
+            .episode(gz_replay::ReplayEpisodeId::new(1))
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         learner.outcome.reference.as_ref().unwrap().kind,
         ReplayReferenceKind::GatedPolicy
@@ -901,23 +1142,18 @@ fn sampled_tree_routes_models_and_appends_both_perspectives() {
         learner.outcome.reference.as_ref().unwrap().model_version,
         Some(incumbent)
     );
+    assert_eq!(store.counters().produced_rows, u64::from(learner.row_count));
     assert_eq!(
-        incumbent_record.outcome.reference.as_ref().unwrap().kind,
-        ReplayReferenceKind::Gumbel
+        store.counters().produced_policy_rows,
+        u64::from(learner.row_count)
     );
     assert_eq!(
-        incumbent_record
-            .outcome
-            .reference
-            .as_ref()
-            .unwrap()
-            .model_version,
-        Some(current)
+        store.counters().produced_value_rows,
+        u64::from(learner.row_count)
     );
-    assert_eq!(
-        learner.outcome.value_target,
-        incumbent_record.outcome.value_target.map(|target| -target)
-    );
+    let (early_value_accuracy, late_value_accuracy) = store.value_sign_accuracy_emas();
+    assert!(early_value_accuracy.is_some_and(|value| (0.0..=1.0).contains(&value)));
+    assert!(late_value_accuracy.is_none());
 
     let window = std::num::NonZeroU64::new(store.counters().produced_rows).unwrap();
     let policy = store
@@ -935,10 +1171,7 @@ fn sampled_tree_routes_models_and_appends_both_perspectives() {
             && row.model_version == Some(current)
             && row.policy_target.iter().any(|target| *target > 0.0)
     }));
-    let mut opponent_steps = [
-        vec![None; learner.row_count as usize],
-        vec![None; incumbent_record.row_count as usize],
-    ];
+    let mut opponent_steps = vec![None; learner.row_count as usize];
     for seed in 0..64 {
         let values = store
             .sample_rows_kind(
@@ -951,39 +1184,52 @@ fn sampled_tree_routes_models_and_appends_both_perspectives() {
             )
             .unwrap();
         for (id, row) in values {
+            assert_eq!(id, gz_replay::ReplayEpisodeId::new(0));
             let features = decode_feature_row(row.feature_row.as_ref().unwrap()).unwrap();
             assert!(row.value_target.is_some());
             assert!(features.position.opponent_present);
             let opponent = features.opponent.unwrap();
-            let record = usize::from(id == gz_replay::ReplayEpisodeId::new(1));
-            opponent_steps[record][row.step_index as usize] = Some(opponent.position.root_step);
+            opponent_steps[row.step_index as usize] = Some(opponent.position.root_step);
         }
-        if opponent_steps.iter().flatten().all(Option::is_some) {
+        if opponent_steps.iter().all(Option::is_some) {
             break;
         }
     }
-    assert!(opponent_steps.iter().flatten().all(Option::is_some));
-    let aligned = |record: usize, after_turn: bool, opponent_len: usize| {
-        opponent_steps[record]
-            .iter()
-            .enumerate()
-            .all(|(step, actual)| {
-                *actual == Some((step + usize::from(after_turn)).min(opponent_len) as u32)
-            })
-    };
-    let learner_is_p1 = aligned(0, false, incumbent_record.row_count as usize)
-        && aligned(1, true, learner.row_count as usize);
-    let incumbent_is_p1 = aligned(1, false, learner.row_count as usize)
-        && aligned(0, true, incumbent_record.row_count as usize);
-    assert!(learner_is_p1 ^ incumbent_is_p1);
+    assert!(opponent_steps.iter().all(Option::is_some));
 }
 
-impl FeatureEvalBackend for AlternatingVersionBackend {
+impl FeatureEvalBackend for SwappingVersionBackend {
+    fn model_generation(&self) -> ModelGeneration {
+        ModelGeneration::initial(ModelVersion::from_bytes([1; 16]))
+    }
+
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
         let mut outputs = StubBackend.eval(batch_bytes, action_counts)?;
-        let call = self.calls.fetch_add(1, Ordering::Relaxed);
-        outputs.model_version = ModelVersion::from_bytes([1 + (call % 2) as u8; 16]);
+        outputs.model_version = self.model_generation().version;
+        outputs.active_generation = self.model_generation();
         Ok(outputs)
+    }
+
+    fn submit_for_model(
+        &mut self,
+        model: ModelGeneration,
+        batch_bytes: &[u8],
+        action_counts: &[u32],
+    ) -> ServiceResult<PendingBatch> {
+        let mut outputs = StubBackend.eval(batch_bytes, action_counts)?;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.requested.lock().unwrap().push(model);
+        outputs.model_version = model.version;
+        outputs.active_generation = ModelGeneration {
+            id: 2,
+            version: ModelVersion::from_bytes([2; 16]),
+        };
+        Ok(PendingBatch::Ready(outputs))
+    }
+
+    fn release_model_generation(&mut self, model: ModelGeneration) -> ServiceResult<()> {
+        self.released.lock().unwrap().push(model);
+        Ok(())
     }
 }
 
@@ -998,8 +1244,11 @@ fn sampled_trajectory_runs_one_active_policy_prelude_per_learner_episode() {
     let provider = SampledTrajectoryProvider {
         next_ref_id: Arc::new(AtomicU64::new(1)),
         finished: Arc::clone(&finished),
+        observed_latest: Arc::new(Mutex::new(Vec::new())),
     };
-    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(2));
+    let policy_rollout = policy_rollout_config(&search);
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(2))
+        .with_policy_rollout(policy_rollout);
 
     let run = orchestrator
         .run_featurized_with_replay(
@@ -1039,7 +1288,7 @@ fn sampled_trajectory_runs_one_active_policy_prelude_per_learner_episode() {
 }
 
 #[test]
-fn sampled_trajectory_accepts_mid_rollout_model_swaps_without_false_attribution() {
+fn sampled_trajectory_pins_each_episode_and_new_episodes_adopt_swaps() {
     let dir = TestDir::new();
     let store = ReplayStore::open(dir.path()).unwrap();
     let engines = engines(1);
@@ -1048,18 +1297,27 @@ fn sampled_trajectory_accepts_mid_rollout_model_swaps_without_false_attribution(
     search_config.mask_stop = true;
     let search = GumbelMcts::new(search_config);
     let extractors = extractors(&engines);
+    let observed_latest = Arc::new(Mutex::new(Vec::new()));
     let provider = SampledTrajectoryProvider {
         next_ref_id: Arc::new(AtomicU64::new(1)),
         finished: Arc::new(AtomicU64::new(0)),
+        observed_latest: Arc::clone(&observed_latest),
     };
-    let backend = AlternatingVersionBackend {
-        calls: Arc::new(AtomicU64::new(0)),
+    let calls = Arc::new(AtomicU64::new(0));
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let backend = SwappingVersionBackend {
+        calls: Arc::clone(&calls),
+        requested: Arc::clone(&requested),
+        released: Arc::clone(&released),
     };
-    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+    let policy_rollout = policy_rollout_config(&search);
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1))
+        .with_policy_rollout(policy_rollout);
 
     let run = orchestrator
         .run_featurized_with_replay(
-            vec![roots(1)],
+            vec![roots(2)],
             GumbelEpisodeContext::default(),
             FeaturizedRuntime {
                 extractors,
@@ -1077,12 +1335,120 @@ fn sampled_trajectory_accepts_mid_rollout_model_swaps_without_false_attribution(
         )
         .unwrap();
 
-    assert_eq!(run.episodes_appended, 1);
-    let episode = store
+    assert_eq!(run.episodes_appended, 2);
+    let first_episode = store
         .episode(gz_replay::ReplayEpisodeId::new(0))
         .unwrap()
         .unwrap();
-    assert_eq!(episode.outcome.reference.unwrap().model_version, None);
+    let first = ModelGeneration::initial(ModelVersion::from_bytes([1; 16]));
+    let second = ModelGeneration {
+        id: 2,
+        version: ModelVersion::from_bytes([2; 16]),
+    };
+    assert_eq!(
+        first_episode.outcome.reference.unwrap().model_version,
+        Some(first.version)
+    );
+    let second_episode = store
+        .episode(gz_replay::ReplayEpisodeId::new(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second_episode.outcome.reference.unwrap().model_version,
+        Some(second.version)
+    );
+    assert!(calls.load(Ordering::Relaxed) > 1);
+    let requested = requested.lock().unwrap();
+    let second_start = requested
+        .iter()
+        .position(|model| *model == second)
+        .expect("second episode never adopted the new model generation");
+    assert!(second_start > 1, "first episode did not retain its lease");
+    assert!(
+        requested[..second_start]
+            .iter()
+            .all(|model| *model == first)
+    );
+    assert!(
+        requested[second_start..]
+            .iter()
+            .all(|model| *model == second)
+    );
+    let observed_latest = observed_latest.lock().unwrap();
+    assert!(observed_latest.contains(&Some(second.version)));
+    assert!(!observed_latest.contains(&Some(first.version)));
+    assert_eq!(*released.lock().unwrap(), vec![first]);
+}
+
+#[test]
+fn symmetric_selfplay_pins_both_players_and_next_game_adopts_swap() {
+    let dir = TestDir::new();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let engines = engines(1);
+    let mut search_config = symmetric_search(&engines[0]).config();
+    search_config.max_steps = 2;
+    let search = GumbelMcts::new(search_config);
+    let extractors = extractors(&engines);
+    let calls = Arc::new(AtomicU64::new(0));
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let backend = SwappingVersionBackend {
+        calls: Arc::clone(&calls),
+        requested: Arc::clone(&requested),
+        released: Arc::clone(&released),
+    };
+    let orchestrator = ThreadedGumbelOrchestrator::new(engines, evaluator(), search, config(1));
+
+    let run = orchestrator
+        .run_featurized_with_replay(
+            vec![roots(2)],
+            GumbelEpisodeContext::default(),
+            FeaturizedRuntime {
+                extractors,
+                backends: vec![backend],
+                reference_backends: vec![],
+                challenger_backends: vec![],
+            },
+            ReplayRuntime {
+                store: &store,
+                providers: vec![NoReferenceProvider],
+                backpressure: None,
+                length_tiebreak: true,
+                value_target: ValueTargetConfig::Sign,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(run.episodes_appended, 2);
+    let first = ModelGeneration::initial(ModelVersion::from_bytes([1; 16]));
+    let second = ModelGeneration {
+        id: 2,
+        version: ModelVersion::from_bytes([2; 16]),
+    };
+    for replay_id in 0..4 {
+        let record = store
+            .episode(gz_replay::ReplayEpisodeId::new(replay_id))
+            .unwrap()
+            .unwrap();
+        assert!(!record.steps.is_empty());
+    }
+    let requested = requested.lock().unwrap();
+    let second_start = requested
+        .iter()
+        .position(|model| *model == second)
+        .expect("second game never adopted the new model generation");
+    assert!(second_start > 1, "first game did not retain its lease");
+    assert!(
+        requested[..second_start]
+            .iter()
+            .all(|model| *model == first)
+    );
+    assert!(
+        requested[second_start..]
+            .iter()
+            .all(|model| *model == second)
+    );
+    assert_eq!(*released.lock().unwrap(), vec![first]);
 }
 
 /// Never supplies a reference and never expects one: rows are stored

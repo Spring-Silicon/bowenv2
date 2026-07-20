@@ -284,6 +284,7 @@ fn search(engine: &WhittleEngine) -> GumbelMcts {
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: gz_search::GumbelValueMode::Competitive,
         candidate_options: CandidateOptions::default(),
         measure_options: measure_options(engine),
     })

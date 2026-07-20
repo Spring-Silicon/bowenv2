@@ -1,0 +1,15 @@
+[queue]
+name = "symmetric-tree-reuse-fix-ab-2026-07-17-r1"
+results_dir = "runs/queues/symmetric-tree-reuse-fix-ab-2026-07-17-r1"
+poll_seconds = 5.0
+min_free_gb = 5.0
+
+[[runs]]
+name = "reuse-off"
+config = "00-reuse-off.toml"
+timeout_seconds = 7200
+
+[[runs]]
+name = "reuse-on"
+config = "01-reuse-on.toml"
+timeout_seconds = 7200

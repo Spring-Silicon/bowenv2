@@ -84,6 +84,7 @@ pub struct ReplayRow {
     pub policy_target: Vec<f32>,
     pub selected_action: PortableSearchActionRef,
     pub value_target: Option<f32>,
+    pub horizon_value_targets: Option<[f32; 2]>,
     pub reward_target: Option<f32>,
     pub final_measure: MeasureSummary,
     pub model_version: Option<ModelVersion>,
@@ -109,6 +110,7 @@ pub(crate) struct StoredReplayRow {
     policy_target_bf16: Vec<u16>,
     selected_action: PortableSearchActionRef,
     value_target: Option<f32>,
+    horizon_value_targets: Option<[f32; 2]>,
     reward_target: Option<f32>,
     final_measure: MeasureSummary,
     model_version: Option<ModelVersion>,
@@ -156,6 +158,7 @@ impl StoredReplayRow {
                 .collect(),
             selected_action: row.selected_action,
             value_target: row.value_target,
+            horizon_value_targets: row.horizon_value_targets,
             reward_target: row.reward_target,
             final_measure: row.final_measure.clone(),
             model_version: row.model_version,
@@ -190,6 +193,7 @@ impl StoredReplayRow {
                 .collect(),
             selected_action: self.selected_action,
             value_target: self.value_target,
+            horizon_value_targets: self.horizon_value_targets,
             reward_target: self.reward_target,
             final_measure: self.final_measure,
             model_version: self.model_version,
@@ -267,6 +271,9 @@ fn validate_outcome(record: &ReplayEpisodeRecord, data_mode: ReplayDataMode) -> 
 
     match &record.outcome.reference {
         Some(reference) => {
+            if data_mode.is_single_vanilla() {
+                return Err(ReplayError::InvalidRecord);
+            }
             if !reference.reward.is_finite() {
                 return Err(ReplayError::InvalidRecord);
             }
@@ -292,7 +299,20 @@ fn validate_outcome(record: &ReplayEpisodeRecord, data_mode: ReplayDataMode) -> 
             }
         }
         None => {
-            if record.outcome.value_target.is_some() {
+            let valid = if data_mode.is_symmetric_selfplay() {
+                (!record.outcome.stopped || data_mode.symmetric_stop_enabled())
+                    && matches!(record.outcome.value_target, Some(-1.0 | 0.0 | 1.0))
+                    && (!data_mode.symmetric_stop_enabled()
+                        || record.outcome.stopped
+                            == record.steps.last().is_some_and(|step| {
+                                matches!(step.action, PortableSearchActionRef::Stop { .. })
+                            }))
+            } else if data_mode.is_single_vanilla() {
+                record.outcome.value_target == Some(record.outcome.learner_reward)
+            } else {
+                record.outcome.value_target.is_none()
+            };
+            if !valid {
                 return Err(ReplayError::InvalidRecord);
             }
         }
@@ -321,12 +341,24 @@ fn validate_row(
         return Err(ReplayError::InvalidRecord);
     }
 
-    if row.legal_actions.len() != row.policy_target.len()
-        || !matches!(
+    let legal_action_shape_valid = if data_mode.symmetric_stop_enabled() {
+        matches!(
             row.legal_actions.last(),
             Some(PortableSearchActionRef::Stop { .. })
         )
-    {
+    } else if data_mode.is_symmetric_selfplay() {
+        !row.legal_actions.is_empty()
+            && row
+                .legal_actions
+                .iter()
+                .all(|action| !matches!(action, PortableSearchActionRef::Stop { .. }))
+    } else {
+        matches!(
+            row.legal_actions.last(),
+            Some(PortableSearchActionRef::Stop { .. })
+        )
+    };
+    if row.legal_actions.len() != row.policy_target.len() || !legal_action_shape_valid {
         return Err(ReplayError::InvalidRecord);
     }
 
@@ -341,16 +373,45 @@ fn validate_row(
     }
 
     validate_value_target(row.value_target, data_mode)?;
+    validate_horizon_value_targets(row.horizon_value_targets, data_mode)?;
 
     Ok(())
 }
 
+fn validate_horizon_value_targets(
+    targets: Option<[f32; 2]>,
+    data_mode: ReplayDataMode,
+) -> ReplayResult<()> {
+    match (targets, data_mode.is_symmetric_selfplay()) {
+        (Some(targets), true)
+            if targets
+                .iter()
+                .all(|target| target.is_finite() && (-1.0..=1.0).contains(target)) =>
+        {
+            Ok(())
+        }
+        (None, false) => Ok(()),
+        _ => Err(ReplayError::InvalidRecord),
+    }
+}
+
 fn validate_value_target(value: Option<f32>, data_mode: ReplayDataMode) -> ReplayResult<()> {
-    match (value, data_mode.is_graded()) {
-        (Some(value), false) if value == -1.0 || value == 1.0 => Ok(()),
-        (Some(value), true) if value.is_finite() && (-1.0..=1.0).contains(&value) => Ok(()),
-        (Some(_), _) => Err(ReplayError::InvalidRecord),
-        (None, _) => Ok(()),
+    if data_mode.is_single_vanilla() {
+        return match value {
+            Some(value) if value.is_finite() => Ok(()),
+            _ => Err(ReplayError::InvalidRecord),
+        };
+    }
+    match (
+        value,
+        data_mode.is_graded(),
+        data_mode.is_symmetric_selfplay(),
+    ) {
+        (Some(value), false, true) if value == -1.0 || value == 0.0 || value == 1.0 => Ok(()),
+        (Some(value), false, false) if value == -1.0 || value == 1.0 => Ok(()),
+        (Some(value), true, false) if value.is_finite() && (-1.0..=1.0).contains(&value) => Ok(()),
+        (Some(_), _, _) => Err(ReplayError::InvalidRecord),
+        (None, _, _) => Ok(()),
     }
 }
 

@@ -6,15 +6,47 @@ use gz_engine::{EngineResult, GraphEngine};
 use gz_eval::{EvalOutput, EvalRequest};
 use gz_features::{FeatureExtractor, FeatureRow, PositionFeatures};
 use gz_search::{
-    CategoricalPolicyEpisodeTask, EngineIdentity, EvalModel, GumbelEpisode, GumbelEpisodeTask,
-    GumbelHandleBatch, GumbelMcts, SampledTreeEpisodeTask, SearchPoll, SearchWork,
-    SearchWorkResult, WorkToken,
+    EngineIdentity, EvalModel, GumbelEpisode, GumbelEpisodeTask, GumbelMcts, PolicyRollout,
+    PolicyRolloutContext, PolicyRolloutEpisode, PolicyRolloutEpisodeTask, SampledTreeEpisodeTask,
+    SearchHandleBatch, SearchPoll, SearchWork, SearchWorkResult, SymmetricEpisode,
+    SymmetricSelfplayEpisodeTask, WorkToken,
 };
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 
 pub(crate) struct WorkerPool<G, C> {
     slots: Vec<Slot<G, C>>,
+}
+
+pub(crate) struct CompletedTask<G, C> {
+    pub worker_id: WorkerId,
+    pub episode_id: EpisodeId,
+    pub evaluations: u64,
+    pub episode: CompletedSearchEpisode<G, C>,
+}
+
+pub(crate) enum CompletedSearchEpisode<G, C> {
+    Gumbel(GumbelEpisode<G, C>),
+    PolicyRollout(PolicyRolloutEpisode<G, C>),
+    Symmetric(Box<SymmetricEpisode<G, C>>),
+}
+
+type EpisodePoll<G, C> = SearchPoll<G, C, Box<CompletedSearchEpisode<G, C>>>;
+
+impl<G, C> CompletedTask<G, C> {
+    pub(crate) fn into_gumbel(self) -> EngineResult<OrchestratedEpisode<G, C>> {
+        let CompletedSearchEpisode::Gumbel(episode) = self.episode else {
+            return Err(internal(
+                "policy rollout completed outside sampled-trajectory mode",
+            ));
+        };
+        Ok(OrchestratedEpisode {
+            worker_id: self.worker_id,
+            episode_id: self.episode_id,
+            evaluations: self.evaluations,
+            episode,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +66,7 @@ pub(crate) struct Admission<'a> {
     pub identity: EngineIdentity,
     pub context: gz_search::GumbelEpisodeContext,
     pub sampled_tree: bool,
+    pub symmetric_selfplay: bool,
     pub pressure_reserved: bool,
     pub next_episode_id: &'a mut u64,
 }
@@ -62,13 +95,17 @@ enum SlotState<G, C> {
     Running(ActiveEpisode<G, C>),
     Parked {
         episode: ActiveEpisode<G, C>,
-        token: WorkToken,
-        request: EvalRequest,
-        row: Option<FeatureRow>,
-        action_count: u32,
-        model: EvalModel,
-        sent: bool,
+        evals: Vec<ParkedEvalState>,
     },
+}
+
+struct ParkedEvalState {
+    token: WorkToken,
+    request: Option<EvalRequest>,
+    row: Option<FeatureRow>,
+    action_count: u32,
+    model: EvalModel,
+    sent: bool,
 }
 
 impl<G, C> SlotState<G, C> {
@@ -86,20 +123,10 @@ impl<G, C> SlotState<G, C> {
         }
     }
 
-    fn take_parked(&mut self) -> Option<ActiveEpisode<G, C>> {
-        match self.take() {
-            Self::Parked { episode, .. } => Some(episode),
-            other => {
-                *self = other;
-                None
-            }
-        }
-    }
-
-    fn parked_token(&self) -> Option<WorkToken> {
+    fn has_parked_token(&self, token: WorkToken) -> bool {
         match self {
-            Self::Parked { token, .. } => Some(*token),
-            _ => None,
+            Self::Parked { evals, .. } => evals.iter().any(|eval| eval.token == token),
+            _ => false,
         }
     }
 }
@@ -193,7 +220,15 @@ where
                     ..admission.context
                 },
             )?;
-            let mut task = if admission.sampled_tree {
+            let mut task = if admission.symmetric_selfplay {
+                EpisodeTask::Symmetric(SymmetricSelfplayEpisodeTask::with_wave_batching(
+                    admission.search,
+                    admission.identity,
+                    root,
+                    context,
+                    admission.search.symmetric_wave_batching(),
+                ))
+            } else if admission.sampled_tree {
                 EpisodeTask::SampledTree(SampledTreeEpisodeTask::new(
                     admission.search,
                     admission.identity,
@@ -263,12 +298,12 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn admit_direct_categorical(
+    pub(crate) fn admit_direct_policy_rollout(
         &mut self,
-        search: &GumbelMcts,
+        search: &PolicyRollout,
         identity: EngineIdentity,
         root: G,
-        context: gz_search::GumbelEpisodeContext,
+        context: PolicyRolloutContext,
         episode_id: EpisodeId,
         owned_root: bool,
         pressure_reserved: bool,
@@ -277,7 +312,7 @@ where
             if !matches!(slot.state, SlotState::Idle) {
                 continue;
             }
-            let mut task = EpisodeTask::Categorical(CategoricalPolicyEpisodeTask::new(
+            let mut task = EpisodeTask::PolicyRollout(PolicyRolloutEpisodeTask::new(
                 search, identity, root, context,
             ));
             if owned_root {
@@ -300,7 +335,7 @@ where
         blocked_message: &'static str,
         mut extractor: Option<&mut dyn FeatureExtractor<E>>,
         mut decorate_row: F,
-    ) -> EngineResult<Vec<OrchestratedEpisode<G, C>>>
+    ) -> EngineResult<Vec<CompletedTask<G, C>>>
     where
         E: GraphEngine<Graph = G, Candidate = C>,
         F: FnMut(EpisodeId, u32, &mut FeatureRow),
@@ -308,7 +343,11 @@ where
         let mut completed = Vec::new();
 
         for slot in &mut self.slots {
-            while let Some(mut episode) = slot.state.take_running() {
+            let Some(mut episode) = slot.state.take_running() else {
+                continue;
+            };
+            let mut parked_evals = Vec::new();
+            loop {
                 let poll = match episode.task.poll() {
                     Ok(poll) => poll,
                     Err(error) => {
@@ -334,7 +373,6 @@ where
                                 return Err(error);
                             }
                             release_task_releasable(engine, &mut episode.task)?;
-                            slot.state = SlotState::Running(episode);
                             continue;
                         }
 
@@ -425,27 +463,38 @@ where
                             }
                             None => None,
                         };
-                        slot.state = SlotState::Parked {
-                            episode,
+                        parked_evals.push(ParkedEvalState {
                             token,
-                            request: work.request,
+                            request: Some(work.request),
                             row,
                             action_count,
                             model: work.model,
                             sent: false,
-                        };
+                        });
                     }
                     SearchPoll::Blocked => {
-                        release_task_all(engine, &mut episode.task)?;
-                        return Err(internal(blocked_message));
+                        if parked_evals.is_empty() {
+                            release_task_all(engine, &mut episode.task)?;
+                            return Err(internal(blocked_message));
+                        }
+                        slot.state = SlotState::Parked {
+                            episode,
+                            evals: parked_evals,
+                        };
+                        break;
                     }
                     SearchPoll::Done(result) => {
-                        completed.push(OrchestratedEpisode {
+                        if !parked_evals.is_empty() {
+                            release_task_all(engine, &mut episode.task)?;
+                            return Err(internal("search completed with pending evaluations"));
+                        }
+                        completed.push(CompletedTask {
                             worker_id: slot.worker_id,
                             episode_id: episode.episode_id,
                             evaluations: episode.evaluations,
-                            episode: result,
+                            episode: *result,
                         });
+                        break;
                     }
                 }
             }
@@ -455,63 +504,59 @@ where
     }
 
     pub(crate) fn parked(&self) -> Vec<ParkedEval> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| match &slot.state {
-                SlotState::Parked {
-                    episode,
-                    token,
-                    request,
-                    row,
-                    action_count,
-                    model,
-                    ..
-                } => Some(ParkedEval {
+        let mut parked = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let SlotState::Parked { episode, evals } = &slot.state else {
+                continue;
+            };
+            let mut pressure_reserved = episode.pressure_reserved;
+            for eval in evals {
+                let Some(request) = &eval.request else {
+                    continue;
+                };
+                parked.push(ParkedEval {
                     episode_id: episode.episode_id,
                     slot: index,
-                    token: *token,
+                    token: eval.token,
                     request: request.clone(),
-                    row: row.clone(),
-                    action_count: *action_count,
-                    model: *model,
-                    pressure_reserved: episode.pressure_reserved,
-                }),
-                _ => None,
-            })
-            .collect()
+                    row: eval.row.clone(),
+                    action_count: eval.action_count,
+                    model: eval.model,
+                    pressure_reserved,
+                });
+                pressure_reserved = false;
+            }
+        }
+        parked
     }
 
     pub(crate) fn take_unsent_parked(&mut self) -> Vec<ParkedEval> {
-        self.slots
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, slot)| match &mut slot.state {
-                SlotState::Parked {
-                    episode,
-                    token,
+        let mut parked = Vec::new();
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            let SlotState::Parked { episode, evals } = &mut slot.state else {
+                continue;
+            };
+            let mut pressure_reserved = episode.pressure_reserved;
+            for eval in evals.iter_mut().filter(|eval| !eval.sent) {
+                eval.sent = true;
+                let request = eval
+                    .request
+                    .take()
+                    .expect("unsent parked eval retains its request");
+                parked.push(ParkedEval {
+                    episode_id: episode.episode_id,
+                    slot: index,
+                    token: eval.token,
                     request,
-                    row,
-                    action_count,
-                    model,
-                    sent,
-                    ..
-                } if !*sent => {
-                    *sent = true;
-                    Some(ParkedEval {
-                        episode_id: episode.episode_id,
-                        slot: index,
-                        token: *token,
-                        request: request.clone(),
-                        row: row.clone(),
-                        action_count: *action_count,
-                        model: *model,
-                        pressure_reserved: episode.pressure_reserved,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
+                    row: eval.row.take(),
+                    action_count: eval.action_count,
+                    model: eval.model,
+                    pressure_reserved,
+                });
+                pressure_reserved = false;
+            }
+        }
+        parked
     }
 
     pub(crate) fn resume<E>(
@@ -529,23 +574,29 @@ where
             .get_mut(slot_index)
             .ok_or_else(|| internal("unknown work token"))?;
 
-        let Some(expected) = slot.state.parked_token() else {
+        if !slot.state.has_parked_token(token) {
             return Err(internal("resume without pending work"));
-        };
-        if expected != token {
-            return Err(internal("unknown work token"));
         }
-
-        let mut episode = slot
-            .state
-            .take_parked()
-            .expect("token check ensures the slot is parked");
+        let SlotState::Parked { episode, evals } = &mut slot.state else {
+            unreachable!("token check ensures the slot is parked");
+        };
+        let index = evals
+            .iter()
+            .position(|eval| eval.token == token)
+            .expect("token check ensures the eval exists");
+        evals.swap_remove(index);
         if let Err(error) = episode.task.resume(token, SearchWorkResult::Eval(output)) {
             release_task_all(engine, &mut episode.task)?;
+            slot.state = SlotState::Idle;
             return Err(error);
         }
         release_task_releasable(engine, &mut episode.task)?;
-        slot.state = SlotState::Running(episode);
+        if evals.is_empty() {
+            let SlotState::Parked { episode, .. } = slot.state.take() else {
+                unreachable!("slot remains parked until its final eval reply");
+            };
+            slot.state = SlotState::Running(episode);
+        }
         Ok(())
     }
 
@@ -558,15 +609,10 @@ where
             .slots
             .get_mut(slot_index)
             .ok_or_else(|| internal("unknown pressure reservation slot"))?;
-        let SlotState::Parked {
-            episode,
-            token: expected,
-            ..
-        } = &mut slot.state
-        else {
+        let SlotState::Parked { episode, evals, .. } = &mut slot.state else {
             return Err(internal("pressure reservation without pending work"));
         };
-        if *expected != token {
+        if !evals.iter().any(|eval| eval.token == token) {
             return Err(internal("pressure reservation token mismatch"));
         }
         episode.pressure_reserved = false;
@@ -624,8 +670,9 @@ where
 #[allow(clippy::large_enum_variant)]
 enum EpisodeTask<G, C> {
     Gumbel(GumbelEpisodeTask<G, C>),
-    Categorical(CategoricalPolicyEpisodeTask<G, C>),
+    PolicyRollout(PolicyRolloutEpisodeTask<G, C>),
     SampledTree(SampledTreeEpisodeTask<G, C>),
+    Symmetric(SymmetricSelfplayEpisodeTask<G, C>),
 }
 
 impl<G, C> EpisodeTask<G, C>
@@ -633,58 +680,72 @@ where
     G: Copy + Eq + Hash,
     C: Copy + Eq + Hash,
 {
-    fn poll(&mut self) -> EngineResult<SearchPoll<G, C, GumbelEpisode<G, C>>> {
-        match self {
-            Self::Gumbel(task) => task.poll(),
-            Self::Categorical(task) => task.poll(),
-            Self::SampledTree(task) => task.poll(),
-        }
+    fn poll(&mut self) -> EngineResult<EpisodePoll<G, C>> {
+        Ok(match self {
+            Self::Gumbel(task) => task
+                .poll()?
+                .map_done(|episode| Box::new(CompletedSearchEpisode::Gumbel(episode))),
+            Self::PolicyRollout(task) => task
+                .poll()?
+                .map_done(|episode| Box::new(CompletedSearchEpisode::PolicyRollout(episode))),
+            Self::SampledTree(task) => task
+                .poll()?
+                .map_done(|episode| Box::new(CompletedSearchEpisode::Gumbel(episode))),
+            Self::Symmetric(task) => task
+                .poll()?
+                .map_done(|episode| Box::new(CompletedSearchEpisode::Symmetric(Box::new(episode)))),
+        })
     }
 
     fn resume(&mut self, token: WorkToken, result: SearchWorkResult<G, C>) -> EngineResult<()> {
         match self {
             Self::Gumbel(task) => task.resume(token, result),
-            Self::Categorical(task) => task.resume(token, result),
+            Self::PolicyRollout(task) => task.resume(token, result),
             Self::SampledTree(task) => task.resume(token, result),
+            Self::Symmetric(task) => task.resume(token, result),
         }
     }
 
     fn step_index(&self) -> usize {
         match self {
             Self::Gumbel(task) => task.step_index(),
-            Self::Categorical(task) => task.step_index(),
+            Self::PolicyRollout(task) => task.step_index(),
             Self::SampledTree(task) => task.step_index(),
+            Self::Symmetric(task) => task.step_index(),
         }
     }
 
-    fn take_releasable(&mut self) -> GumbelHandleBatch<G, C> {
+    fn take_releasable(&mut self) -> SearchHandleBatch<G, C> {
         match self {
             Self::Gumbel(task) => task.take_releasable(),
-            Self::Categorical(task) => task.take_releasable(),
+            Self::PolicyRollout(task) => task.take_releasable(),
             Self::SampledTree(task) => task.take_releasable(),
+            Self::Symmetric(task) => task.take_releasable(),
         }
     }
 
     fn track_owned_root(&mut self) {
         match self {
             Self::Gumbel(task) => task.track_owned_root(),
-            Self::Categorical(task) => task.track_owned_root(),
+            Self::PolicyRollout(task) => task.track_owned_root(),
             Self::SampledTree(task) => task.track_owned_root(),
+            Self::Symmetric(task) => task.track_owned_root(),
         }
     }
 
-    fn take_all_handles(&mut self) -> GumbelHandleBatch<G, C> {
+    fn take_all_handles(&mut self) -> SearchHandleBatch<G, C> {
         match self {
             Self::Gumbel(task) => task.take_all_handles(),
-            Self::Categorical(task) => task.take_all_handles(),
+            Self::PolicyRollout(task) => task.take_all_handles(),
             Self::SampledTree(task) => task.take_all_handles(),
+            Self::Symmetric(task) => task.take_all_handles(),
         }
     }
 }
 
 fn release_handles<E>(
     engine: &mut E,
-    handles: GumbelHandleBatch<E::Graph, E::Candidate>,
+    handles: SearchHandleBatch<E::Graph, E::Candidate>,
 ) -> EngineResult<()>
 where
     E: GraphEngine,

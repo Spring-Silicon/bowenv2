@@ -19,6 +19,8 @@ class _Layout:
     policy: int
     value: int
     value_valid: int
+    horizon_value: int
+    horizon_value_valid: int
     reward: int
     total_len: int
 
@@ -31,6 +33,8 @@ class TargetsView:
     policy: np.ndarray
     value: np.ndarray
     value_valid: np.ndarray
+    horizon_value: np.ndarray
+    horizon_value_valid: np.ndarray
     reward: np.ndarray
 
     @classmethod
@@ -62,6 +66,12 @@ class TargetsView:
             policy=_array(view, layout.policy, "<f4", (capacity, max_actions)),
             value=_array(view, layout.value, "<f4", (capacity,)),
             value_valid=_array(view, layout.value_valid, "u1", (capacity,)),
+            horizon_value=_array(
+                view, layout.horizon_value, "<f4", (capacity, 2)
+            ),
+            horizon_value_valid=_array(
+                view, layout.horizon_value_valid, "u1", (capacity,)
+            ),
             reward=_array(view, layout.reward, "<f4", (capacity,)),
         )
 
@@ -71,6 +81,8 @@ def _layout(capacity: int, max_actions: int) -> _Layout:
     policy, cursor = _section(cursor, capacity * max_actions * 4)
     value, cursor = _section(cursor, capacity * 4)
     value_valid, cursor = _section(cursor, capacity)
+    horizon_value, cursor = _section(cursor, capacity * 2 * 4)
+    horizon_value_valid, cursor = _section(cursor, capacity)
     reward, cursor = _section(cursor, capacity * 4)
     return _Layout(
         b=capacity,
@@ -78,6 +90,8 @@ def _layout(capacity: int, max_actions: int) -> _Layout:
         policy=policy,
         value=value,
         value_valid=value_valid,
+        horizon_value=horizon_value,
+        horizon_value_valid=horizon_value_valid,
         reward=reward,
         total_len=_align4(cursor),
     )

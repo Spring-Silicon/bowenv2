@@ -1,7 +1,8 @@
 use crate::{
     BackendOutputs, FRAME_ERROR, FRAME_EVAL, FRAME_EVAL_RESULT, FRAME_HELLO, FRAME_HELLO_ACK,
-    FRAME_PING, FRAME_PONG, FeatureEvalBackend, Hello, HelloAck, PROTOCOL_VERSION, PendingBatch,
-    ServiceError, ServiceResult, decode_error, read_frame, write_frame,
+    FRAME_MODEL_RELEASE, FRAME_PING, FRAME_PONG, FeatureEvalBackend, Hello, HelloAck,
+    ModelGeneration, PROTOCOL_VERSION, PendingBatch, ServiceError, ServiceResult, decode_error,
+    read_frame, write_frame,
 };
 use gz_engine::ModelVersion;
 use gz_features::{decode_outputs, validate_batch_action_counts};
@@ -154,7 +155,7 @@ pub struct ProcessBackend {
     write_buf: Vec<u8>,
     batch_id: u64,
     batch_capacity: NonZeroUsize,
-    model_version: ModelVersion,
+    model_generation: ModelGeneration,
 }
 
 impl ProcessBackend {
@@ -184,13 +185,19 @@ impl ProcessBackend {
                 if ack.protocol_version != PROTOCOL_VERSION {
                     return Err(ServiceError::handshake("protocol version mismatch"));
                 }
+                if ack.model_generation == 0 {
+                    return Err(ServiceError::handshake("zero model generation"));
+                }
                 Ok(Self {
                     stream,
                     read_buf,
                     write_buf,
                     batch_id: 0,
                     batch_capacity,
-                    model_version: ack.model_version,
+                    model_generation: ModelGeneration {
+                        id: ack.model_generation,
+                        version: ack.model_version,
+                    },
                 })
             }
             FRAME_ERROR => {
@@ -230,11 +237,15 @@ impl ProcessBackend {
     }
 
     pub fn model_version(&self) -> ModelVersion {
-        self.model_version
+        self.model_generation.version
     }
 }
 
 impl FeatureEvalBackend for ProcessBackend {
+    fn model_generation(&self) -> ModelGeneration {
+        self.model_generation
+    }
+
     fn batch_capacity(&self) -> Option<NonZeroUsize> {
         Some(self.batch_capacity)
     }
@@ -244,7 +255,7 @@ impl FeatureEvalBackend for ProcessBackend {
     }
 
     fn eval(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<BackendOutputs> {
-        let pending = self.submit(batch_bytes, action_counts)?;
+        let pending = self.submit_for_model(self.model_generation, batch_bytes, action_counts)?;
         self.receive(pending)
     }
 
@@ -253,6 +264,15 @@ impl FeatureEvalBackend for ProcessBackend {
     /// stream is FIFO, so one submitted batch may be outstanding while
     /// its predecessor's result is read.
     fn submit(&mut self, batch_bytes: &[u8], action_counts: &[u32]) -> ServiceResult<PendingBatch> {
+        self.submit_for_model(self.model_generation, batch_bytes, action_counts)
+    }
+
+    fn submit_for_model(
+        &mut self,
+        model: ModelGeneration,
+        batch_bytes: &[u8],
+        action_counts: &[u32],
+    ) -> ServiceResult<PendingBatch> {
         validate_batch_action_counts(batch_bytes, action_counts)
             .map_err(|error| ServiceError::protocol(error.to_string()))?;
 
@@ -263,27 +283,47 @@ impl FeatureEvalBackend for ProcessBackend {
             &mut self.stream,
             &mut self.write_buf,
             FRAME_EVAL,
-            &[&batch_id_bytes, batch_bytes],
+            &[&batch_id_bytes, model.version.as_bytes(), batch_bytes],
         )?;
 
         Ok(PendingBatch::InFlight {
             batch_id,
             action_counts: action_counts.to_vec(),
+            model,
         })
     }
 
+    fn release_model_generation(&mut self, model: ModelGeneration) -> ServiceResult<()> {
+        if model == self.model_generation {
+            return Err(ServiceError::protocol(
+                "cannot release the active model generation",
+            ));
+        }
+        write_frame(
+            &mut self.stream,
+            &mut self.write_buf,
+            FRAME_MODEL_RELEASE,
+            &[&model.id.to_le_bytes(), model.version.as_bytes()],
+        )
+    }
+
     fn receive(&mut self, pending: PendingBatch) -> ServiceResult<BackendOutputs> {
-        let (batch_id, action_counts) = match pending {
+        let (batch_id, action_counts, model) = match pending {
             PendingBatch::Ready(outputs) => return Ok(outputs),
             PendingBatch::InFlight {
                 batch_id,
                 action_counts,
-            } => (batch_id, action_counts),
+                model,
+            } => (batch_id, action_counts, model),
         };
 
         let (frame_type, payload) = read_frame(&mut self.stream, &mut self.read_buf)?;
         match frame_type {
-            FRAME_EVAL_RESULT => decode_eval_result(payload, batch_id, &action_counts),
+            FRAME_EVAL_RESULT => {
+                let outputs = decode_eval_result(payload, batch_id, model, &action_counts)?;
+                self.model_generation = outputs.active_generation;
+                Ok(outputs)
+            }
             FRAME_ERROR => Err(error_payload(payload)),
             _ => Err(ServiceError::protocol("expected EVAL_RESULT")),
         }
@@ -293,9 +333,10 @@ impl FeatureEvalBackend for ProcessBackend {
 fn decode_eval_result(
     payload: &[u8],
     expected_batch_id: u64,
+    expected_model: ModelGeneration,
     action_counts: &[u32],
 ) -> ServiceResult<BackendOutputs> {
-    if payload.len() < 24 {
+    if payload.len() < 48 {
         return Err(ServiceError::protocol("EVAL_RESULT frame truncated"));
     }
     let batch_id = u64::from_le_bytes(payload[0..8].try_into().expect("slice checked"));
@@ -304,10 +345,21 @@ fn decode_eval_result(
     }
 
     let model_version = ModelVersion::from_bytes(payload[8..24].try_into().expect("slice checked"));
-    let rows = decode_outputs(&payload[24..], action_counts)
+    if model_version != expected_model.version {
+        return Err(ServiceError::protocol("model version mismatch"));
+    }
+    let active_generation = ModelGeneration {
+        id: u64::from_le_bytes(payload[24..32].try_into().expect("slice checked")),
+        version: ModelVersion::from_bytes(payload[32..48].try_into().expect("slice checked")),
+    };
+    if active_generation.id == 0 {
+        return Err(ServiceError::protocol("zero model generation"));
+    }
+    let rows = decode_outputs(&payload[48..], action_counts)
         .map_err(|error| ServiceError::protocol(error.to_string()))?;
     Ok(BackendOutputs {
         model_version,
+        active_generation,
         rows,
     })
 }

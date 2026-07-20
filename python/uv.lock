@@ -104,7 +104,7 @@ torch = [
 requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "safetensors", marker = "extra == 'torch'" },
-    { name = "torch", marker = "extra == 'torch'", specifier = ">=2.7" },
+    { name = "torch", marker = "extra == 'torch'", specifier = ">=2.9" },
 ]
 provides-extras = ["torch"]
 

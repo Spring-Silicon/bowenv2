@@ -25,7 +25,7 @@ pub(crate) trait MctsStrategy<G, C>: MctsStrategyState {
 
     fn select_nonroot(
         &self,
-        state: &Self::RootState,
+        state: &mut Self::RootState,
         tree: &MctsTree<G, C>,
         node_index: usize,
     ) -> usize;

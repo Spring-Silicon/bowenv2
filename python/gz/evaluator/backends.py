@@ -13,9 +13,11 @@ from gz.common.tags import ModelVersion
 from gz.model import build
 from gz.model.exphormer import ArchConfig, BatchStager, build_pair_serving_models
 from gz.model.stub import STUB_MODEL_VERSION, stub
-from gz.proto import ERROR_CAPACITY, ERROR_SCHEMA, Hello, ProtocolError
+from gz.proto import ERROR_CAPACITY, ERROR_PROTOCOL, ERROR_SCHEMA, Hello, ProtocolError
 
 WARMUP_RUNS = 3
+INITIAL_MODEL_GENERATION = 1
+MAX_RESIDENT_MODEL_GENERATIONS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +101,17 @@ class StubBackend:
     def apply_pending_swap(self) -> None:
         return None
 
-    def eval(self, view: BatchView) -> EvalResult:
+    def model_generation(self) -> tuple[int, ModelVersion]:
+        return INITIAL_MODEL_GENERATION, STUB_MODEL_VERSION
+
+    def release_model_generation(self, generation: int, version: ModelVersion) -> None:
+        if generation != INITIAL_MODEL_GENERATION or version != STUB_MODEL_VERSION:
+            raise ProtocolError(ERROR_PROTOCOL, "unknown model generation")
+        raise ProtocolError(ERROR_PROTOCOL, "cannot release the active model generation")
+
+    def eval(self, view: BatchView, model_version: ModelVersion | None = None) -> EvalResult:
+        if model_version is not None and model_version != STUB_MODEL_VERSION:
+            raise ProtocolError(ERROR_PROTOCOL, "requested model version is unavailable")
         if (
             self._encoder is None
             or self._encoder.capacity != view.batch_capacity
@@ -120,9 +132,14 @@ class StubBackend:
     # The stub computes eagerly at stage; the payload is copied because the
     # encoder buffer would otherwise be clobbered by the next stage before
     # the pipelined server writes this reply.
-    def stage(self, view: BatchView) -> EvalResult:
-        result = self.eval(view)
-        return EvalResult(model_version=result.model_version, payload=memoryview(bytes(result.payload)))
+    def stage(
+        self, view: BatchView, model_version: ModelVersion | None = None
+    ) -> EvalResult:
+        result = self.eval(view, model_version)
+        return EvalResult(
+            model_version=result.model_version,
+            payload=memoryview(bytes(result.payload)),
+        )
 
     def launch(self, staged: EvalResult) -> EvalResult:
         return staged
@@ -145,10 +162,12 @@ class _ServingSlot:
     opponent_runner: object = None
     opponent_dim: int = 0
     policy_only: bool = False
+    raw_opponent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class StagedEval:
+    serving: _ServingSlot
     tensors: object
     ready_event: object
     row_count: int
@@ -196,6 +215,8 @@ class TorchBackend:
         max_batch: int = 1024,
         poll_interval: float = 10.0,
         policy_only: bool = False,
+        required_state_input: str | None = None,
+        required_value_input: str | None = None,
     ) -> None:
         torch = _torch()
         self.source = DirectorySource(source) if isinstance(source, (str, Path)) else source
@@ -205,8 +226,18 @@ class TorchBackend:
         self.max_batch = max_batch
         self.poll_interval = poll_interval
         self.policy_only = policy_only
+        self.required_state_input = required_state_input
+        self.required_value_input = required_value_input
         self.resolved = self.source.resolve_latest()
         self._active = self._build_slot(self.resolved)
+        self._active_generation = INITIAL_MODEL_GENERATION
+        self._next_generation = INITIAL_MODEL_GENERATION + 1
+        self._slots_by_version: dict[str, tuple[int, _ServingSlot]] = {
+            self._active.model_version.hex(): (self._active_generation, self._active)
+        }
+        self._versions_by_generation: dict[int, str] = {
+            self._active_generation: self._active.model_version.hex()
+        }
         self.manifest = self._active.manifest
         self.stager: BatchStager | None = None
         self._stagers: tuple[BatchStager, ...] = ()
@@ -217,6 +248,9 @@ class TorchBackend:
         self._encoder: OutputEncoder | None = None
         self._pending: _ServingSlot | None = None
         self._pending_lock = threading.Lock()
+        self._resident_versions = {self._active.model_version.hex()}
+        self._loading_version: str | None = None
+        self._adopting_version: str | None = None
         self._logged_rejections: set[str] = set()
         self._loader_started = False
         self._stop_polling = threading.Event()
@@ -278,6 +312,7 @@ class TorchBackend:
         with self._pending_lock:
             pending = self._pending
             self._pending = None
+            self._adopting_version = None if pending is None else pending.model_version.hex()
         if pending is None:
             return
         import time as _time
@@ -291,10 +326,21 @@ class TorchBackend:
             # pauses serving for its duration while workers park.
             self._warm_slot(pending, self.stager, WARMUP_RUNS)
         except Exception as error:
+            with self._pending_lock:
+                self._adopting_version = None
             self._log_rejection(pending.model_version.hex(), pending.model_version, error)
             return
+        generation = self._next_generation
+        self._next_generation += 1
         self._active = pending
+        self._active_generation = generation
+        version_key = pending.model_version.hex()
+        self._slots_by_version[version_key] = (generation, pending)
+        self._versions_by_generation[generation] = version_key
         self.manifest = pending.manifest
+        with self._pending_lock:
+            self._resident_versions.add(version_key)
+            self._adopting_version = None
         self._clear_opponent_cache()
         torch = _torch()
         allocated = (
@@ -302,6 +348,7 @@ class TorchBackend:
         )
         print(
             f"event=checkpoint_swapped model_version={pending.model_version.hex()}"
+            f" generation={generation}"
             f" warm_s={_time.perf_counter() - warm_started:.2f}"
             f" gpu_alloc_mb={allocated / 1e6:.0f}",
             file=sys.stderr,
@@ -311,10 +358,30 @@ class TorchBackend:
     def stop_polling(self) -> None:
         self._stop_polling.set()
 
-    def eval(self, view: BatchView) -> EvalResult:
-        return self.finish(self.launch(self.stage(view)))
+    def model_generation(self) -> tuple[int, ModelVersion]:
+        return self._active_generation, self._active.model_version
 
-    def stage(self, view: BatchView) -> StagedEval:
+    def release_model_generation(self, generation: int, version: ModelVersion) -> None:
+        if generation == self._active_generation:
+            raise ProtocolError(ERROR_PROTOCOL, "cannot release the active model generation")
+        version_key = version.hex()
+        if self._versions_by_generation.get(generation) != version_key:
+            raise ProtocolError(ERROR_PROTOCOL, "unknown model generation")
+        stored = self._slots_by_version.get(version_key)
+        if stored is None or stored[0] != generation:
+            raise ProtocolError(ERROR_PROTOCOL, "model generation mismatch")
+        del self._versions_by_generation[generation]
+        del self._slots_by_version[version_key]
+        with self._pending_lock:
+            self._resident_versions.discard(version_key)
+        self._clear_opponent_cache()
+
+    def eval(self, view: BatchView, model_version: ModelVersion | None = None) -> EvalResult:
+        return self.finish(self.launch(self.stage(view, model_version)))
+
+    def stage(
+        self, view: BatchView, model_version: ModelVersion | None = None
+    ) -> StagedEval:
         if self.stager is None:
             raise RuntimeError("torch backend used before handshake")
         if (
@@ -326,7 +393,7 @@ class TorchBackend:
         started = time.perf_counter()
         stager = self._stagers[self._stage_index]
         self._stage_index = (self._stage_index + 1) % len(self._stagers)
-        active = self._active
+        active = self._serving_slot(model_version)
         opponent_cached = self._opponent_rows_cached(
             active,
             view.opponent_trajectory_id[: view.row_count],
@@ -335,13 +402,15 @@ class TorchBackend:
         )
         tensors = stager.copy(
             view,
-            copy_opponent=active.opponent_runner is not None and not opponent_cached,
+            copy_opponent=active.raw_opponent
+            or (active.opponent_runner is not None and not opponent_cached),
         )
         action_counts = view.action_count[: view.row_count].copy()
         self._timings.record_stage(time.perf_counter() - started)
         # The encoder rides with the batch: finish() runs after the NEXT
         # batch was staged, which may have re-keyed self._encoder.
         return StagedEval(
+            serving=active,
             tensors=tensors,
             ready_event=stager.ready_event,
             row_count=view.row_count,
@@ -354,7 +423,7 @@ class TorchBackend:
         )
 
     def launch(self, staged: StagedEval) -> PendingEval:
-        active = self._active
+        active = staged.serving
         started = time.perf_counter()
         self._wait_for_stage(staged.ready_event)
         if active.policy_only:
@@ -463,6 +532,14 @@ class TorchBackend:
         torch = _torch()
         return torch.tanh(value_raw)
 
+    def _serving_slot(self, model_version: ModelVersion | None) -> _ServingSlot:
+        if model_version is None:
+            return self._active
+        stored = self._slots_by_version.get(model_version.hex())
+        if stored is None:
+            raise ProtocolError(ERROR_PROTOCOL, "requested model version is unavailable")
+        return stored[1]
+
     def _wait_for_stage(self, ready_event: object) -> None:
         if ready_event is None:
             return
@@ -567,27 +644,54 @@ class TorchBackend:
     def _poll_once(self) -> None:
         resolved = self.source.resolve_latest()
         version = resolved.manifest.model_version
-        if version.hex() in self._logged_rejections:
+        version_key = version.hex()
+        if version_key in self._logged_rejections:
             return
         with self._pending_lock:
             pending_version = self._pending.model_version if self._pending is not None else None
-        if version == self._active.model_version or version == pending_version:
-            return
+            occupied = (
+                len(self._resident_versions)
+                + int(self._pending is not None)
+                + int(self._loading_version is not None)
+                + int(self._adopting_version is not None)
+            )
+            if (
+                version_key in self._resident_versions
+                or version == pending_version
+                or version_key == self._loading_version
+                or version_key == self._adopting_version
+                or occupied >= MAX_RESIDENT_MODEL_GENERATIONS
+            ):
+                return
+            self._loading_version = version_key
         if resolved.manifest.feature_schema_hash != self._active.manifest.feature_schema_hash:
+            with self._pending_lock:
+                self._loading_version = None
             self._log_rejection(version.hex(), version, "feature schema hash mismatch")
             return
         try:
             slot = self._build_slot(resolved)
         except Exception as error:
+            with self._pending_lock:
+                self._loading_version = None
             self._log_rejection(version.hex(), version, error)
             return
         with self._pending_lock:
+            self._loading_version = None
             self._pending = slot
 
     def _build_slot(self, resolved: ResolvedCheckpoint) -> _ServingSlot:
         arch = ArchConfig.from_dict(resolved.manifest.arch_config)
         if arch.name != resolved.manifest.arch_name:
             raise ValueError("manifest arch name mismatch")
+        if self.required_state_input is not None and arch.state_input != self.required_state_input:
+            raise ValueError(
+                f"checkpoint state_input must be {self.required_state_input!r}, got {arch.state_input!r}"
+            )
+        if self.required_value_input is not None and arch.value_input != self.required_value_input:
+            raise ValueError(
+                f"checkpoint value_input must be {self.required_value_input!r}, got {arch.value_input!r}"
+            )
         model = build(resolved.manifest.feature_schema, arch)
         from gz.checkpoints.weights import load_state_dict
 
@@ -625,6 +729,7 @@ class TorchBackend:
             opponent_runner=opponent_runner,
             opponent_dim=arch.dim if opponent_runner is not None else 0,
             policy_only=self.policy_only,
+            raw_opponent=arch.state_input == "joint-board",
         )
 
     def _warm_slot(self, slot: _ServingSlot, stager: BatchStager, count: int) -> None:

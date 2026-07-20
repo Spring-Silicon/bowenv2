@@ -1,6 +1,6 @@
 use gz_cli::selfplay::{
-    EvaluatorMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig, ValueReward,
-    init_replay, run as run_selfplay,
+    EvaluatorMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig, TrainingMode,
+    ValueReward, init_replay, run as run_selfplay,
 };
 use gz_cli::serve::{ReplayServeConfig, SAMPLE_PROTOCOL_VERSION, run_one};
 use gz_features::{
@@ -49,6 +49,7 @@ fn replay_serve_returns_feature_batch_and_targets() {
         episodes: 2,
         lanes: 1,
         workers_per_lane: 2,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
@@ -91,6 +92,7 @@ fn replay_serve_returns_feature_batch_and_targets() {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     })
     .unwrap();
     let expected_schema_config = ReplayStore::open(dir.path())
@@ -145,7 +147,17 @@ fn replay_serve_returns_feature_batch_and_targets() {
         u64::from_le_bytes(ack[108..116].try_into().unwrap()),
         summary.rows_produced
     );
-    let schema_config = decode_feature_schema_config(&ack[116..]).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(ack[116..124].try_into().unwrap()),
+        summary.rows_produced
+    );
+    let early_value_accuracy = f32::from_le_bytes(ack[124..128].try_into().unwrap());
+    let late_value_accuracy = f32::from_le_bytes(ack[128..132].try_into().unwrap());
+    assert!(early_value_accuracy == -1.0 || (0.0..=1.0).contains(&early_value_accuracy));
+    assert!(late_value_accuracy == -1.0 || (0.0..=1.0).contains(&late_value_accuracy));
+    assert_eq!(u32::from_le_bytes(ack[132..136].try_into().unwrap()), 0);
+    assert!(ack[136..176].iter().all(|byte| *byte == 0));
+    let schema_config = decode_feature_schema_config(&ack[176..]).unwrap();
     assert_eq!(Some(schema_config), expected_schema_config);
 
     let mut sample = Vec::new();
@@ -171,6 +183,156 @@ fn replay_serve_returns_feature_batch_and_targets() {
         targets.policy.len(),
         (targets.capacity * targets.max_actions) as usize
     );
+
+    drop(stream);
+    server.join().unwrap().unwrap();
+}
+
+#[test]
+fn replay_serve_reports_symmetric_game_metrics() {
+    let dir = TestDir::new();
+    run_selfplay(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 1,
+        lanes: 1,
+        workers_per_lane: 1,
+        training_mode: TrainingMode::SymmetricSelfplay,
+        reference: ReferenceMode::None,
+        reference_ema_decay: 0.0,
+        tree_reuse: false,
+        mask_stop: true,
+        length_tiebreak: true,
+        evaluator: EvaluatorMode::Stub,
+        max_steps: 1,
+        simulations: 2,
+        max_considered: 2,
+        max_batch: 1,
+        ..SelfplayConfig::default()
+    })
+    .unwrap();
+    let expected = ReplayStore::open(dir.path())
+        .unwrap()
+        .symmetric_selfplay_metrics()
+        .unwrap();
+    let socket = dir.path().join("symmetric.sock");
+    let server_config = ReplayServeConfig {
+        replay_dir: dir.path().to_path_buf(),
+        socket: socket.clone(),
+        max_batch: 1,
+    };
+    let server = std::thread::spawn(move || run_one(server_config));
+    let mut stream = connect_retry(&socket);
+
+    let mut hello = Vec::new();
+    hello.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
+    hello.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
+    write_frame(&mut stream, 1, &[&hello]);
+    let (frame_type, ack) = read_frame(&mut stream);
+    assert_eq!(frame_type, 2);
+    assert_eq!(u32::from_le_bytes(ack[132..136].try_into().unwrap()), 1);
+    let expected = [
+        expected.p1_win_rate_ema,
+        expected.p2_win_rate_ema,
+        expected.draw_rate_ema,
+        expected.p1_terminal_cost_ema,
+        expected.p2_terminal_cost_ema,
+        expected.terminal_cost_margin_ema,
+        expected.terminal_cost_best,
+        expected.p1_episode_len_ema,
+        expected.p2_episode_len_ema,
+        expected.episode_len_margin_ema,
+    ];
+    for (index, expected) in expected.into_iter().enumerate() {
+        let offset = 136 + index * 4;
+        let actual = f32::from_le_bytes(ack[offset..offset + 4].try_into().unwrap());
+        assert!((f64::from(actual) - expected).abs() < 1.0e-5);
+    }
+    let schema = decode_feature_schema_config(&ack[176..]).unwrap();
+
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&1u32.to_le_bytes());
+    sample.extend_from_slice(&0u32.to_le_bytes());
+    sample.extend_from_slice(&2u64.to_le_bytes());
+    sample.extend_from_slice(&7u64.to_le_bytes());
+    write_frame(&mut stream, 3, &[&sample]);
+    let (frame_type, result) = read_frame(&mut stream);
+    assert_eq!(frame_type, 4);
+    let gzfb_len = u32::from_le_bytes(result[0..4].try_into().unwrap()) as usize;
+    let targets = TrainingTargetsView::parse(&result[4 + gzfb_len..]).unwrap();
+    assert_eq!(targets.horizon_value_valid[0], 1);
+    assert!(
+        targets.horizon_value[0..2]
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert!(
+        targets.horizon_value[0..2]
+            .iter()
+            .all(|value| (-1.0..=1.0).contains(value))
+    );
+    let terminal_nodes = -targets.reward[0];
+    assert_eq!(terminal_nodes.fract(), 0.0);
+    assert!((0.0..=schema.max_nodes as f32).contains(&terminal_nodes));
+
+    drop(stream);
+    server.join().unwrap().unwrap();
+}
+
+#[test]
+fn replay_serve_returns_single_vanilla_raw_value_target() {
+    let dir = TestDir::new();
+    let summary = run_selfplay(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 1,
+        lanes: 1,
+        workers_per_lane: 1,
+        training_mode: gz_cli::selfplay::TrainingMode::SingleVanilla,
+        reference: ReferenceMode::None,
+        reference_ema_decay: 0.0,
+        tree_reuse: false,
+        max_steps: 2,
+        simulations: 2,
+        max_considered: 2,
+        max_candidates: 255,
+        max_batch: 1,
+        evaluator: EvaluatorMode::Stub,
+        ..SelfplayConfig::default()
+    })
+    .unwrap();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let expected = store
+        .episode(gz_replay::ReplayEpisodeId::new(0))
+        .unwrap()
+        .unwrap()
+        .outcome
+        .value_target
+        .unwrap();
+    assert!(expected.abs() > 1.0);
+    drop(store);
+
+    let socket = dir.path().join("single-vanilla.sock");
+    let server_config = ReplayServeConfig {
+        replay_dir: dir.path().to_path_buf(),
+        socket: socket.clone(),
+        max_batch: 1,
+    };
+    let server = std::thread::spawn(move || run_one(server_config));
+    let mut stream = connect_hello(&socket);
+
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&1u32.to_le_bytes());
+    sample.extend_from_slice(&2u32.to_le_bytes());
+    sample.extend_from_slice(&summary.rows_produced.to_le_bytes());
+    sample.extend_from_slice(&7u64.to_le_bytes());
+    write_frame(&mut stream, 3, &[&sample]);
+    let (frame_type, result) = read_frame(&mut stream);
+    assert_eq!(frame_type, 4);
+    let gzfb_len = u32::from_le_bytes(result[0..4].try_into().unwrap()) as usize;
+    let targets = TrainingTargetsView::parse(&result[4 + gzfb_len..]).unwrap();
+    assert_eq!(targets.value[0], expected);
+    assert_eq!(targets.value_valid[0], 1);
+    assert_eq!(targets.horizon_value_valid[0], 0);
+    assert_eq!(&targets.horizon_value[0..2], &[0.0, 0.0]);
 
     drop(stream);
     server.join().unwrap().unwrap();
@@ -203,7 +365,9 @@ fn replay_serve_acks_initialized_store_before_rows_exist() {
     assert_eq!(u64::from_le_bytes(ack[48..56].try_into().unwrap()), 0);
     assert_eq!(u64::from_le_bytes(ack[56..64].try_into().unwrap()), 0);
     assert_eq!(u64::from_le_bytes(ack[108..116].try_into().unwrap()), 0);
-    let schema_config = decode_feature_schema_config(&ack[116..]).unwrap();
+    assert_eq!(u64::from_le_bytes(ack[116..124].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(ack[132..136].try_into().unwrap()), 0);
+    let schema_config = decode_feature_schema_config(&ack[176..]).unwrap();
     assert_eq!(schema_config.max_actions, 6);
 
     drop(stream);
@@ -218,6 +382,7 @@ fn replay_serve_rejects_featureless_store() {
         episodes: 1,
         lanes: 1,
         workers_per_lane: 1,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
@@ -260,6 +425,7 @@ fn replay_serve_rejects_featureless_store() {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     })
     .unwrap();
 
@@ -412,6 +578,7 @@ fn live_setup(
         export_position: true,
         mask_stop: false,
         no_backtrack: false,
+        value_mode: gz_search::GumbelValueMode::Competitive,
         candidate_options: gz_engine::CandidateOptions {
             max_candidates: Some(255),
             deterministic_order: true,

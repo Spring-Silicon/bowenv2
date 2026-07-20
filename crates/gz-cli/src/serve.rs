@@ -9,7 +9,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const SAMPLE_PROTOCOL_VERSION: u32 = 7;
+pub const SAMPLE_PROTOCOL_VERSION: u32 = 10;
+
+const HELLO_ACK_FIXED_LEN: usize = 176;
 
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const FRAME_HELLO: u8 = 1;
@@ -248,13 +250,17 @@ impl ReplaySampleSession {
         // Unseeded surfaces as -1.0: 0.0 is a legitimate all-loss rate.
         let win_ema = self.store.win_rate_ema().unwrap_or(-1.0);
         let latency_ema = self.store.episode_latency_ema().unwrap_or(-1.0);
+        let (value_sign_early_ema, value_sign_late_ema) = self.store.value_sign_accuracy_emas();
+        let value_sign_early_ema = value_sign_early_ema.unwrap_or(-1.0);
+        let value_sign_late_ema = value_sign_late_ema.unwrap_or(-1.0);
         let best_cost = self.store.best_cost().unwrap_or(0.0);
+        let symmetric = self.store.symmetric_selfplay_metrics();
         let root_info = self
             .store
             .root_info()
             .map_err(|_| (ERROR_ENCODING, "corrupt root info"))?;
         let counters = self.store.counters();
-        let mut payload = Vec::with_capacity(116 + schema_config.len());
+        let mut payload = Vec::with_capacity(HELLO_ACK_FIXED_LEN + schema_config.len());
         payload.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
         payload.extend_from_slice(self.collator.schema().hash().as_bytes());
         payload.extend_from_slice(&(self.max_batch.get() as u32).to_le_bytes());
@@ -279,6 +285,27 @@ impl ReplaySampleSession {
         payload.extend_from_slice(&root.edge_count.to_le_bytes());
         payload.extend_from_slice(&root.candidate_count.to_le_bytes());
         payload.extend_from_slice(&counters.produced_policy_rows.to_le_bytes());
+        payload.extend_from_slice(&counters.produced_value_rows.to_le_bytes());
+        payload.extend_from_slice(&(value_sign_early_ema as f32).to_le_bytes());
+        payload.extend_from_slice(&(value_sign_late_ema as f32).to_le_bytes());
+        payload.extend_from_slice(&u32::from(symmetric.is_some()).to_le_bytes());
+        let symmetric = symmetric.map_or([0.0; 10], |metrics| {
+            [
+                metrics.p1_win_rate_ema,
+                metrics.p2_win_rate_ema,
+                metrics.draw_rate_ema,
+                metrics.p1_terminal_cost_ema,
+                metrics.p2_terminal_cost_ema,
+                metrics.terminal_cost_margin_ema,
+                metrics.terminal_cost_best,
+                metrics.p1_episode_len_ema,
+                metrics.p2_episode_len_ema,
+                metrics.episode_len_margin_ema,
+            ]
+        });
+        for value in symmetric {
+            payload.extend_from_slice(&(value as f32).to_le_bytes());
+        }
         payload.extend_from_slice(&schema_config);
         write_frame(stream, write_buf, FRAME_HELLO_ACK, &[&payload])
             .map_err(|_| (ERROR_PROTOCOL, "failed to write HELLO_ACK"))
@@ -335,6 +362,7 @@ impl ReplaySampleSession {
             targets.push(RowTargets {
                 policy: row.policy_target,
                 value: row.value_target,
+                horizon_value: row.horizon_value_targets,
                 reward,
             });
             feature_rows.push(feature_row);

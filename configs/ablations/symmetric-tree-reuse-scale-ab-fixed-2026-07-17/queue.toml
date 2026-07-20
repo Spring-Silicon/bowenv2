@@ -1,0 +1,25 @@
+[queue]
+name = "symmetric-tree-reuse-scale-ab-fixed-2026-07-17"
+results_dir = "runs/queues/symmetric-tree-reuse-scale-ab-fixed-2026-07-17"
+poll_seconds = 5.0
+min_free_gb = 5.0
+
+[[runs]]
+name = "small-reuse-off"
+config = "00-small-reuse-off.toml"
+timeout_seconds = 21600
+
+[[runs]]
+name = "small-reuse-on"
+config = "01-small-reuse-on.toml"
+timeout_seconds = 21600
+
+[[runs]]
+name = "10m-reuse-off"
+config = "02-10m-reuse-off.toml"
+timeout_seconds = 21600
+
+[[runs]]
+name = "10m-reuse-on"
+config = "03-10m-reuse-on.toml"
+timeout_seconds = 21600

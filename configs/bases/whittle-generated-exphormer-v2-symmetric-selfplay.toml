@@ -1,0 +1,116 @@
+# Generated-root, two-player AlphaZero selfplay. Each game starts both players
+# from the same Whittle root, alternates rewrite turns, and trains one shared
+# joint-board model from both player perspectives. STOP is retained only as the
+# final feature/protocol slot and is excluded from search and policy loss.
+
+[arch]
+name = "gz-graph-v2"
+dim = 128
+layers = 4
+heads = 4
+ffn_dim = 512
+dropout = 0.1
+activation = "gelu"
+aggregation = "attention"
+global_tokens = 1
+state_input = "joint-board"
+trunk = "exphormer"
+sage_layers = 3
+policy_head = "pointer"
+value_input = "single"
+value_activation = "tanh"
+subject_encoding = "mean"
+position_encoding = "remaining_budget"
+action_encoding = "kind_prior"
+profile = "graphzero"
+value_hidden = 0
+
+[trainer]
+optimizer = "adamw"
+lr = 0.0002
+adamw_lr = 0.0002
+lr_schedule = "constant"
+warmup_steps = 0
+min_lr_ratio = 0.0
+batch = 512
+value_batch = 0
+window_rows = 30000
+value_window_rows = 0
+total_steps = 10000
+publish_interval = 8
+checkpoint_retain = 16
+publish_lag_blocks = 0
+value_weight = 1.0
+weight_decay = 0.0001
+ema_decay = 0.0
+grad_clip = 1.0
+min_startup_rows = 1000
+seed = 42
+model_seed = 5
+data_seed = 42
+device = "cuda:1"
+startup_timeout = 600.0
+reconnect_limit = 5
+log_interval = 10
+step_sleep = 0.0
+min_available_gb = 40.0
+prefetch = true
+compile_model = true
+compile_mode = "default"
+matmul_precision = "high"
+max_reuse = 8.0
+reuse_gate_interval = 1
+reuse_gate_episodes = 0
+value_mirror = false
+parallel_value_sampling = true
+resume = false
+init_checkpoint = ""
+init_checkpoint_scope = "all"
+
+[selfplay]
+training_mode = "symmetric-selfplay"
+lanes = 44
+workers_per_lane = 32
+simulations = 48
+max_considered = 8
+gumbel_scale = 1.0
+c_visit = 50.0
+c_scale = 1.0
+gumbel_noise_overlap = 0.5
+tree_reuse = false
+max_steps = 96
+max_candidates = 1023
+reference = "none"
+root_mode = "generated"
+reference_ema_decay = 0.0
+reference_gamma = 0.0
+reference_trajectory_pool = 0
+reference_arena_size = 0
+reference_arena_seed = 910000001
+reference_arena_interval = 0
+max_row_backlog = 1000000
+replay_retain = 48000
+eval_device = "cuda:0"
+eval_poll_interval = 2.0
+seed = 42
+max_batch = 128
+reference_max_batch = 0
+challenger_max_batch = 0
+python_dir = "python"
+position_features = true
+no_backtrack = true
+mask_stop = true
+length_tiebreak = true
+value_reward = "sign"
+eval_processes = 1
+admission_stagger_ms = 0
+admission_smoothing = true
+wave_batching = false
+
+[wandb]
+project = "graphzero"
+run_name = "whittle-generated-exphormer-v2-symmetric-selfplay-base-do-not-run"
+
+[paths]
+run_dir = "runs/whittle-generated-exphormer-v2-symmetric-selfplay-base-do-not-run"
+graphzero_bin = "target/release/graphzero"

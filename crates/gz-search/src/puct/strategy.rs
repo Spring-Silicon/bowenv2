@@ -51,7 +51,7 @@ where
 
     fn select_nonroot(
         &self,
-        _state: &Self::RootState,
+        _state: &mut Self::RootState,
         tree: &MctsTree<G, C>,
         node_index: usize,
     ) -> usize {

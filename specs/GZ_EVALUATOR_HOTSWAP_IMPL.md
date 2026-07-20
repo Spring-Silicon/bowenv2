@@ -72,10 +72,12 @@ adopted capacity for warmup):
     this also fixes the existing single-warm note from the last review),
     then publish (runner, model_version) into a lock-protected slot
 serving loop: between EVAL frames, one cheap slot check; on a pending
-swap, replace the runner and version. In-flight work is unaffected by
-construction (single in-flight; the swap happens strictly between
-batches). EVAL_RESULT already carries model_version per result, so the
-swap is externally observable with zero extra plumbing.
+swap, publish the new runner and version for new episode leases. Retain
+the previous slot while requests target its ModelVersion, and free it on
+MODEL_RELEASE. EVAL_RESULT carries both the served version and the active
+generation, so adoption is externally observable without changing an
+episode's pinned version. At most two generations are resident; polling
+waits for release before loading a third.
 shutdown: the loader thread is a daemon thread; the process exits without
 joining it.
 __main__: --poll-interval; 0 disables polling (static serving, the
@@ -103,11 +105,11 @@ and the primary swap test runs compiled on the GPU.
 All torch tests, on the GPU:
 
 ```text
-swap happens: publish v0, serve on a thread, eval (result carries v0's
-model_version); publish v1 with different weights; with poll_interval
-tiny (0.05s), subsequent evals carry v1's version within a bounded wait;
-outputs differ from v0's for the same batch (weights actually changed);
-no eval errors across the swap
+swap happens: publish v0, serve on a thread, eval targeted at v0; publish
+v1 with different weights; with poll_interval tiny (0.05s), a result
+advertises v1 as active within a bounded wait while still serving a v0
+request from v0; a request targeted at v1 returns different outputs;
+v0 remains targetable until MODEL_RELEASE
 tag mismatch refused: publish a checkpoint under a different schema
 config; evals keep carrying the old version; exactly one stderr line
 (capsys/capfd), serving uninterrupted
@@ -135,8 +137,8 @@ Acceptance checklist:
 ```text
 forward returns raw values; tanh lives in the backend; all four property
 tests and the compile test still pass for both aggregations
-a mid-serving swap is proven by model_version changing in EVAL_RESULTs
-with zero errors
+a mid-serving swap advertises a new active generation while the old version
+remains targetable until release
 rejected checkpoints log once and never interrupt serving
 poll_interval 0 preserves exact current behavior
 ```

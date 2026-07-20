@@ -5,10 +5,12 @@ import struct
 import threading
 from pathlib import Path
 
+import pytest
+
 from gz.codec import FeatureSchemaConfig
 from gz.common import FeatureSchemaHash
 from gz.proto import read_frame, write_frame
-from gz.trainer.sampler import SampleClient, decode_ack, step_seed
+from gz.trainer.sampler import SAMPLE_PROTOCOL_VERSION, SampleClient, decode_ack, step_seed
 from python.tests.test_codec import SCHEMA_HASH, _layout, make_batch
 from python.tests.test_targets import make_targets
 
@@ -34,6 +36,16 @@ def test_sample_client_handshake_and_result_owns_frame(tmp_path: Path) -> None:
         assert ack.feature_schema == schema_config()
         assert ack.feature_schema_hash == FeatureSchemaHash.from_bytes(SCHEMA_HASH)
         assert ack.produced_policy_rows == 2
+        assert ack.produced_value_rows == 2
+        assert ack.value_sign_accuracy_early_ema == 0.75
+        assert ack.value_sign_accuracy_late_ema == 0.25
+        assert ack.symmetric_selfplay is not None
+        assert ack.symmetric_selfplay.p1_win_rate_ema == pytest.approx(0.4)
+        assert ack.symmetric_selfplay.p2_win_rate_ema == pytest.approx(0.35)
+        assert ack.symmetric_selfplay.draw_rate_ema == pytest.approx(0.25)
+        assert ack.symmetric_selfplay.seat_advantage_ema == pytest.approx(0.05)
+        assert ack.symmetric_selfplay.mean_terminal_cost_ema == 61.0
+        assert ack.symmetric_selfplay.game_len_ema == 161.0
         assert first.produced_rows == 2
         assert first.batch.node_count.tolist() == first_node_count.tolist()
         assert first.batch.node_count.tolist() != second.batch.node_count.tolist()
@@ -70,6 +82,14 @@ def test_decode_ack_rejects_truncated() -> None:
         assert "truncated" in str(error)
     else:
         raise AssertionError("decode_ack accepted truncated payload")
+
+
+def test_decode_ack_allows_absent_symmetric_metrics() -> None:
+    payload = bytearray(ack_payload(3))
+    struct.pack_into("<I", payload, 132, 0)
+    payload[136:176] = bytes(40)
+
+    assert decode_ack(memoryview(payload)).symmetric_selfplay is None
 
 
 def serve_samples(
@@ -114,7 +134,7 @@ def serve_samples(
 
 def ack_payload(produced_rows: int) -> bytes:
     return (
-        struct.pack("<I", 7)
+        struct.pack("<I", SAMPLE_PROTOCOL_VERSION)
         + SCHEMA_HASH
         + struct.pack("<I", 2)
         + struct.pack("<Q", produced_rows)
@@ -126,6 +146,10 @@ def ack_payload(produced_rows: int) -> bytes:
         + struct.pack("<f", 150.0)
         + struct.pack("<III", 200, 400, 900)
         + struct.pack("<Q", produced_rows)
+        + struct.pack("<Q", produced_rows)
+        + struct.pack("<ff", 0.75, 0.25)
+        + struct.pack("<I", 1)
+        + struct.pack("<10f", 0.4, 0.35, 0.25, 60.0, 62.0, 2.0, 50.0, 80.0, 81.0, 1.0)
         + schema_config().encode()
     )
 

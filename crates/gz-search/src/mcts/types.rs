@@ -16,25 +16,40 @@ pub(crate) struct MctsConfig {
     pub(crate) export_position: bool,
     pub(crate) mask_stop: bool,
     pub(crate) no_backtrack: bool,
+    pub(crate) predicted_horizon: bool,
     pub(crate) candidate_options: CandidateOptions,
     pub(crate) measure_options: MeasureOptions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub(crate) struct MctsEpisodeContext {
-    pub(crate) opponent: Option<MctsOpponentContext>,
-    pub(crate) noise_seed: u64,
+pub struct MctsEpisodeContext {
+    pub opponent: Option<MctsOpponentContext>,
+    pub noise_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct MctsSearchContext {
-    pub(crate) root_step: u32,
-    pub(crate) budget_fraction: f32,
-    pub(crate) budget_step: f32,
-    pub(crate) selection_temperature: f32,
-    pub(crate) opponent: Option<MctsOpponentContext>,
-    pub(crate) noise_seed: u64,
-    pub(crate) export_position: bool,
+pub struct MctsSearchContext {
+    pub root_step: u32,
+    pub budget_fraction: f32,
+    pub budget_step: f32,
+    pub selection_temperature: f32,
+    pub opponent: Option<MctsOpponentContext>,
+    pub noise_seed: u64,
+    pub export_position: bool,
+}
+
+impl Default for MctsSearchContext {
+    fn default() -> Self {
+        Self {
+            root_step: 0,
+            budget_fraction: 1.0,
+            budget_step: 0.0,
+            selection_temperature: 0.0,
+            opponent: None,
+            noise_seed: 0,
+            export_position: true,
+        }
+    }
 }
 
 impl MctsSearchContext {
@@ -81,27 +96,7 @@ impl MctsOpponentContext {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MctsHandleBatch<G, C> {
-    pub graphs: Vec<G>,
-    pub candidates: Vec<C>,
-}
-
-impl<G, C> Default for MctsHandleBatch<G, C> {
-    fn default() -> Self {
-        Self {
-            graphs: Vec::new(),
-            candidates: Vec::new(),
-        }
-    }
-}
-
-impl<G, C> MctsHandleBatch<G, C> {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.graphs.is_empty() && self.candidates.is_empty()
-    }
-}
+pub type MctsHandleBatch<G, C> = crate::SearchHandleBatch<G, C>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MctsRootResult<G, C> {
@@ -179,16 +174,17 @@ pub enum MctsStopReason {
     SelectedStop,
 }
 
-pub(crate) struct MctsEpisode<G, C> {
-    pub(crate) root: G,
-    pub(crate) final_graph: G,
-    pub(crate) root_context: ReplayGraphContext,
-    pub(crate) final_context: ReplayGraphContext,
-    pub(crate) steps: Vec<MctsStep<G, C>>,
-    pub(crate) root_stats: Vec<MctsRootStats>,
-    pub(crate) created_graphs: Vec<G>,
-    pub(crate) created_candidates: Vec<C>,
-    pub(crate) final_measure: MeasureResult<G>,
-    pub(crate) stop_reason: MctsStopReason,
-    pub(crate) search_config_hash: SearchConfigHash,
+#[derive(Clone, Debug)]
+pub struct MctsEpisode<G, C> {
+    pub root: G,
+    pub final_graph: G,
+    pub root_context: ReplayGraphContext,
+    pub final_context: ReplayGraphContext,
+    pub steps: Vec<MctsStep<G, C>>,
+    pub root_stats: Vec<MctsRootStats>,
+    pub created_graphs: Vec<G>,
+    pub created_candidates: Vec<C>,
+    pub final_measure: MeasureResult<G>,
+    pub stop_reason: MctsStopReason,
+    pub search_config_hash: SearchConfigHash,
 }

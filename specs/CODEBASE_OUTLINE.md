@@ -561,8 +561,9 @@ trainer fsyncs weights and manifest
 trainer atomically renames to checkpoints/run_id/version_N/
 trainer atomically updates checkpoints/run_id/latest.json
 evaluator loads and warms version_N
-evaluator swaps new requests to version_N
-in-flight evals finish on their original ModelVersion
+evaluator advertises version_N for new episode leases
+existing episodes keep targeting their pinned ModelVersion
+evaluator releases the old slot after its final episode lease ends
 ```
 
 Replay rows store the `ModelVersion` used to produce search policy/value data.

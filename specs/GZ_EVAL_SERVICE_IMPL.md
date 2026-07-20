@@ -45,10 +45,10 @@ grounding against the implemented Python server:
    ready_timeout, then performs the handshake on that same connection,
    which becomes the backend. PING is a health check on the live
    connection, not a readiness probe.
-2. No gz-eval dependency. BackendOutputs is ModelVersion (gz-engine) plus
-   RowOutput rows (gz-features); converting to EvalOutput is work order
-   C's orchestrator-side concern. Dependencies: std, gz-engine,
-   gz-features only.
+2. No gz-eval dependency. BackendOutputs is the served ModelVersion
+   (gz-engine), the evaluator's active ModelGeneration, plus RowOutput rows
+   (gz-features); converting to EvalOutput is the orchestrator's concern.
+   Dependencies: std, gz-engine, gz-features only.
 ```
 
 ## Hard Constraints
@@ -64,7 +64,7 @@ engine adapters. Transport is std::os::unix::net; the crate is unix-only
 and says so in lib.rs docs.
 No changes to gz-search, gz-engine, gz-eval, gz-replay, gz-orchestrator,
 or python/ (one narrow gz-features exception in stage 3, below).
-Protocol constants: PROTOCOL_VERSION = 1 defined here;
+Protocol constants: PROTOCOL_VERSION = 2 defined here;
 ENCODING_VERSION is re-exported from gz-features, never redefined.
 Buffers are reused: one read buffer and one write buffer per connection,
 growing monotonically; one write_all per frame.
@@ -129,9 +129,9 @@ Messages bounded to 512 bytes at construction. Keep the enum this small.
 `python/gz/proto/frames.py`:
 
 ```rust
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
-pub const FRAME_HELLO: u8 = 1;  // ... through FRAME_ERROR = 7
+pub const FRAME_HELLO: u8 = 1;  // ... through FRAME_MODEL_RELEASE = 8
 
 pub fn read_frame<'a>(
     stream: &mut UnixStream,
@@ -185,10 +185,19 @@ pub trait FeatureEvalBackend {
         batch_bytes: &[u8],
         action_counts: &[u32],
     ) -> ServiceResult<BackendOutputs>;
+    fn model_generation(&self) -> ModelGeneration;
+    fn submit_for_model(
+        &mut self,
+        model: ModelGeneration,
+        batch_bytes: &[u8],
+        action_counts: &[u32],
+    ) -> ServiceResult<PendingBatch>;
+    fn release_model_generation(&mut self, model: ModelGeneration) -> ServiceResult<()>;
 }
 
 pub struct BackendOutputs {
     pub model_version: ModelVersion,
+    pub active_generation: ModelGeneration,
     pub rows: Vec<RowOutput>,
 }
 
@@ -257,11 +266,12 @@ stream, send HELLO, require HELLO_ACK (an ERROR frame here maps to
 Handshake with the server's message; anything else is Protocol). Records
 the acked model_version. One connect per process, matching the one-client
 server; a second connect call is an error.
-eval: single in-flight. Send EVAL with a monotonically increasing
-batch_id; block for EVAL_RESULT; batch_id mismatch is Protocol; ERROR
-maps to Backend { code }; decode GZFO via the gz-features free function;
-model_version is taken from the frame (it can change under hot swap
-later, so it is per-result, not cached).
+eval: send EVAL with a monotonically increasing batch_id and the exact
+leased ModelVersion; receive EVAL_RESULT in FIFO order; batch_id or served
+version mismatch is Protocol; ERROR maps to Backend { code }; decode GZFO
+via the gz-features free function. Cache the advertised active generation
+for future admissions without changing already leased episodes. Send the
+one-way MODEL_RELEASE after the previous generation's final lease ends.
 ping: nonce round trip; wrong nonce is Protocol.
 Drop for EvaluatorProcess: if the child is still running, kill; always
 wait (reap). Dropping ProcessBackend first closes the stream, which makes
@@ -284,8 +294,8 @@ connect fails, panic with: what failed, and that the test requires
 python3 + numpy (`python3 -c "import numpy"`). Never skip.
 
 ```text
-handshake: HELLO_ACK protocol_version == 1 and model_version ==
-STUB_MODEL_VERSION; ping round trip works
+handshake: HELLO_ACK protocol_version == 2, nonzero model_generation, and
+model_version == STUB_MODEL_VERSION; ping round trip works
 bit-exact equivalence: for several deterministic synthetic batches
 (FeatureRows built by a small in-test arithmetic generator over fixed
 seeds — splitmix-style, no rand — collated by a real FeatureCollator

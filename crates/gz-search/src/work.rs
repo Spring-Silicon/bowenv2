@@ -28,6 +28,17 @@ pub enum SearchPoll<G, C, R> {
     Done(R),
 }
 
+impl<G, C, R> SearchPoll<G, C, R> {
+    #[must_use]
+    pub fn map_done<T>(self, map: impl FnOnce(R) -> T) -> SearchPoll<G, C, T> {
+        match self {
+            Self::Work(work) => SearchPoll::Work(work),
+            Self::Blocked => SearchPoll::Blocked,
+            Self::Done(result) => SearchPoll::Done(map(result)),
+        }
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 // Boxing Eval would allocate on every search evaluation; worker slots hold one

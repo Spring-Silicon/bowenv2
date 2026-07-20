@@ -1,6 +1,6 @@
 use crate::EpisodeId;
 use crate::admission::{AdaptiveAdmissionSchedule, AdmissionDecision, AdmissionSmoothingConfig};
-use crate::pool::{Admission, AdmissionResult, WorkerPool};
+use crate::pool::{Admission, AdmissionResult, CompletedSearchEpisode, CompletedTask, WorkerPool};
 use crate::project::{artifact_from_episode, projected_reference};
 use crate::reference::{
     ArenaRolloutClaim, EpisodeRolloutClaim, PolicyModel, Reference, ReferenceProvider,
@@ -13,20 +13,23 @@ use gz_engine::{
     CandidateOptions, EngineError, EngineResult, ErrorCode, ErrorMessage, GraphEngine, ModelVersion,
 };
 use gz_eval::{EvalOutput, EvalRequest, Evaluator, eval_error_to_engine_error, validate_outputs};
-use gz_eval_service::{BackendOutputs, FeatureEvalBackend};
+use gz_eval_service::{BackendOutputs, FeatureEvalBackend, ModelGeneration};
 use gz_features::{
     FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaHash,
     OpponentBatchRef, OpponentStateFeatures, PositionFeatures, encode_feature_row,
 };
 use gz_measurer::{
     CompletedEpisodeArtifact, CompletedEpisodeStep, MeasureLedgerSnapshot, MeasuredCompetitiveGame,
-    MeasuredEpisode, MeasurerAdmission, MeasurerAdmissionStatus, MeasurerError, MeasurerRunSummary,
-    ProjectedReference, ProjectionMode, ReplayMeasurer, ValueTargetConfig,
+    MeasuredEpisode, MeasuredSymmetricGame, MeasurerAdmission, MeasurerAdmissionStatus,
+    MeasurerError, MeasurerRunSummary, ProjectedReference, ProjectionMode, ReplayMeasurer,
+    ValueTargetConfig,
 };
 use gz_replay::{ReplayError, ReplayReferenceKind, ReplayStore};
 use gz_search::{
     EngineIdentity, EvalModel, GumbelEpisode, GumbelEpisodeContext, GumbelMcts,
-    GumbelOpponentContext, GumbelPlayer, GumbelStep, GumbelStopReason, WorkToken,
+    GumbelOpponentContext, GumbelPlayer, GumbelStep, GumbelStopReason, GumbelValueMode,
+    PolicyRollout, PolicyRolloutConfig, PolicyRolloutContext, PolicyRolloutEpisode,
+    PolicyRolloutStep, SearchAction, SymmetricActorTrace, SymmetricEpisode, WorkToken,
 };
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU64;
@@ -51,6 +54,7 @@ pub struct ThreadedGumbelOrchestrator<E, V> {
     engines: Vec<E>,
     evaluator: V,
     search: GumbelMcts,
+    policy_rollout: Option<PolicyRolloutConfig>,
     config: ThreadedOrchestratorConfig,
 }
 
@@ -139,12 +143,14 @@ struct FeaturizedEvalJob {
     row: FeatureRow,
     action_count: u32,
     opponent_ref: OpponentBatchRef,
+    model: ModelGeneration,
 }
 
 struct EvalReply {
     slot: usize,
     token: WorkToken,
     output: EvalOutput,
+    active_model_version: ModelVersion,
     route: EvalRoute,
 }
 
@@ -425,6 +431,209 @@ enum EvalRoute {
     Challenger,
 }
 
+struct ModelLeaseRegistry {
+    state: Mutex<ModelLeaseState>,
+}
+
+struct FeaturizedBatcherContext {
+    route: EvalRoute,
+    model_registry: Arc<ModelLeaseRegistry>,
+    eval_pressure: Option<Arc<EvalPressure>>,
+}
+
+struct ModelLeaseState {
+    current: ModelGeneration,
+    generations: Vec<ModelGenerationState>,
+    releasable: VecDeque<ModelGeneration>,
+}
+
+struct ModelGenerationState {
+    model: ModelGeneration,
+    users: usize,
+}
+
+struct ModelLease {
+    registry: Arc<ModelLeaseRegistry>,
+    model: ModelGeneration,
+}
+
+impl ModelLeaseRegistry {
+    fn new(current: ModelGeneration) -> EngineResult<Self> {
+        if current.id == 0 {
+            return Err(internal("zero model generation"));
+        }
+        Ok(Self {
+            state: Mutex::new(ModelLeaseState {
+                current,
+                generations: vec![ModelGenerationState {
+                    model: current,
+                    users: 0,
+                }],
+                releasable: VecDeque::new(),
+            }),
+        })
+    }
+
+    fn acquire_current(self: &Arc<Self>) -> ModelLease {
+        let mut state = self.state.lock().expect("model lease registry poisoned");
+        let current = state.current;
+        let generation = state
+            .generations
+            .iter_mut()
+            .find(|generation| generation.model == current)
+            .expect("current model generation is registered");
+        generation.users = generation
+            .users
+            .checked_add(1)
+            .expect("model lease count overflowed");
+        ModelLease {
+            registry: Arc::clone(self),
+            model: current,
+        }
+    }
+
+    fn publish(&self, model: ModelGeneration) -> EngineResult<()> {
+        if model.id == 0 {
+            return Err(internal("zero model generation"));
+        }
+        let mut state = self.state.lock().expect("model lease registry poisoned");
+        if state.current == model {
+            return Ok(());
+        }
+        if state.generations.iter().any(|generation| {
+            generation.model.id == model.id && generation.model.version != model.version
+        }) {
+            return Err(internal("model generation id changed version"));
+        }
+        if state.generations.iter().any(|generation| {
+            generation.model.version == model.version && generation.model.id != model.id
+        }) {
+            return Err(internal("model version has multiple resident generations"));
+        }
+        if state
+            .generations
+            .iter()
+            .all(|generation| generation.model != model)
+        {
+            if state.generations.len() >= 2 {
+                return Err(internal("too many resident model generations"));
+            }
+            state
+                .generations
+                .push(ModelGenerationState { model, users: 0 });
+        }
+        let previous = state.current;
+        state.current = model;
+        if state
+            .generations
+            .iter()
+            .any(|generation| generation.model == previous && generation.users == 0)
+        {
+            queue_model_release(&mut state, previous);
+        }
+        Ok(())
+    }
+
+    fn take_releasable(&self) -> Vec<ModelGeneration> {
+        let mut state = self.state.lock().expect("model lease registry poisoned");
+        let models = state.releasable.drain(..).collect::<Vec<_>>();
+        state
+            .generations
+            .retain(|generation| !models.contains(&generation.model));
+        models
+    }
+}
+
+impl Drop for ModelLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .expect("model lease registry poisoned");
+        let Some(generation) = state
+            .generations
+            .iter_mut()
+            .find(|generation| generation.model == self.model)
+        else {
+            return;
+        };
+        assert!(generation.users > 0, "model lease count underflowed");
+        generation.users -= 1;
+        let became_unused = generation.users == 0;
+        if became_unused && state.current != self.model {
+            queue_model_release(&mut state, self.model);
+        }
+    }
+}
+
+fn queue_model_release(state: &mut ModelLeaseState, model: ModelGeneration) {
+    if !state.releasable.contains(&model) {
+        state.releasable.push_back(model);
+    }
+}
+
+#[derive(Clone)]
+struct LaneModelRegistries {
+    current: Arc<ModelLeaseRegistry>,
+    incumbent: Option<Arc<ModelLeaseRegistry>>,
+    challenger: Option<Arc<ModelLeaseRegistry>>,
+}
+
+struct EpisodeModelLeases {
+    registries: LaneModelRegistries,
+    episodes: HashMap<EpisodeId, EpisodeModelLeaseSet>,
+}
+
+#[derive(Default)]
+struct EpisodeModelLeaseSet {
+    current: Option<ModelLease>,
+    incumbent: Option<ModelLease>,
+    challenger: Option<ModelLease>,
+}
+
+impl EpisodeModelLeases {
+    fn new(registries: LaneModelRegistries) -> Self {
+        Self {
+            registries,
+            episodes: HashMap::new(),
+        }
+    }
+
+    fn ensure(&mut self, episode_id: EpisodeId, route: EvalRoute) -> EngineResult<ModelGeneration> {
+        let leases = self.episodes.entry(episode_id).or_default();
+        let lease = match route {
+            EvalRoute::Current => &mut leases.current,
+            EvalRoute::Incumbent => &mut leases.incumbent,
+            EvalRoute::Challenger => &mut leases.challenger,
+        };
+        if let Some(lease) = lease {
+            return Ok(lease.model);
+        }
+        let registry = match route {
+            EvalRoute::Current => &self.registries.current,
+            EvalRoute::Incumbent => self
+                .registries
+                .incumbent
+                .as_ref()
+                .ok_or_else(|| internal("missing incumbent model registry"))?,
+            EvalRoute::Challenger => self
+                .registries
+                .challenger
+                .as_ref()
+                .ok_or_else(|| internal("missing challenger model registry"))?,
+        };
+        let acquired = registry.acquire_current();
+        let model = acquired.model;
+        *lease = Some(acquired);
+        Ok(model)
+    }
+
+    fn release(&mut self, episode_id: EpisodeId) {
+        self.episodes.remove(&episode_id);
+    }
+}
+
 enum ReplayJob {
     Episode {
         episode: Box<MeasuredEpisode>,
@@ -432,6 +641,10 @@ enum ReplayJob {
     },
     Competitive {
         game: Box<MeasuredCompetitiveGame>,
+        ack: SyncSender<EngineResult<MeasurerAdmission>>,
+    },
+    Symmetric {
+        game: Box<MeasuredSymmetricGame>,
         ack: SyncSender<EngineResult<MeasurerAdmission>>,
     },
 }
@@ -453,8 +666,15 @@ where
             engines,
             evaluator,
             search,
+            policy_rollout: None,
             config,
         }
+    }
+
+    #[must_use]
+    pub const fn with_policy_rollout(mut self, config: PolicyRolloutConfig) -> Self {
+        self.policy_rollout = Some(config);
+        self
     }
 
     pub fn run<R>(
@@ -465,6 +685,11 @@ where
     where
         R: RootSource<E> + Send,
     {
+        if self.search.config().value_mode == GumbelValueMode::SymmetricSelfplay {
+            return Err(internal(
+                "symmetric selfplay requires featurized replay output",
+            ));
+        }
         let lanes = self.engines.len();
         if root_sources.len() != lanes {
             return Err(internal("lane count mismatch"));
@@ -574,11 +799,22 @@ where
         R: RootSource<E> + Send,
         P: ReferenceProvider<E> + Send,
     {
+        if self.search.config().value_mode == GumbelValueMode::SymmetricSelfplay {
+            return Err(internal(
+                "symmetric selfplay requires featurized replay output",
+            ));
+        }
         let lanes = self.engines.len();
         if root_sources.len() != lanes || replay.providers.len() != lanes {
             return Err(internal("lane count mismatch"));
         }
-        ensure_replay_data_mode::<E, P>(replay.store, &replay.providers, replay.value_target)?;
+        ensure_replay_data_mode::<E, P>(
+            replay.store,
+            &replay.providers,
+            replay.value_target,
+            self.search.config().value_mode == GumbelValueMode::SymmetricSelfplay,
+            self.search.config().mask_stop,
+        )?;
         validate_engine_identities(&self.engines)?;
 
         let workers_per_lane = self.config.workers_per_lane.get();
@@ -718,6 +954,9 @@ where
         X: FeatureExtractor<E> + Send,
         B: FeatureEvalBackend + Send,
     {
+        if self.search.config().value_mode == GumbelValueMode::SymmetricSelfplay {
+            return Err(internal("symmetric selfplay requires replay output"));
+        }
         let lanes = self.engines.len();
         if root_sources.len() != lanes || featurized.extractors.len() != lanes {
             return Err(internal("lane count mismatch"));
@@ -771,6 +1010,18 @@ where
         let backends = featurized.backends;
         let reference_backends = featurized.reference_backends;
         let challenger_backends = featurized.challenger_backends;
+        let model_registries = backends
+            .iter()
+            .map(|backend| ModelLeaseRegistry::new(backend.model_generation()).map(Arc::new))
+            .collect::<EngineResult<Vec<_>>>()?;
+        let reference_model_registries = reference_backends
+            .iter()
+            .map(|backend| ModelLeaseRegistry::new(backend.model_generation()).map(Arc::new))
+            .collect::<EngineResult<Vec<_>>>()?;
+        let challenger_model_registries = challenger_backends
+            .iter()
+            .map(|backend| ModelLeaseRegistry::new(backend.model_generation()).map(Arc::new))
+            .collect::<EngineResult<Vec<_>>>()?;
         let extractors = featurized.extractors;
         let engines = self.engines;
         let feature_schema = first_schema::<E, X>(&extractors, schema_hash)?;
@@ -782,7 +1033,11 @@ where
 
         let (batch_results, lane_results) = std::thread::scope(|scope| {
             let mut batch_handles = Vec::with_capacity(backend_count);
-            for (backend, intake_rx) in backends.into_iter().zip(intake_rxs) {
+            for ((backend, intake_rx), model_registry) in backends
+                .into_iter()
+                .zip(intake_rxs)
+                .zip(model_registries.iter().cloned())
+            {
                 let batch_capacity = backend.batch_capacity().unwrap_or(config.max_batch);
                 let collator = FeatureCollator::new(feature_schema.clone(), batch_capacity);
                 let reply_txs = reply_txs.clone();
@@ -794,12 +1049,19 @@ where
                         intake_rx,
                         reply_txs,
                         config,
-                        EvalRoute::Current,
-                        Some(eval_pressure),
+                        FeaturizedBatcherContext {
+                            route: EvalRoute::Current,
+                            model_registry,
+                            eval_pressure: Some(eval_pressure),
+                        },
                     )
                 }));
             }
-            for (backend, intake_rx) in reference_backends.into_iter().zip(reference_intake_rxs) {
+            for ((backend, intake_rx), model_registry) in reference_backends
+                .into_iter()
+                .zip(reference_intake_rxs)
+                .zip(reference_model_registries.iter().cloned())
+            {
                 let batch_capacity = backend.batch_capacity().unwrap_or(config.max_batch);
                 let collator = FeatureCollator::new(feature_schema.clone(), batch_capacity);
                 let reply_txs = reply_txs.clone();
@@ -811,12 +1073,19 @@ where
                         intake_rx,
                         reply_txs,
                         config,
-                        EvalRoute::Incumbent,
-                        Some(eval_pressure),
+                        FeaturizedBatcherContext {
+                            route: EvalRoute::Incumbent,
+                            model_registry,
+                            eval_pressure: Some(eval_pressure),
+                        },
                     )
                 }));
             }
-            for (backend, intake_rx) in challenger_backends.into_iter().zip(challenger_intake_rxs) {
+            for ((backend, intake_rx), model_registry) in challenger_backends
+                .into_iter()
+                .zip(challenger_intake_rxs)
+                .zip(challenger_model_registries.iter().cloned())
+            {
                 let batch_capacity = backend.batch_capacity().unwrap_or(config.max_batch);
                 let collator = FeatureCollator::new(feature_schema.clone(), batch_capacity);
                 let reply_txs = reply_txs.clone();
@@ -828,8 +1097,11 @@ where
                         intake_rx,
                         reply_txs,
                         config,
-                        EvalRoute::Challenger,
-                        Some(eval_pressure),
+                        FeaturizedBatcherContext {
+                            route: EvalRoute::Challenger,
+                            model_registry,
+                            eval_pressure: Some(eval_pressure),
+                        },
                     )
                 }));
             }
@@ -848,6 +1120,19 @@ where
                     .then(|| reference_intake_txs[lane % reference_intake_txs.len()].clone());
                 let challenger_intake_tx = (!challenger_intake_txs.is_empty())
                     .then(|| challenger_intake_txs[lane % challenger_intake_txs.len()].clone());
+                let lane_model_registries = LaneModelRegistries {
+                    current: Arc::clone(&model_registries[lane % model_registries.len()]),
+                    incumbent: (!reference_model_registries.is_empty()).then(|| {
+                        Arc::clone(
+                            &reference_model_registries[lane % reference_model_registries.len()],
+                        )
+                    }),
+                    challenger: (!challenger_model_registries.is_empty()).then(|| {
+                        Arc::clone(
+                            &challenger_model_registries[lane % challenger_model_registries.len()],
+                        )
+                    }),
+                };
                 let eval_pressure = Arc::clone(&eval_pressure);
                 let admission_shaper = admission_shaper.clone();
                 lane_handles.push(scope.spawn(move || {
@@ -870,7 +1155,7 @@ where
                             challenger_intake_tx,
                             reply_rx,
                         },
-                        FeaturizedCollectMode::new(extractor),
+                        FeaturizedCollectMode::new(extractor, lane_model_registries),
                     )
                 }));
             }
@@ -925,6 +1210,13 @@ where
         B: FeatureEvalBackend + Send,
         P: ReferenceProvider<E> + Send,
     {
+        if self.search.config().value_mode == GumbelValueMode::SymmetricSelfplay
+            && !replay.length_tiebreak
+        {
+            return Err(internal(
+                "symmetric selfplay requires the episode length tiebreak",
+            ));
+        }
         let lanes = self.engines.len();
         if root_sources.len() != lanes
             || featurized.extractors.len() != lanes
@@ -932,7 +1224,23 @@ where
         {
             return Err(internal("lane count mismatch"));
         }
-        ensure_replay_data_mode::<E, P>(replay.store, &replay.providers, replay.value_target)?;
+        if replay
+            .providers
+            .iter()
+            .any(ReferenceProvider::sampled_trajectory_mode)
+            && self.policy_rollout.is_none()
+        {
+            return Err(internal(
+                "sampled-trajectory mode requires a policy rollout config",
+            ));
+        }
+        ensure_replay_data_mode::<E, P>(
+            replay.store,
+            &replay.providers,
+            replay.value_target,
+            self.search.config().value_mode == GumbelValueMode::SymmetricSelfplay,
+            self.search.config().mask_stop,
+        )?;
         validate_engine_identities(&self.engines)?;
         let schema_hash = validate_feature_schemas::<E, X>(&featurized.extractors)?;
         validate_backend_count(featurized.backends.len(), lanes)?;
@@ -952,12 +1260,27 @@ where
             return Err(internal("arena parallelism mismatch"));
         }
         let coordinator_capacity = workers_per_lane.max(arena_parallelism);
-        let intake_capacity = lanes
+        let worker_capacity = lanes
             .checked_mul(workers_per_lane)
             .and_then(|capacity| {
                 capacity.checked_add(coordinator_capacity.saturating_sub(workers_per_lane))
             })
             .ok_or_else(|| internal("worker count overflow"))?;
+        let evals_per_worker = if self.search.config().value_mode
+            == GumbelValueMode::SymmetricSelfplay
+            && self.search.symmetric_wave_batching()
+        {
+            self.search
+                .config()
+                .max_considered_actions
+                .get()
+                .min(self.search.config().simulations.get())
+        } else {
+            1
+        };
+        let intake_capacity = worker_capacity
+            .checked_mul(evals_per_worker)
+            .ok_or_else(|| internal("wave eval capacity overflow"))?;
         let pool_capacities = (0..lanes)
             .map(|lane| {
                 NonZeroUsize::new(if lane == 0 {
@@ -1002,17 +1325,22 @@ where
             challenger_intake_txs.push(tx);
             challenger_intake_rxs.push(rx);
         }
-        let (replay_tx, replay_rx) = sync_channel(intake_capacity);
+        let (replay_tx, replay_rx) = sync_channel(worker_capacity);
         let mut reply_txs = Vec::with_capacity(lanes);
         let mut reply_rxs = Vec::with_capacity(lanes);
 
         for &capacity in &pool_capacities {
-            let (tx, rx) = sync_channel(capacity.get());
+            let reply_capacity = capacity
+                .get()
+                .checked_mul(evals_per_worker)
+                .ok_or_else(|| internal("wave reply capacity overflow"))?;
+            let (tx, rx) = sync_channel(reply_capacity);
             reply_txs.push(tx);
             reply_rxs.push(rx);
         }
 
         let config = self.config;
+        let policy_rollout = self.policy_rollout;
         let eval_pressure = Arc::new(EvalPressure::default());
         let admission_shaper =
             build_admission_shaper(lanes, backend_count, config, Arc::clone(&eval_pressure))?;
@@ -1020,6 +1348,18 @@ where
         let backends = featurized.backends;
         let reference_backends = featurized.reference_backends;
         let challenger_backends = featurized.challenger_backends;
+        let model_registries = backends
+            .iter()
+            .map(|backend| ModelLeaseRegistry::new(backend.model_generation()).map(Arc::new))
+            .collect::<EngineResult<Vec<_>>>()?;
+        let reference_model_registries = reference_backends
+            .iter()
+            .map(|backend| ModelLeaseRegistry::new(backend.model_generation()).map(Arc::new))
+            .collect::<EngineResult<Vec<_>>>()?;
+        let challenger_model_registries = challenger_backends
+            .iter()
+            .map(|backend| ModelLeaseRegistry::new(backend.model_generation()).map(Arc::new))
+            .collect::<EngineResult<Vec<_>>>()?;
         let extractors = featurized.extractors;
         let engines = self.engines;
         let providers = replay.providers;
@@ -1039,7 +1379,11 @@ where
 
         let (batch_results, sink_result, lane_results) = std::thread::scope(|scope| {
             let mut batch_handles = Vec::with_capacity(backend_count);
-            for (backend, intake_rx) in backends.into_iter().zip(intake_rxs) {
+            for ((backend, intake_rx), model_registry) in backends
+                .into_iter()
+                .zip(intake_rxs)
+                .zip(model_registries.iter().cloned())
+            {
                 let batch_capacity = backend.batch_capacity().unwrap_or(config.max_batch);
                 let collator = FeatureCollator::new(feature_schema.clone(), batch_capacity);
                 let reply_txs = reply_txs.clone();
@@ -1051,12 +1395,19 @@ where
                         intake_rx,
                         reply_txs,
                         config,
-                        EvalRoute::Current,
-                        Some(eval_pressure),
+                        FeaturizedBatcherContext {
+                            route: EvalRoute::Current,
+                            model_registry,
+                            eval_pressure: Some(eval_pressure),
+                        },
                     )
                 }));
             }
-            for (backend, intake_rx) in reference_backends.into_iter().zip(reference_intake_rxs) {
+            for ((backend, intake_rx), model_registry) in reference_backends
+                .into_iter()
+                .zip(reference_intake_rxs)
+                .zip(reference_model_registries.iter().cloned())
+            {
                 let batch_capacity = backend.batch_capacity().unwrap_or(config.max_batch);
                 let collator = FeatureCollator::new(feature_schema.clone(), batch_capacity);
                 let reply_txs = reply_txs.clone();
@@ -1068,12 +1419,19 @@ where
                         intake_rx,
                         reply_txs,
                         config,
-                        EvalRoute::Incumbent,
-                        Some(eval_pressure),
+                        FeaturizedBatcherContext {
+                            route: EvalRoute::Incumbent,
+                            model_registry,
+                            eval_pressure: Some(eval_pressure),
+                        },
                     )
                 }));
             }
-            for (backend, intake_rx) in challenger_backends.into_iter().zip(challenger_intake_rxs) {
+            for ((backend, intake_rx), model_registry) in challenger_backends
+                .into_iter()
+                .zip(challenger_intake_rxs)
+                .zip(challenger_model_registries.iter().cloned())
+            {
                 let batch_capacity = backend.batch_capacity().unwrap_or(config.max_batch);
                 let collator = FeatureCollator::new(feature_schema.clone(), batch_capacity);
                 let reply_txs = reply_txs.clone();
@@ -1085,8 +1443,11 @@ where
                         intake_rx,
                         reply_txs,
                         config,
-                        EvalRoute::Challenger,
-                        Some(eval_pressure),
+                        FeaturizedBatcherContext {
+                            route: EvalRoute::Challenger,
+                            model_registry,
+                            eval_pressure: Some(eval_pressure),
+                        },
                     )
                 }));
             }
@@ -1108,6 +1469,19 @@ where
                     .then(|| reference_intake_txs[lane % reference_intake_txs.len()].clone());
                 let challenger_intake_tx = (!challenger_intake_txs.is_empty())
                     .then(|| challenger_intake_txs[lane % challenger_intake_txs.len()].clone());
+                let lane_model_registries = LaneModelRegistries {
+                    current: Arc::clone(&model_registries[lane % model_registries.len()]),
+                    incumbent: (!reference_model_registries.is_empty()).then(|| {
+                        Arc::clone(
+                            &reference_model_registries[lane % reference_model_registries.len()],
+                        )
+                    }),
+                    challenger: (!challenger_model_registries.is_empty()).then(|| {
+                        Arc::clone(
+                            &challenger_model_registries[lane % challenger_model_registries.len()],
+                        )
+                    }),
+                };
                 let replay_tx = replay_tx.clone();
                 let eval_pressure = Arc::clone(&eval_pressure);
                 let admission_shaper = admission_shaper.clone();
@@ -1140,11 +1514,13 @@ where
                             provider.sampled_tree_mode(),
                             provider.sampled_trajectory_mode(),
                             provider.per_root_policy_mode(),
+                            policy_rollout,
                             provider,
                             replay_tx,
                             store,
                             backpressure,
                             value_target,
+                            lane_model_registries,
                         ),
                     )
                 }));
@@ -1236,6 +1612,12 @@ struct CompetitiveFeatureRows<C> {
     candidates: Vec<C>,
 }
 
+struct SymmetricFeatureRows<C> {
+    p1: Vec<Vec<u8>>,
+    p2: Vec<Vec<u8>>,
+    candidates: Vec<C>,
+}
+
 trait LaneMode<E>
 where
     E: GraphEngine,
@@ -1311,6 +1693,7 @@ where
             identity,
             context,
             sampled_tree: false,
+            symmetric_selfplay: search.config().value_mode == GumbelValueMode::SymmetricSelfplay,
             pressure_reserved,
             next_episode_id,
         };
@@ -1354,7 +1737,7 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
-    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>>;
+    ) -> EngineResult<Vec<CompletedTask<E::Graph, E::Candidate>>>;
 
     fn send_parked(
         &mut self,
@@ -1374,7 +1757,7 @@ where
         &mut self,
         engine: &mut E,
         search: &GumbelMcts,
-        completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+        completed: CompletedTask<E::Graph, E::Candidate>,
     ) -> EngineResult<Option<u64>>;
 
     fn finish(self, lane: usize) -> Self::Output;
@@ -1633,7 +2016,7 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
-    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+    ) -> EngineResult<Vec<CompletedTask<E::Graph, E::Candidate>>> {
         pool.drive(engine, "worker blocked", None, |_, _, _| {})
     }
 
@@ -1653,8 +2036,9 @@ where
         &mut self,
         engine: &mut E,
         _search: &GumbelMcts,
-        completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+        completed: CompletedTask<E::Graph, E::Candidate>,
     ) -> EngineResult<Option<u64>> {
+        let completed = completed.into_gumbel()?;
         let evaluations = completed.evaluations;
         release_episode_handles(engine, &completed.episode, &[])?;
         self.episodes.push(completed);
@@ -1672,13 +2056,15 @@ where
 struct FeaturizedCollectMode<X, G, C> {
     extractor: X,
     episodes: Vec<OrchestratedEpisode<G, C>>,
+    model_leases: EpisodeModelLeases,
 }
 
 impl<X, G, C> FeaturizedCollectMode<X, G, C> {
-    fn new(extractor: X) -> Self {
+    fn new(extractor: X, model_registries: LaneModelRegistries) -> Self {
         Self {
             extractor,
             episodes: Vec::new(),
+            model_leases: EpisodeModelLeases::new(model_registries),
         }
     }
 }
@@ -1691,11 +2077,22 @@ where
     type Job = FeaturizedEvalJob;
     type Output = LaneEpisodes<E::Graph, E::Candidate>;
 
+    fn episode_context(
+        &mut self,
+        _engine: &mut E,
+        episode_id: EpisodeId,
+        _root: E::Graph,
+        context: GumbelEpisodeContext,
+    ) -> EngineResult<GumbelEpisodeContext> {
+        self.model_leases.ensure(episode_id, EvalRoute::Current)?;
+        Ok(context)
+    }
+
     fn drive(
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
-    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+    ) -> EngineResult<Vec<CompletedTask<E::Graph, E::Candidate>>> {
         pool.drive(
             engine,
             "worker blocked",
@@ -1713,15 +2110,17 @@ where
         _challenger_intake_tx: Option<&SyncSender<Self::Job>>,
         eval_pressure: &EvalPressure,
     ) -> EngineResult<()> {
-        send_featurized_parked(lane, pool, intake_tx, eval_pressure)
+        send_featurized_parked(lane, pool, intake_tx, eval_pressure, &mut self.model_leases)
     }
 
     fn complete(
         &mut self,
         engine: &mut E,
         _search: &GumbelMcts,
-        completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+        completed: CompletedTask<E::Graph, E::Candidate>,
     ) -> EngineResult<Option<u64>> {
+        let completed = completed.into_gumbel()?;
+        self.model_leases.release(completed.episode_id);
         let evaluations = completed.evaluations;
         release_episode_handles(engine, &completed.episode, &[])?;
         self.episodes.push(completed);
@@ -1874,7 +2273,7 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
-    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+    ) -> EngineResult<Vec<CompletedTask<E::Graph, E::Candidate>>> {
         pool.drive(engine, "worker blocked", None, |_, _, _| {})
     }
 
@@ -1900,8 +2299,9 @@ where
         &mut self,
         engine: &mut E,
         search: &GumbelMcts,
-        mut completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+        completed: CompletedTask<E::Graph, E::Candidate>,
     ) -> EngineResult<Option<u64>> {
+        let mut completed = completed.into_gumbel()?;
         let mut rollout = self
             .rollout
             .take()
@@ -1975,18 +2375,19 @@ struct FeaturizedReplayMode<'a, X, P, G> {
     sampled_trajectory: Option<SampledTrajectoryState<G>>,
     per_root_policy: Option<PerRootPolicyState<G>>,
     root_evaluations: HashMap<EpisodeId, u64>,
+    model_leases: EpisodeModelLeases,
 }
 
 struct SampledTrajectoryState<G> {
-    search: Option<GumbelMcts>,
+    search: PolicyRollout,
     in_flight: HashMap<EpisodeId, bool>,
     ready: VecDeque<ReadySampledLearner<G>>,
 }
 
-impl<G> Default for SampledTrajectoryState<G> {
-    fn default() -> Self {
+impl<G> SampledTrajectoryState<G> {
+    fn new(config: PolicyRolloutConfig) -> Self {
         Self {
-            search: None,
+            search: PolicyRollout::new(config),
             in_flight: HashMap::new(),
             ready: VecDeque::new(),
         }
@@ -2039,11 +2440,13 @@ impl<'a, X, P, G> FeaturizedReplayMode<'a, X, P, G> {
         sampled_tree: bool,
         sampled_trajectory: bool,
         per_root_policy: bool,
+        policy_rollout: Option<PolicyRolloutConfig>,
         provider: P,
         replay_tx: SyncSender<ReplayJob>,
         store: &'a ReplayStore,
         backpressure: Option<ReplayBackpressure>,
         value_target: ValueTargetConfig,
+        model_registries: LaneModelRegistries,
     ) -> Self {
         Self {
             extractor,
@@ -2059,10 +2462,160 @@ impl<'a, X, P, G> FeaturizedReplayMode<'a, X, P, G> {
             candidate_options: CandidateOptions::default(),
             export_position: true,
             sampled_tree,
-            sampled_trajectory: sampled_trajectory.then(SampledTrajectoryState::default),
+            sampled_trajectory: sampled_trajectory.then(|| {
+                SampledTrajectoryState::new(
+                    policy_rollout.expect("sampled-trajectory config validated before lanes"),
+                )
+            }),
             per_root_policy: per_root_policy.then(PerRootPolicyState::default),
             root_evaluations: HashMap::new(),
+            model_leases: EpisodeModelLeases::new(model_registries),
         }
+    }
+}
+
+impl<X, P, G: Copy> FeaturizedReplayMode<'_, X, P, G> {
+    fn complete_policy_rollout<E>(
+        &mut self,
+        engine: &mut E,
+        episode_id: EpisodeId,
+        evaluations: u64,
+        episode: PolicyRolloutEpisode<G, E::Candidate>,
+    ) -> EngineResult<Option<u64>>
+    where
+        E: GraphEngine<Graph = G>,
+        X: FeatureExtractor<E>,
+        P: ReferenceProvider<E>,
+    {
+        let sampled = self
+            .sampled_trajectory
+            .as_mut()
+            .ok_or_else(|| internal("policy rollout outside sampled-trajectory mode"))?;
+        let owned_root = sampled
+            .in_flight
+            .remove(&episode_id)
+            .ok_or_else(|| internal("missing sampled-trajectory admission"))?;
+        let position_config = policy_position_config(&sampled.search);
+
+        let root_evaluations = self.root_evaluations.entry(episode_id).or_default();
+        *root_evaluations = root_evaluations.saturating_add(evaluations);
+        let measure = &episode.final_measure;
+        let reward = (measure.measured && measure.valid)
+            .then_some(measure.scalar_reward)
+            .flatten()
+            .filter(|reward| reward.is_finite());
+        let projection = match reward {
+            Some(final_reward) => reference_steps_for_episode_with_features(
+                engine,
+                &mut self.extractor,
+                position_config,
+                episode.final_graph,
+                episode.final_context,
+                &episode.steps,
+                final_reward,
+            ),
+            None => Ok((Vec::new(), Vec::new())),
+        };
+        let (steps, feature_candidates) = match projection {
+            Ok(projected) => projected,
+            Err(error) => {
+                release_created_handles(
+                    engine,
+                    &episode.created_graphs,
+                    &episode.created_candidates,
+                    &[],
+                )?;
+                return Err(error);
+            }
+        };
+        release_created_handles(
+            engine,
+            &episode.created_graphs,
+            &episode.created_candidates,
+            &feature_candidates,
+        )?;
+        let outcome = reward.map(|final_reward| RolloutOutcome {
+            final_reward,
+            final_graph: episode.final_context,
+            steps,
+            search_config_hash: episode.search_config_hash,
+            model_version: homogeneous_step_model_version(&episode.steps),
+        });
+        if let Some(reference) = self.replay.provider.finish_sampled_trajectory(outcome) {
+            sampled.ready.push_back(ReadySampledLearner {
+                episode_id,
+                root: episode.root,
+                owned_root,
+                reference,
+            });
+        } else {
+            self.model_leases.release(episode_id);
+            if owned_root {
+                engine.release(&[episode.root], &[])?;
+            }
+            self.replay.admitted_at.remove(&episode_id);
+            self.root_evaluations.remove(&episode_id);
+        }
+        Ok(None)
+    }
+
+    fn complete_symmetric<E>(
+        &mut self,
+        engine: &mut E,
+        search: &GumbelMcts,
+        episode_id: EpisodeId,
+        evaluations: u64,
+        episode: SymmetricEpisode<G, E::Candidate>,
+    ) -> EngineResult<Option<u64>>
+    where
+        E: GraphEngine<Graph = G>,
+        X: FeatureExtractor<E>,
+        P: ReferenceProvider<E>,
+    {
+        match self.replay.references.remove(&episode_id) {
+            Some(None) => {}
+            Some(Some(_)) => {
+                release_symmetric_episode_handles(engine, &episode, &[])?;
+                return Err(internal("symmetric selfplay received a reference"));
+            }
+            None => {
+                release_symmetric_episode_handles(engine, &episode, &[])?;
+                return Err(internal("missing symmetric selfplay admission"));
+            }
+        }
+        if let Some(admitted_at) = self.replay.admitted_at.remove(&episode_id) {
+            self.replay
+                .store
+                .observe_episode_latency(admitted_at.elapsed().as_secs_f64());
+        }
+        let feature_rows =
+            match feature_rows_for_symmetric_episode(engine, &mut self.extractor, search, &episode)
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    release_symmetric_episode_handles(engine, &episode, &[])?;
+                    return Err(error);
+                }
+            };
+        let game = measured_symmetric_game(
+            self.replay.lane,
+            episode_id.value(),
+            &episode,
+            &feature_rows,
+        );
+        self.replay.summary.episodes_completed += 1;
+        self.replay.summary.search_contexts += symmetric_search_contexts(&episode);
+
+        let append = append_symmetric_replay_job(&self.replay.replay_tx, game);
+        release_symmetric_episode_handles(engine, &episode, &feature_rows.candidates)?;
+        append?;
+        self.model_leases.release(episode_id);
+        let evaluations = self
+            .root_evaluations
+            .remove(&episode_id)
+            .unwrap_or(0)
+            .saturating_add(evaluations);
+        Ok(Some(evaluations))
     }
 }
 
@@ -2084,9 +2637,6 @@ where
         self.replay.begin(search, identity, context);
         self.candidate_options = search.config().candidate_options;
         self.export_position = search.config().export_position;
-        if let Some(sampled) = &mut self.sampled_trajectory {
-            sampled.search = Some(search.categorical_policy_rollout());
-        }
         if let Some(per_root) = &mut self.per_root_policy {
             per_root.search = Some(search.policy_rollout());
         }
@@ -2130,6 +2680,10 @@ where
                 .search
                 .as_ref()
                 .ok_or_else(|| internal("missing per-root policy search"))?;
+            self.model_leases
+                .ensure(retry.episode_id, EvalRoute::Current)?;
+            self.model_leases
+                .ensure(retry.episode_id, policy_eval_route(claim.model))?;
             if !pool.admit_direct(
                 policy_search,
                 identity,
@@ -2246,6 +2800,8 @@ where
                 identity,
                 context,
                 sampled_tree: self.sampled_tree,
+                symmetric_selfplay: search.config().value_mode
+                    == GumbelValueMode::SymmetricSelfplay,
                 pressure_reserved,
                 next_episode_id,
             };
@@ -2296,6 +2852,9 @@ where
                     .search
                     .as_ref()
                     .ok_or_else(|| internal("missing per-root policy search"))?;
+                self.model_leases.ensure(episode_id, EvalRoute::Current)?;
+                self.model_leases
+                    .ensure(episode_id, policy_eval_route(claim.model))?;
                 if !pool.admit_direct(
                     policy_search,
                     identity,
@@ -2315,17 +2874,13 @@ where
                     .sampled_trajectory
                     .as_mut()
                     .expect("sampled trajectory mode checked");
-                let sampled_search = sampled
-                    .search
-                    .as_ref()
-                    .ok_or_else(|| internal("missing categorical policy search"))?;
-                if !pool.admit_direct_categorical(
-                    sampled_search,
+                self.model_leases.ensure(episode_id, EvalRoute::Current)?;
+                if !pool.admit_direct_policy_rollout(
+                    &sampled.search,
                     identity,
                     root,
-                    GumbelEpisodeContext {
+                    PolicyRolloutContext {
                         noise_seed: sampled_trajectory_seed(episode_id),
-                        opponent: None,
                     },
                     episode_id,
                     false,
@@ -2378,6 +2933,10 @@ where
         root: E::Graph,
         context: GumbelEpisodeContext,
     ) -> EngineResult<GumbelEpisodeContext> {
+        self.model_leases.ensure(episode_id, EvalRoute::Current)?;
+        if self.sampled_tree {
+            self.model_leases.ensure(episode_id, EvalRoute::Incumbent)?;
+        }
         let reference = self.replay.provider.reference_with_features(
             engine,
             root,
@@ -2396,7 +2955,7 @@ where
         &mut self,
         engine: &mut E,
         pool: &mut WorkerPool<E::Graph, E::Candidate>,
-    ) -> EngineResult<Vec<OrchestratedEpisode<E::Graph, E::Candidate>>> {
+    ) -> EngineResult<Vec<CompletedTask<E::Graph, E::Candidate>>> {
         let references = &self.replay.references;
         pool.drive(
             engine,
@@ -2422,10 +2981,13 @@ where
         send_featurized_parked_routed(
             lane,
             pool,
-            intake_tx,
-            reference_intake_tx,
-            challenger_intake_tx,
+            FeaturizedEvalIntakes {
+                current: intake_tx,
+                incumbent: reference_intake_tx,
+                challenger: challenger_intake_tx,
+            },
             eval_pressure,
+            &mut self.model_leases,
             |episode_id| {
                 rollout
                     .and_then(|rollout| rollout.eval_route(episode_id))
@@ -2447,8 +3009,33 @@ where
         &mut self,
         engine: &mut E,
         search: &GumbelMcts,
-        mut completed: OrchestratedEpisode<E::Graph, E::Candidate>,
+        completed: CompletedTask<E::Graph, E::Candidate>,
     ) -> EngineResult<Option<u64>> {
+        let mut completed = match completed.episode {
+            CompletedSearchEpisode::Gumbel(episode) => OrchestratedEpisode {
+                worker_id: completed.worker_id,
+                episode_id: completed.episode_id,
+                evaluations: completed.evaluations,
+                episode,
+            },
+            CompletedSearchEpisode::PolicyRollout(episode) => {
+                return self.complete_policy_rollout(
+                    engine,
+                    completed.episode_id,
+                    completed.evaluations,
+                    episode,
+                );
+            }
+            CompletedSearchEpisode::Symmetric(episode) => {
+                return self.complete_symmetric(
+                    engine,
+                    search,
+                    completed.episode_id,
+                    completed.evaluations,
+                    *episode,
+                );
+            }
+        };
         let mut rollout = self
             .replay
             .rollout
@@ -2461,6 +3048,7 @@ where
             &mut self.extractor,
         )? {
             self.replay.rollout = Some(rollout);
+            self.model_leases.release(completed.episode_id);
             return Ok(None);
         }
         self.replay.rollout = Some(rollout);
@@ -2481,11 +3069,13 @@ where
                 .flatten()
                 .filter(|reward| reward.is_finite());
             let projection = match reward {
-                Some(final_reward) => reference_steps_for_gumbel_episode_with_features(
+                Some(final_reward) => reference_steps_for_episode_with_features(
                     engine,
                     &mut self.extractor,
-                    search,
-                    &completed.episode,
+                    episode_position_config(search),
+                    completed.episode.final_graph,
+                    completed.episode.final_context,
+                    &completed.episode.steps,
                     final_reward,
                 ),
                 None => Ok((Vec::new(), Vec::new())),
@@ -2521,6 +3111,7 @@ where
                         reference,
                     });
             } else {
+                self.model_leases.release(completed.episode_id);
                 self.per_root_policy
                     .as_mut()
                     .expect("per-root policy state exists")
@@ -2531,67 +3122,6 @@ where
                         owned_root: prelude.owned_root,
                         pressure_reserved: false,
                     });
-            }
-            return Ok(None);
-        }
-
-        let sampled_prelude = self
-            .sampled_trajectory
-            .as_mut()
-            .and_then(|sampled| sampled.in_flight.remove(&completed.episode_id));
-        if let Some(owned_root) = sampled_prelude {
-            let evaluations = self
-                .root_evaluations
-                .entry(completed.episode_id)
-                .or_default();
-            *evaluations = evaluations.saturating_add(completed.evaluations);
-            let measure = &completed.episode.final_measure;
-            let reward = (measure.measured && measure.valid)
-                .then_some(measure.scalar_reward)
-                .flatten()
-                .filter(|reward| reward.is_finite());
-            let projection = match reward {
-                Some(final_reward) => reference_steps_for_gumbel_episode_with_features(
-                    engine,
-                    &mut self.extractor,
-                    search,
-                    &completed.episode,
-                    final_reward,
-                ),
-                None => Ok((Vec::new(), Vec::new())),
-            };
-            let (steps, feature_candidates) = match projection {
-                Ok(projected) => projected,
-                Err(error) => {
-                    release_episode_handles(engine, &completed.episode, &[])?;
-                    return Err(error);
-                }
-            };
-            release_episode_handles(engine, &completed.episode, &feature_candidates)?;
-            let outcome = reward.map(|final_reward| RolloutOutcome {
-                final_reward,
-                final_graph: completed.episode.final_context,
-                steps,
-                search_config_hash: completed.episode.search_config_hash,
-                model_version: rollout_model_version(&completed.episode),
-            });
-            if let Some(reference) = self.replay.provider.finish_sampled_trajectory(outcome) {
-                self.sampled_trajectory
-                    .as_mut()
-                    .expect("sampled trajectory state exists")
-                    .ready
-                    .push_back(ReadySampledLearner {
-                        episode_id: completed.episode_id,
-                        root: completed.episode.root,
-                        owned_root,
-                        reference,
-                    });
-            } else {
-                if owned_root {
-                    engine.release(&[completed.episode.root], &[])?;
-                }
-                self.replay.admitted_at.remove(&completed.episode_id);
-                self.root_evaluations.remove(&completed.episode_id);
             }
             return Ok(None);
         }
@@ -2669,6 +3199,7 @@ where
                 self.replay.provider.observe(reward);
             }
             clear_replayed_episode_trace(&mut completed.episode);
+            self.model_leases.release(completed.episode_id);
             let evaluations = self
                 .root_evaluations
                 .remove(&completed.episode_id)
@@ -2731,6 +3262,7 @@ where
         }
 
         clear_replayed_episode_trace(&mut completed.episode);
+        self.model_leases.release(completed.episode_id);
         let evaluations = self
             .root_evaluations
             .remove(&completed.episode_id)
@@ -2750,23 +3282,38 @@ fn send_featurized_parked<G, C>(
     pool: &mut WorkerPool<G, C>,
     intake_tx: &SyncSender<FeaturizedEvalJob>,
     eval_pressure: &EvalPressure,
+    model_leases: &mut EpisodeModelLeases,
 ) -> EngineResult<()>
 where
     G: Copy + Eq + std::hash::Hash,
     C: Copy + Eq + std::hash::Hash,
 {
-    send_featurized_parked_routed(lane, pool, intake_tx, None, None, eval_pressure, |_| {
-        EvalRoute::Current
-    })
+    send_featurized_parked_routed(
+        lane,
+        pool,
+        FeaturizedEvalIntakes {
+            current: intake_tx,
+            incumbent: None,
+            challenger: None,
+        },
+        eval_pressure,
+        model_leases,
+        |_| EvalRoute::Current,
+    )
+}
+
+struct FeaturizedEvalIntakes<'a> {
+    current: &'a SyncSender<FeaturizedEvalJob>,
+    incumbent: Option<&'a SyncSender<FeaturizedEvalJob>>,
+    challenger: Option<&'a SyncSender<FeaturizedEvalJob>>,
 }
 
 fn send_featurized_parked_routed<G, C, F>(
     lane: usize,
     pool: &mut WorkerPool<G, C>,
-    intake_tx: &SyncSender<FeaturizedEvalJob>,
-    reference_intake_tx: Option<&SyncSender<FeaturizedEvalJob>>,
-    challenger_intake_tx: Option<&SyncSender<FeaturizedEvalJob>>,
+    intakes: FeaturizedEvalIntakes<'_>,
     eval_pressure: &EvalPressure,
+    model_leases: &mut EpisodeModelLeases,
     mut route: F,
 ) -> EngineResult<()>
 where
@@ -2792,14 +3339,15 @@ where
             EvalModel::Incumbent => EvalRoute::Incumbent,
         };
         let destination = match eval_route {
-            EvalRoute::Current => intake_tx,
-            EvalRoute::Incumbent => {
-                reference_intake_tx.ok_or_else(|| internal("missing incumbent eval backend"))?
-            }
-            EvalRoute::Challenger => {
-                challenger_intake_tx.ok_or_else(|| internal("missing challenger eval backend"))?
-            }
+            EvalRoute::Current => intakes.current,
+            EvalRoute::Incumbent => intakes
+                .incumbent
+                .ok_or_else(|| internal("missing incumbent eval backend"))?,
+            EvalRoute::Challenger => intakes
+                .challenger
+                .ok_or_else(|| internal("missing challenger eval backend"))?,
         };
+        let model = model_leases.ensure(parked.episode_id, eval_route)?;
         if parked.pressure_reserved {
             pool.consume_pressure_reservation(parked.slot, parked.token)?;
         }
@@ -2812,6 +3360,7 @@ where
                 row,
                 action_count: parked.action_count,
                 opponent_ref,
+                model,
             })
             .is_err()
         {
@@ -2834,6 +3383,16 @@ fn episode_search_contexts<G, C>(episode: &GumbelEpisode<G, C>) -> u64 {
     episode
         .root_stats
         .iter()
+        .map(|stats| stats.portable_contexts as u64)
+        .sum()
+}
+
+fn symmetric_search_contexts<G, C>(episode: &SymmetricEpisode<G, C>) -> u64 {
+    episode
+        .p1
+        .root_stats
+        .iter()
+        .chain(&episode.p2.root_stats)
         .map(|stats| stats.portable_contexts as u64)
         .sum()
 }
@@ -2969,7 +3528,12 @@ where
         created_candidates.extend(candidates.iter().copied());
         // Mirror the eval-side export gate: rows must train the model on
         // the same position inputs it served with.
-        let position = replay_position_features(search, extractor.schema(), index, reference)?;
+        let position = replay_position_features(
+            episode_position_config(search),
+            extractor.schema(),
+            index,
+            reference,
+        )?;
         let mut row = extractor
             .extract(engine, step.before, &candidates, position)
             .map_err(|_| internal("feature extraction failed"))?;
@@ -3038,6 +3602,164 @@ where
     }
 }
 
+fn feature_rows_for_symmetric_episode<E, X>(
+    engine: &mut E,
+    extractor: &mut X,
+    search: &GumbelMcts,
+    episode: &SymmetricEpisode<E::Graph, E::Candidate>,
+) -> EngineResult<SymmetricFeatureRows<E::Candidate>>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let mut candidates = Vec::new();
+    let rows = (|| {
+        let p1 = feature_rows_for_symmetric_actor(
+            engine,
+            extractor,
+            search,
+            &episode.p1,
+            &episode.p2,
+            false,
+            &mut candidates,
+        )?;
+        let p2 = feature_rows_for_symmetric_actor(
+            engine,
+            extractor,
+            search,
+            &episode.p2,
+            &episode.p1,
+            true,
+            &mut candidates,
+        )?;
+        Ok(SymmetricFeatureRows {
+            p1,
+            p2,
+            candidates: std::mem::take(&mut candidates),
+        })
+    })();
+    match rows {
+        Ok(rows) => Ok(rows),
+        Err(error) => {
+            engine.release(&[], &candidates)?;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn feature_rows_for_symmetric_actor<E, X>(
+    engine: &mut E,
+    extractor: &mut X,
+    search: &GumbelMcts,
+    actor: &SymmetricActorTrace<E::Graph, E::Candidate>,
+    opponent: &SymmetricActorTrace<E::Graph, E::Candidate>,
+    opponent_after_turn: bool,
+    created_candidates: &mut Vec<E::Candidate>,
+) -> EngineResult<Vec<Vec<u8>>>
+where
+    E: GraphEngine,
+    X: FeatureExtractor<E>,
+{
+    let schema = extractor.schema().clone();
+    let mut rows = Vec::with_capacity(actor.steps.len());
+    let mut candidates = Vec::new();
+    for (index, step) in actor.steps.iter().enumerate() {
+        candidates.clear();
+        engine.candidates(
+            step.before,
+            search.config().candidate_options,
+            &mut candidates,
+        )?;
+        created_candidates.extend(candidates.iter().copied());
+        let (actor_step, actor_inactive) =
+            symmetric_position_state(actor, index, false, search.config());
+        let mut position = replay_position_features(
+            episode_position_config(search),
+            extractor.schema(),
+            actor_step,
+            None,
+        )?;
+        if actor_inactive {
+            position.budget_step = -position.budget_step.abs();
+        }
+        position.opponent_present = true;
+        let mut row = extractor
+            .extract(engine, step.before, &candidates, position)
+            .map_err(|_| internal("feature extraction failed"))?;
+
+        let requested_opponent_index = index + usize::from(opponent_after_turn);
+        let opponent_index = requested_opponent_index.min(opponent.steps.len());
+        let opponent_graph = symmetric_actor_state(opponent, opponent_index);
+        let (opponent_step, opponent_inactive) = symmetric_position_state(
+            opponent,
+            opponent_index,
+            requested_opponent_index > opponent.steps.len(),
+            search.config(),
+        );
+        let mut opponent_position = replay_position_features(
+            episode_position_config(search),
+            extractor.schema(),
+            opponent_step,
+            None,
+        )?;
+        if opponent_inactive {
+            opponent_position.budget_step = -opponent_position.budget_step.abs();
+        }
+        let opponent_row = extractor
+            .extract(engine, opponent_graph, &[], opponent_position)
+            .map_err(|_| internal("opponent feature extraction failed"))?;
+        row.opponent = Some(OpponentStateFeatures {
+            node_count: opponent_row.node_count,
+            node_tokens: opponent_row.node_tokens,
+            node_attrs: opponent_row.node_attrs,
+            edges: opponent_row.edges,
+            position: opponent_row.position,
+        });
+        let expected_actions = if search.config().mask_stop {
+            step.legal_actions.len().saturating_add(1)
+        } else {
+            step.legal_actions.len()
+        };
+        if row.actions.len() != expected_actions {
+            return Err(internal("symmetric feature row action count mismatch"));
+        }
+
+        let mut bytes = Vec::new();
+        encode_feature_row(&row, &schema, &mut bytes)
+            .map_err(|_| internal("feature row encoding failed"))?;
+        rows.push(bytes);
+    }
+    Ok(rows)
+}
+
+fn symmetric_actor_state<G: Copy, C>(actor: &SymmetricActorTrace<G, C>, index: usize) -> G {
+    if index == 0 {
+        actor.root
+    } else {
+        actor
+            .steps
+            .get(index - 1)
+            .map_or(actor.final_graph, |step| step.after)
+    }
+}
+
+fn symmetric_position_state<G, C>(
+    actor: &SymmetricActorTrace<G, C>,
+    decision_count: usize,
+    observed_after_trace: bool,
+    config: gz_search::GumbelMctsConfig,
+) -> (usize, bool) {
+    let rewrites = actor.steps[..decision_count]
+        .iter()
+        .filter(|step| matches!(step.action, SearchAction::Candidate(_)))
+        .count();
+    let at_trace_end = decision_count == actor.steps.len();
+    let inactive = at_trace_end
+        && (actor.stopped || rewrites >= config.max_steps || actor.blocked && observed_after_trace);
+    (rewrites, inactive)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn feature_rows_for_competitive_actor<E, X>(
     engine: &mut E,
@@ -3063,7 +3785,12 @@ where
             &mut candidates,
         )?;
         created_candidates.extend(candidates.iter().copied());
-        let mut position = replay_position_features(search, extractor.schema(), index, None)?;
+        let mut position = replay_position_features(
+            episode_position_config(search),
+            extractor.schema(),
+            index,
+            None,
+        )?;
         position.opponent_present = true;
         let mut row = extractor
             .extract(engine, step.before, &candidates, position)
@@ -3071,8 +3798,12 @@ where
 
         let opponent_index = (index + usize::from(opponent_after_turn)).min(opponent.steps.len());
         let (opponent_graph, _) = competitive_actor_state(opponent, opponent_index);
-        let opponent_position =
-            replay_position_features(search, extractor.schema(), opponent_index, None)?;
+        let opponent_position = replay_position_features(
+            episode_position_config(search),
+            extractor.schema(),
+            opponent_index,
+            None,
+        )?;
         let opponent_row = extractor
             .extract(engine, opponent_graph, &[], opponent_position)
             .map_err(|_| internal("opponent feature extraction failed"))?;
@@ -3196,6 +3927,20 @@ fn measured_competitive_game<G: Copy, C: Copy>(
     })
 }
 
+fn measured_symmetric_game<G: Copy, C: Copy>(
+    lane: usize,
+    game_id: u64,
+    episode: &SymmetricEpisode<G, C>,
+    rows: &SymmetricFeatureRows<C>,
+) -> MeasuredSymmetricGame {
+    MeasuredSymmetricGame {
+        lane,
+        game_id,
+        p1_artifact: symmetric_artifact(&episode.p1, &rows.p1, episode.search_config_hash),
+        p2_artifact: symmetric_artifact(&episode.p2, &rows.p2, episode.search_config_hash),
+    }
+}
+
 fn value_target_root_reward<E>(
     engine: &mut E,
     root: E::Graph,
@@ -3205,7 +3950,10 @@ fn value_target_root_reward<E>(
 where
     E: GraphEngine,
 {
-    if matches!(value_target, ValueTargetConfig::Sign) {
+    if matches!(
+        value_target,
+        ValueTargetConfig::Sign | ValueTargetConfig::SingleVanilla
+    ) {
         return Ok(0.0);
     }
     let measure = engine.measure(root, options)?;
@@ -3238,6 +3986,37 @@ fn competitive_artifact<G: Copy, C>(
                 selected_action: step.selected_action,
                 legal_actions: step.legal_actions.clone(),
                 policy_target: step.policy_target.clone(),
+                root_value: Some(step.root_value),
+                root_search_value: Some(step.root_search_value),
+                model_version: Some(step.model_version),
+            })
+            .collect(),
+        feature_rows: Some(feature_rows.to_vec()),
+    }
+}
+
+fn symmetric_artifact<G: Copy, C>(
+    actor: &SymmetricActorTrace<G, C>,
+    feature_rows: &[Vec<u8>],
+    search_config_hash: gz_engine::SearchConfigHash,
+) -> CompletedEpisodeArtifact {
+    CompletedEpisodeArtifact {
+        root: actor.root_context,
+        final_graph: actor.final_context,
+        final_measure: gz_engine::MeasureSummary::from(&actor.final_measure),
+        stop_selected: actor.stopped,
+        search_config_hash,
+        steps: actor
+            .steps
+            .iter()
+            .map(|step| CompletedEpisodeStep {
+                before: step.step_ref.before,
+                after: step.step_ref.after,
+                selected_action: step.selected_action,
+                legal_actions: step.legal_actions.clone(),
+                policy_target: step.policy_target.clone(),
+                root_value: Some(step.root_value),
+                root_search_value: Some(step.root_search_value),
                 model_version: Some(step.model_version),
             })
             .collect(),
@@ -3285,14 +4064,48 @@ fn sampled_trajectory_seed(episode_id: EpisodeId) -> u64 {
     crate::root::episode_noise_seed(episode_id.value() ^ SAMPLE_TRAJECTORY_SALT)
 }
 
+#[derive(Clone, Copy)]
+struct EpisodePositionConfig {
+    max_steps: usize,
+    export_position: bool,
+    candidate_options: CandidateOptions,
+}
+
+fn episode_position_config(search: &GumbelMcts) -> EpisodePositionConfig {
+    let config = search.config();
+    EpisodePositionConfig {
+        max_steps: config.max_steps,
+        export_position: config.export_position,
+        candidate_options: config.candidate_options,
+    }
+}
+
+fn policy_position_config(search: &PolicyRollout) -> EpisodePositionConfig {
+    let config = search.config();
+    EpisodePositionConfig {
+        max_steps: config.max_steps,
+        export_position: config.export_position,
+        candidate_options: config.candidate_options,
+    }
+}
+
 fn replay_position_features(
-    search: &GumbelMcts,
+    config: EpisodePositionConfig,
     schema: &FeatureSchema,
     index: usize,
     reference: Option<&Reference>,
 ) -> EngineResult<PositionFeatures> {
-    let (root_step, budget_fraction, budget_step) = if search.config().export_position {
-        let (budget_fraction, budget_step) = search.root_budget(index);
+    let (root_step, budget_fraction, budget_step) = if config.export_position {
+        let budget_step = if config.max_steps == 0 {
+            0.0
+        } else {
+            1.0 / config.max_steps as f32
+        };
+        let budget_fraction = if config.max_steps == 0 {
+            1.0
+        } else {
+            config.max_steps.saturating_sub(index) as f32 / config.max_steps as f32
+        };
         (
             u32::try_from(index).map_err(|_| internal("root step overflow"))?,
             budget_fraction,
@@ -3322,15 +4135,47 @@ fn release_episode_handles<E>(
 where
     E: GraphEngine,
 {
+    release_created_handles(
+        engine,
+        &episode.created_graphs,
+        &episode.created_candidates,
+        extra_candidates,
+    )
+}
+
+fn release_symmetric_episode_handles<E>(
+    engine: &mut E,
+    episode: &SymmetricEpisode<E::Graph, E::Candidate>,
+    extra_candidates: &[E::Candidate],
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
+    release_created_handles(
+        engine,
+        &episode.created_graphs,
+        &episode.created_candidates,
+        extra_candidates,
+    )
+}
+
+fn release_created_handles<E>(
+    engine: &mut E,
+    created_graphs: &[E::Graph],
+    created_candidates: &[E::Candidate],
+    extra_candidates: &[E::Candidate],
+) -> EngineResult<()>
+where
+    E: GraphEngine,
+{
     if extra_candidates.is_empty() {
-        return engine.release(&episode.created_graphs, &episode.created_candidates);
+        return engine.release(created_graphs, created_candidates);
     }
 
-    let mut candidates =
-        Vec::with_capacity(episode.created_candidates.len() + extra_candidates.len());
-    candidates.extend_from_slice(&episode.created_candidates);
+    let mut candidates = Vec::with_capacity(created_candidates.len() + extra_candidates.len());
+    candidates.extend_from_slice(created_candidates);
     candidates.extend_from_slice(extra_candidates);
-    engine.release(&episode.created_graphs, &candidates)
+    engine.release(created_graphs, &candidates)
 }
 
 fn reference_steps_for_gumbel_episode<G, C>(
@@ -3359,41 +4204,96 @@ fn reference_steps_for_gumbel_episode<G, C>(
     steps
 }
 
-fn reference_steps_for_gumbel_episode_with_features<E, X>(
+trait ReferenceStepView<G> {
+    fn before(&self) -> G;
+    fn after(&self) -> G;
+    fn before_context(&self) -> gz_engine::ReplayGraphContext;
+    fn after_context(&self) -> gz_engine::ReplayGraphContext;
+    fn model_version(&self) -> ModelVersion;
+}
+
+impl<G: Copy, C> ReferenceStepView<G> for GumbelStep<G, C> {
+    fn before(&self) -> G {
+        self.before
+    }
+
+    fn after(&self) -> G {
+        self.after
+    }
+
+    fn before_context(&self) -> gz_engine::ReplayGraphContext {
+        self.step_ref.before
+    }
+
+    fn after_context(&self) -> gz_engine::ReplayGraphContext {
+        self.step_ref.after
+    }
+
+    fn model_version(&self) -> ModelVersion {
+        self.model_version
+    }
+}
+
+impl<G: Copy, C> ReferenceStepView<G> for PolicyRolloutStep<G, C> {
+    fn before(&self) -> G {
+        self.before
+    }
+
+    fn after(&self) -> G {
+        self.after
+    }
+
+    fn before_context(&self) -> gz_engine::ReplayGraphContext {
+        self.step_ref.before
+    }
+
+    fn after_context(&self) -> gz_engine::ReplayGraphContext {
+        self.step_ref.after
+    }
+
+    fn model_version(&self) -> ModelVersion {
+        self.model_version
+    }
+}
+
+fn reference_steps_for_episode_with_features<E, X, S>(
     engine: &mut E,
     extractor: &mut X,
-    search: &GumbelMcts,
-    episode: &GumbelEpisode<E::Graph, E::Candidate>,
+    config: EpisodePositionConfig,
+    final_graph: E::Graph,
+    final_context: gz_engine::ReplayGraphContext,
+    steps: &[S],
     final_reward: f32,
 ) -> EngineResult<(Vec<crate::reference::ReferenceStep>, Vec<E::Candidate>)>
 where
     E: GraphEngine,
     X: FeatureExtractor<E>,
+    S: ReferenceStepView<E::Graph>,
 {
     let mut candidates = Vec::new();
     let steps = (|| {
-        let mut steps = Vec::with_capacity(episode.steps.len() + 1);
+        let mut projected = Vec::with_capacity(steps.len() + 1);
 
-        match episode.steps.first() {
-            Some(step) => steps.push(reference_step_with_features(
+        match steps.first() {
+            Some(step) => projected.push(reference_step_with_features(
                 engine,
                 extractor,
-                search,
-                GumbelReferenceStepInput {
-                    graph: step.before,
-                    context: step.step_ref.before,
+                config,
+                ReferenceStepInput {
+                    graph: step.before(),
+                    context: step.before_context(),
                     index: 0,
                     final_reward,
                 },
                 &mut candidates,
             )?),
-            None => steps.push(reference_step_with_features(
+            None => projected.push(reference_step_with_features(
                 engine,
                 extractor,
-                search,
-                GumbelReferenceStepInput {
-                    graph: episode.final_graph,
-                    context: episode.final_context,
+                config,
+                ReferenceStepInput {
+                    graph: final_graph,
+                    context: final_context,
                     index: 0,
                     final_reward,
                 },
@@ -3401,14 +4301,14 @@ where
             )?),
         }
 
-        for (index, step) in episode.steps.iter().enumerate() {
-            steps.push(reference_step_with_features(
+        for (index, step) in steps.iter().enumerate() {
+            projected.push(reference_step_with_features(
                 engine,
                 extractor,
-                search,
-                GumbelReferenceStepInput {
-                    graph: step.after,
-                    context: step.step_ref.after,
+                config,
+                ReferenceStepInput {
+                    graph: step.after(),
+                    context: step.after_context(),
                     index: index + 1,
                     final_reward,
                 },
@@ -3416,7 +4316,7 @@ where
             )?);
         }
 
-        Ok(steps)
+        Ok(projected)
     })();
 
     match steps {
@@ -3428,7 +4328,7 @@ where
     }
 }
 
-struct GumbelReferenceStepInput<G> {
+struct ReferenceStepInput<G> {
     graph: G,
     context: gz_engine::ReplayGraphContext,
     index: usize,
@@ -3438,8 +4338,8 @@ struct GumbelReferenceStepInput<G> {
 fn reference_step_with_features<E, X>(
     engine: &mut E,
     extractor: &mut X,
-    search: &GumbelMcts,
-    input: GumbelReferenceStepInput<E::Graph>,
+    config: EpisodePositionConfig,
+    input: ReferenceStepInput<E::Graph>,
     created_candidates: &mut Vec<E::Candidate>,
 ) -> EngineResult<crate::reference::ReferenceStep>
 where
@@ -3447,13 +4347,9 @@ where
     X: FeatureExtractor<E>,
 {
     let mut candidates = Vec::new();
-    engine.candidates(
-        input.graph,
-        search.config().candidate_options,
-        &mut candidates,
-    )?;
+    engine.candidates(input.graph, config.candidate_options, &mut candidates)?;
     created_candidates.extend(candidates.iter().copied());
-    let position = replay_position_features(search, extractor.schema(), input.index, None)?;
+    let position = replay_position_features(config, extractor.schema(), input.index, None)?;
     let scale = extractor.schema().config().opponent_reward_scale;
     let row = extractor
         .extract(
@@ -3481,7 +4377,7 @@ where
 }
 
 /// Drives opponent rollout episodes for rollout-based reference providers
-/// (the policy opponent). Tracks the newest model version seen on eval
+/// (the policy opponent). Tracks the active model version advertised on eval
 /// replies. It prioritizes the greedy checkpoint challenge, then fills the
 /// accepted checkpoint's trajectory pool with categorical policy rollouts.
 /// Rollout episodes never reach the replay store or the run summary.
@@ -3780,15 +4676,17 @@ impl OpponentRollout {
                 reference_steps_for_gumbel_episode(&completed.episode),
                 Vec::new(),
             ),
-            (_, Some(final_reward)) => reference_steps_for_gumbel_episode_with_features(
+            (_, Some(final_reward)) => reference_steps_for_episode_with_features(
                 engine,
                 extractor,
-                match kind {
+                episode_position_config(match kind {
                     OpponentRolloutKind::Challenge => &self.greedy_search,
                     OpponentRolloutKind::Sample(_) => &self.sample_search,
                     OpponentRolloutKind::Arena { .. } => unreachable!(),
-                },
-                &completed.episode,
+                }),
+                completed.episode.final_graph,
+                completed.episode.final_context,
+                &completed.episode.steps,
                 final_reward,
             )?,
             (_, None) => (Vec::new(), Vec::new()),
@@ -3845,15 +4743,21 @@ fn arena_score(kind: OpponentRolloutKind, final_reward: Option<f32>) -> Option<f
     final_reward.map(|reward| (reward - root_reward) / root_reward.abs().max(1.0))
 }
 
-/// A policy trajectory belongs to one checkpoint only. A hot-swap that
-/// lands between roots makes the rollout unusable as either a challenger
-/// or a trajectory-pool sample.
-fn rollout_model_version<G, C>(episode: &GumbelEpisode<G, C>) -> Option<ModelVersion> {
-    let version = episode.steps.first()?.model_version;
-    episode
-        .steps
+/// A policy trajectory belongs to one checkpoint only. Episode leases make
+/// this invariant hold across evaluator hot-swaps; the scan remains the
+/// attribution guard for empty or malformed trajectories.
+fn rollout_model_version<G: Copy, C>(episode: &GumbelEpisode<G, C>) -> Option<ModelVersion> {
+    homogeneous_step_model_version(&episode.steps)
+}
+
+fn homogeneous_step_model_version<G, S>(steps: &[S]) -> Option<ModelVersion>
+where
+    S: ReferenceStepView<G>,
+{
+    let version = steps.first()?.model_version();
+    steps
         .iter()
-        .all(|step| step.model_version == version)
+        .all(|step| step.model_version() == version)
         .then_some(version)
 }
 
@@ -3897,6 +4801,20 @@ fn append_competitive_replay_job(
     done.recv().map_err(|_| internal("replay sink failed"))?
 }
 
+fn append_symmetric_replay_job(
+    replay_tx: &SyncSender<ReplayJob>,
+    game: MeasuredSymmetricGame,
+) -> EngineResult<MeasurerAdmission> {
+    let (ack, done) = sync_channel(1);
+    replay_tx
+        .send(ReplayJob::Symmetric {
+            game: Box::new(game),
+            ack,
+        })
+        .map_err(|_| internal("replay sink failed"))?;
+    done.recv().map_err(|_| internal("replay sink failed"))?
+}
+
 /// Resumes every pending reply; returns the newest model version seen so
 /// callers can drive version-triggered opponent rollouts.
 fn receive_replies<E>(
@@ -3920,14 +4838,14 @@ where
             .recv()
             .map_err(|_| internal("eval backend unavailable"))?,
     };
-    let mut version = (reply.route == EvalRoute::Current).then_some(reply.output.model_version);
+    let mut version = (reply.route == EvalRoute::Current).then_some(reply.active_model_version);
     pool.resume(engine, reply.slot, reply.token, reply.output)?;
 
     loop {
         match reply_rx.try_recv() {
             Ok(reply) => {
                 if reply.route == EvalRoute::Current {
-                    version = Some(reply.output.model_version);
+                    version = Some(reply.active_model_version);
                 }
                 pool.resume(engine, reply.slot, reply.token, reply.output)?;
             }
@@ -3996,6 +4914,7 @@ where
             let _ = reply_txs[job.lane].send(EvalReply {
                 slot: job.slot,
                 token: job.token,
+                active_model_version: output.model_version,
                 output,
                 route: EvalRoute::Current,
             });
@@ -4021,8 +4940,7 @@ fn run_featurized_batcher<B>(
     intake_rx: Receiver<FeaturizedEvalJob>,
     reply_txs: Vec<SyncSender<EvalReply>>,
     config: ThreadedOrchestratorConfig,
-    route: EvalRoute,
-    eval_pressure: Option<Arc<EvalPressure>>,
+    context: FeaturizedBatcherContext,
 ) -> EngineResult<Vec<usize>>
 where
     B: FeatureEvalBackend,
@@ -4046,16 +4964,34 @@ where
     let mut action_counts = Vec::with_capacity(max_batch);
     let mut opponent_refs = Vec::with_capacity(max_batch);
     let mut bytes = Vec::new();
-    let mut in_flight: std::collections::VecDeque<(Routing, gz_eval_service::PendingBatch)> =
-        std::collections::VecDeque::with_capacity(EVAL_PIPELINE_DEPTH);
+    let mut deferred: VecDeque<FeaturizedEvalJob> = VecDeque::with_capacity(max_batch);
+    let mut in_flight: VecDeque<(Routing, gz_eval_service::PendingBatch, ModelGeneration)> =
+        VecDeque::with_capacity(EVAL_PIPELINE_DEPTH);
     let mut capacity_accounted_at = None;
     let mut intake_open = true;
     let mut stats_batches: usize = 0;
     let mut last_stats = Instant::now();
 
-    while intake_open || !in_flight.is_empty() {
+    while intake_open || !in_flight.is_empty() || !deferred.is_empty() {
+        release_releasable_models(&mut backend, &context.model_registry)?;
         batch.clear();
-        if intake_open && in_flight.len() < EVAL_PIPELINE_DEPTH {
+        let mut batch_model = None;
+        if in_flight.len() < EVAL_PIPELINE_DEPTH && (intake_open || !deferred.is_empty()) {
+            if let Some(first) = deferred.pop_front() {
+                batch_model = Some(first.model);
+                batch.push(first);
+                let queued = deferred.len();
+                for _ in 0..queued {
+                    let job = deferred
+                        .pop_front()
+                        .expect("deferred eval queue length changed");
+                    if batch.len() < max_batch && Some(job.model) == batch_model {
+                        batch.push(job);
+                    } else {
+                        deferred.push_back(job);
+                    }
+                }
+            }
             // Fill toward a FULL batch. The evaluator's buffers (and its
             // CUDA-graph forward) are capacity-shaped, so a half batch
             // costs the same GPU time as a full one: padding rows are
@@ -4071,7 +5007,10 @@ where
                 if batch.is_empty() && in_flight.is_empty() {
                     // Nothing anywhere: block for work.
                     match intake_rx.recv() {
-                        Ok(job) => batch.push(job),
+                        Ok(job) => {
+                            batch_model = Some(job.model);
+                            batch.push(job);
+                        }
                         Err(_) => {
                             intake_open = false;
                             break;
@@ -4079,8 +5018,23 @@ where
                     }
                     continue;
                 }
+                if !intake_open {
+                    break;
+                }
                 match intake_rx.recv_timeout(config.flush_after) {
-                    Ok(job) => batch.push(job),
+                    Ok(job) => {
+                        if batch_model.is_none() {
+                            batch_model = Some(job.model);
+                            batch.push(job);
+                        } else if Some(job.model) == batch_model {
+                            batch.push(job);
+                        } else {
+                            deferred.push_back(job);
+                            if deferred.len() >= max_batch {
+                                break;
+                            }
+                        }
+                    }
                     Err(RecvTimeoutError::Timeout) => {
                         if in_flight.is_empty() {
                             // Backend idle: ship what we have now.
@@ -4091,10 +5045,10 @@ where
                             &mut in_flight,
                             &reply_txs,
                             &mut batch_sizes,
-                            route,
+                            &context,
                             max_batch,
                             EvalCapacityAccounting {
-                                pressure: eval_pressure.as_deref(),
+                                pressure: context.eval_pressure.as_deref(),
                                 accounted_at: &mut capacity_accounted_at,
                             },
                         )?;
@@ -4110,11 +5064,15 @@ where
         let submitted = if batch.is_empty() {
             false
         } else {
+            let model = batch_model.ok_or_else(|| internal("missing eval batch model"))?;
             let mut routing: Routing = Vec::with_capacity(batch.len());
             rows.clear();
             action_counts.clear();
             opponent_refs.clear();
             for job in batch.drain(..) {
+                if job.model != model {
+                    return Err(internal("mixed model generations in eval batch"));
+                }
                 routing.push((job.lane, job.slot, job.token, job.action_count));
                 action_counts.push(job.action_count);
                 opponent_refs.push(job.opponent_ref);
@@ -4123,13 +5081,14 @@ where
             collator
                 .collate_with_opponent_refs(&rows, &opponent_refs, &mut bytes)
                 .map_err(|_| internal("feature collation failed"))?;
-            if route == EvalRoute::Current && in_flight.is_empty() {
+            if context.route == EvalRoute::Current && in_flight.is_empty() {
                 capacity_accounted_at = Some(Instant::now());
             }
+            release_releasable_models(&mut backend, &context.model_registry)?;
             let pending = backend
-                .submit(&bytes, &action_counts)
+                .submit_for_model(model, &bytes, &action_counts)
                 .map_err(|_| internal("feature eval backend failed"))?;
-            in_flight.push_back((routing, pending));
+            in_flight.push_back((routing, pending, model));
             true
         };
 
@@ -4144,10 +5103,10 @@ where
                 &mut in_flight,
                 &reply_txs,
                 &mut batch_sizes,
-                route,
+                &context,
                 max_batch,
                 EvalCapacityAccounting {
-                    pressure: eval_pressure.as_deref(),
+                    pressure: context.eval_pressure.as_deref(),
                     accounted_at: &mut capacity_accounted_at,
                 },
             )?;
@@ -4156,7 +5115,7 @@ where
             stats_batches = batch_sizes.len();
             let stats_rows: u64 = batch_sizes.iter().map(|&size| size as u64).sum();
             last_stats = Instant::now();
-            let role = match route {
+            let role = match context.route {
                 EvalRoute::Current => "current",
                 EvalRoute::Incumbent => "incumbent",
                 EvalRoute::Challenger => "challenger",
@@ -4165,6 +5124,7 @@ where
         }
     }
 
+    release_releasable_models(&mut backend, &context.model_registry)?;
     Ok(batch_sizes)
 }
 
@@ -4177,17 +5137,21 @@ struct EvalCapacityAccounting<'a> {
 
 fn drain_oldest<B>(
     backend: &mut B,
-    in_flight: &mut std::collections::VecDeque<(BatcherRouting, gz_eval_service::PendingBatch)>,
+    in_flight: &mut VecDeque<(
+        BatcherRouting,
+        gz_eval_service::PendingBatch,
+        ModelGeneration,
+    )>,
     reply_txs: &[SyncSender<EvalReply>],
     batch_sizes: &mut Vec<usize>,
-    route: EvalRoute,
+    context: &FeaturizedBatcherContext,
     max_batch: usize,
     capacity: EvalCapacityAccounting<'_>,
 ) -> EngineResult<()>
 where
     B: FeatureEvalBackend,
 {
-    let Some((routing, pending)) = in_flight.pop_front() else {
+    let Some((routing, pending, model)) = in_flight.pop_front() else {
         return Ok(());
     };
     let capacity_work = backend.capacity_work(routing.len(), max_batch);
@@ -4195,11 +5159,15 @@ where
         .receive(pending)
         .map_err(|_| internal("feature eval backend failed"))?;
     let completed_at = Instant::now();
+    if outputs.model_version != model.version {
+        return Err(internal("evaluator served the wrong model version"));
+    }
     let counts = routing
         .iter()
         .map(|&(_, _, _, action_count)| action_count)
         .collect::<Vec<_>>();
     validate_backend_outputs(&outputs, &counts)?;
+    context.model_registry.publish(outputs.active_generation)?;
     let completed = routing.len();
     batch_sizes.push(completed);
 
@@ -4207,16 +5175,17 @@ where
         let _ = reply_txs[lane].send(EvalReply {
             slot,
             token,
+            active_model_version: outputs.active_generation.version,
             output: EvalOutput {
                 model_version: outputs.model_version,
                 policy_logits: row.policy_logits,
                 value: row.value,
             },
-            route,
+            route: context.route,
         });
     }
     if let Some(eval_pressure) = capacity.pressure {
-        match route {
+        match context.route {
             EvalRoute::Current => {
                 let capacity_started = capacity
                     .accounted_at
@@ -4230,6 +5199,22 @@ where
             }
             EvalRoute::Incumbent | EvalRoute::Challenger => eval_pressure.complete(completed),
         }
+    }
+    release_releasable_models(backend, &context.model_registry)?;
+    Ok(())
+}
+
+fn release_releasable_models<B>(
+    backend: &mut B,
+    model_registry: &ModelLeaseRegistry,
+) -> EngineResult<()>
+where
+    B: FeatureEvalBackend,
+{
+    for model in model_registry.take_releasable() {
+        backend
+            .release_model_generation(model)
+            .map_err(|_| internal("feature eval backend failed"))?;
     }
     Ok(())
 }
@@ -4270,6 +5255,10 @@ fn run_replay_sink(
                 measurer.admit_competitive(*game).map_err(map_replay_error),
                 ack,
             ),
+            ReplayJob::Symmetric { game, ack } => (
+                measurer.admit_symmetric(*game).map_err(map_replay_error),
+                ack,
+            ),
         };
         let failed = result.as_ref().err().cloned();
         let _ = ack.send(result);
@@ -4304,6 +5293,8 @@ fn ensure_replay_data_mode<E, P>(
     store: &ReplayStore,
     providers: &[P],
     value_target: ValueTargetConfig,
+    symmetric_selfplay: bool,
+    mask_stop: bool,
 ) -> EngineResult<()>
 where
     E: GraphEngine,
@@ -4321,10 +5312,23 @@ where
     if !value_target.is_valid() {
         return Err(internal("invalid value target configuration"));
     }
-    let data_mode = match value_target {
-        ValueTargetConfig::Sign if sampled_tree => gz_replay::ReplayDataMode::SampledTree,
-        ValueTargetConfig::Sign => gz_replay::ReplayDataMode::Standard,
-        ValueTargetConfig::Graded { reward_scale } => {
+    let data_mode = match (value_target, symmetric_selfplay) {
+        (ValueTargetConfig::Sign, true) if mask_stop => {
+            gz_replay::ReplayDataMode::SymmetricSelfplay
+        }
+        (ValueTargetConfig::Sign, true) => gz_replay::ReplayDataMode::SymmetricSelfplayStop,
+        (ValueTargetConfig::SingleVanilla | ValueTargetConfig::Graded { .. }, true) => {
+            return Err(internal("symmetric selfplay requires sign value targets"));
+        }
+        (ValueTargetConfig::Sign, false) if sampled_tree => gz_replay::ReplayDataMode::SampledTree,
+        (ValueTargetConfig::Sign, false) => gz_replay::ReplayDataMode::Standard,
+        (ValueTargetConfig::SingleVanilla, false) if sampled_tree => {
+            return Err(internal(
+                "single-vanilla replay cannot use sampled-tree providers",
+            ));
+        }
+        (ValueTargetConfig::SingleVanilla, false) => gz_replay::ReplayDataMode::SingleVanilla,
+        (ValueTargetConfig::Graded { reward_scale }, false) => {
             gz_replay::ReplayDataMode::graded(sampled_tree, reward_scale)
                 .map_err(map_replay_error)?
         }

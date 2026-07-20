@@ -21,9 +21,22 @@ from gz.checkpoints.publish import (
     prune_checkpoints,
 )
 from gz.trainer.data import TrainingStager
+from gz.trainer.episode_schedule import (
+    EpisodeLengthProgress,
+    EpisodeLengthSchedule,
+    EpisodeLengthStage,
+    parse_episode_length_schedule as _parse_episode_length_schedule,
+)
+from gz.trainer.episode_stages import (
+    EpisodeStagePlan,
+    episode_length_stage_config as _episode_length_stage_config,
+    load_progress as _load_episode_length_progress,
+    state_path as _episode_length_state_path,
+    write_progress as _write_episode_length_progress,
+)
 from gz.trainer.loop import LoopConfig, TrainerLoop
 from gz.trainer.publish import EmaWeights, publish_ema
-from gz.trainer.sampler import SampleClient, step_seed
+from gz.trainer.sampler import SampleAck, SampleClient, step_seed
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,18 +51,28 @@ class TrainerConfig:
     # A positive value samples and stages an independent value batch.
     value_batch: int = 0
     window_rows: int = 200_000
-    # Zero inherits window_rows. Mirrored pair replay uses half the policy
-    # row window because each source row contributes two orientations.
+    # Zero inherits window_rows. This counts source rows; paired value
+    # training evaluates both orientations of every sampled source row.
     value_window_rows: int = 0
     total_steps: int = 1000
     publish_interval: int = 500
     # Newest ordinary actor checkpoints to retain. Named checkpoint pointers
     # and in-flight arena challengers are retained in addition; zero disables.
     checkpoint_retain: int = 0
+    # Publish and permanently pin an exact checkpoint at each positive
+    # multiple of this many optimizer steps. Zero disables milestone pins.
+    permanent_checkpoint_interval: int = 1000
     # Hold each periodic checkpoint until the next training gate. A one-block
     # lag matches whittlezero's overlapped actor snapshot schedule.
     publish_lag_blocks: int = 0
     value_weight: float = 1.0
+    # Scale value gradients entering the shared trunk while leaving the
+    # private value head's gradients unchanged.
+    value_trunk_grad_scale: float = 1.0
+    value_final_weight: float = 1.0
+    value_v8_weight: float = 0.0
+    value_v32_weight: float = 0.0
+    terminal_score_weight: float = 0.0
     weight_decay: float = 0.01
     optimizer: str = "adamw"
     adamw_lr: float | None = None
@@ -113,6 +136,7 @@ class TrainerConfig:
 class SelfplayConfig:
     lanes: int = 2
     workers_per_lane: int = 8
+    training_mode: str = "competitive"
     simulations: int = 8
     max_considered: int = 16
     gumbel_scale: float = 0.0
@@ -167,9 +191,8 @@ class SelfplayConfig:
     # learner/reference reward margin when graded, hard +/-1 when sign.
     value_reward: str = "sign"
     value_reward_scale: float = 0.1
-    # Carry the selected subtree across moves. whittlezero searches a
-    # fresh tree per move; visit-based final selection is only faithful
-    # with reuse off.
+    # Carry the selected subtree across moves. Each promoted root still gets
+    # the configured fresh budget relative to its inherited visit baseline.
     tree_reuse: bool = True
     # Evaluator server processes; lanes stripe across them (torch only).
     eval_processes: int = 1
@@ -177,6 +200,8 @@ class SelfplayConfig:
     # adaptive smoothing.
     admission_stagger_ms: int = 0
     admission_smoothing: bool = False
+    # Evaluate independent symmetric MCTS root branches concurrently.
+    wave_batching: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,10 +230,16 @@ class RunConfig:
     paths: PathsConfig
     wandb: WandbConfig
     arch: ArchConfig
-
+    episode_length_schedule: EpisodeLengthSchedule
 
 def _sample_window_rows(window_rows: int, produced_rows: int) -> int:
     return max(1, min(int(window_rows), int(produced_rows)))
+
+
+def _cumulative_reuse(step: int, batch: int, produced_rows: int) -> float:
+    if batch <= 0 or produced_rows <= 0:
+        return 0.0
+    return (step + 1) * batch / produced_rows
 
 
 def _resolved_trainer_seeds(config: TrainerConfig) -> tuple[int, int]:
@@ -252,25 +283,33 @@ def _sample_training_batches(
     run_seed: int,
     step: int,
     produced_rows: int,
+    produced_policy_rows: int | None = None,
+    produced_value_rows: int | None = None,
     sampled_tree: bool = False,
     value_sampler: SampleClient | None = None,
     value_executor: Executor | None = None,
 ) -> SampledBatches:
     if value_executor is not None and value_sampler is None:
         raise ValueError("parallel value sampling requires a separate sample client")
+    if sampled_tree and (produced_policy_rows is None or produced_value_rows is None):
+        raise ValueError("sampled-tree sampling requires policy and value row counters")
+    policy_rows = produced_policy_rows if sampled_tree else produced_rows
+    value_rows = produced_value_rows if sampled_tree else produced_rows
+    assert policy_rows is not None
+    assert value_rows is not None
     value_future = None
     if value_batch > 0 and value_executor is not None:
         assert value_sampler is not None
         value_future = value_executor.submit(
             value_sampler.sample,
             value_batch,
-            _sample_window_rows(value_window_rows, produced_rows),
+            _sample_window_rows(value_window_rows, value_rows),
             step_seed(run_seed, step, "value-sample"),
             **({"kind": "value"} if sampled_tree else {}),
         )
     policy = sampler.sample(
         policy_batch,
-        _sample_window_rows(policy_window_rows, produced_rows),
+        _sample_window_rows(policy_window_rows, policy_rows),
         step_seed(run_seed, step),
         **({"kind": "policy"} if sampled_tree else {}),
     )
@@ -281,7 +320,7 @@ def _sample_training_batches(
         else:
             value = sampler.sample(
                 value_batch,
-                _sample_window_rows(value_window_rows, produced_rows),
+                _sample_window_rows(value_window_rows, value_rows),
                 step_seed(run_seed, step, "value-sample"),
                 **({"kind": "value"} if sampled_tree else {}),
             )
@@ -294,21 +333,34 @@ def run(config_path: str | Path) -> None:
     model_seed, data_seed = _resolved_trainer_seeds(config.trainer)
     for path in (config.paths.replay_dir, config.paths.checkpoint_dir, config.paths.run_dir):
         path.mkdir(parents=True, exist_ok=True)
+    resume_resolved = None
+    resume_start = 0
+    if config.trainer.resume:
+        from gz.checkpoints import DirectorySource
+
+        resume_resolved = DirectorySource(str(config.paths.checkpoint_dir)).resolve_latest()
+        resume_start = resume_resolved.manifest.training_step
+        if resume_start >= config.trainer.total_steps:
+            raise RuntimeError("resume checkpoint is at or past total_steps")
+    stage_plan = EpisodeStagePlan.load(config, resume_start, _read_replay_ack)
+    scheduled = stage_plan.scheduled
+    active_stage_index = stage_plan.stage_index
+    active_config = stage_plan.active_config
+    progress = stage_plan.progress
     metrics = MetricsWriter(config.paths.run_dir / "metrics.jsonl", WandbRun.start(config))
 
     arch = config.arch
     model = None
     ema = None
     published_snapshot = None
-    resume_start = 0
     arena_active_version = None
     arena_completed_version = None
     if not config.trainer.resume:
-        init_replay(config)
-        serve = spawn_replay_serve(config)
+        init_replay(active_config)
+        serve = spawn_replay_serve(active_config)
         try:
             sampler = SampleClient(
-                config.paths.sample_socket,
+                active_config.paths.sample_socket,
                 startup_timeout=config.trainer.startup_timeout,
                 reconnect_limit=config.trainer.reconnect_limit,
             )
@@ -368,7 +420,9 @@ def run(config_path: str | Path) -> None:
                     "update_norm": 0.0,
                 }
             )
+            stage_plan.write_progress()
         finally:
+            sampler.close()
             stop_child(serve)
 
     if _uses_incumbent_evaluator(config) and config.trainer.resume:
@@ -389,33 +443,62 @@ def run(config_path: str | Path) -> None:
         else None
     )
     _prune_training_checkpoints(config, arena_publisher)
-    selfplay = spawn_torch_selfplay(config)
-    opponent = OpponentTracker()
-    selfplay_stats = SelfplayStatsTracker()
-    threading.Thread(
-        target=pump_selfplay_stderr,
-        args=(
-            selfplay,
-            opponent,
-            selfplay_stats,
-            config.paths.checkpoint_dir
-            if _uses_incumbent_evaluator(config)
-            else None,
-            arena_publisher,
-        ),
-        daemon=True,
-    ).start()
-    try:
-        sampler = SampleClient(
-            config.paths.sample_socket,
+
+    def start_stage(
+        stage_config: RunConfig,
+    ) -> tuple[
+        subprocess.Popen[bytes],
+        threading.Thread,
+        OpponentTracker,
+        SelfplayStatsTracker,
+        SampleClient,
+        SampleAck,
+    ]:
+        child = spawn_torch_selfplay(stage_config)
+        stage_opponent = OpponentTracker()
+        stage_stats = SelfplayStatsTracker()
+        pump = threading.Thread(
+            target=pump_selfplay_stderr,
+            args=(
+                child,
+                stage_opponent,
+                stage_stats,
+                config.paths.checkpoint_dir
+                if _uses_incumbent_evaluator(config)
+                else None,
+                arena_publisher,
+            ),
+            daemon=True,
+        )
+        pump.start()
+        stage_sampler = SampleClient(
+            stage_config.paths.sample_socket,
             startup_timeout=config.trainer.startup_timeout,
             reconnect_limit=config.trainer.reconnect_limit,
         )
-        ready_ack = sampler.wait_until_ready(
-            config.trainer.min_startup_rows,
-            alive_check=lambda: check_child(selfplay, "selfplay"),
-            policy_rows=_is_sampled_tree(config),
-        )
+        try:
+            ready = stage_sampler.wait_until_ready(
+                config.trainer.min_startup_rows,
+                alive_check=lambda: check_child(child, "selfplay"),
+                policy_rows=_is_sampled_tree(config),
+            )
+        except BaseException:
+            stage_sampler.close()
+            kill_child(child)
+            pump.join(timeout=5.0)
+            raise
+        return child, pump, stage_opponent, stage_stats, stage_sampler, ready
+
+    (
+        selfplay,
+        selfplay_pump,
+        opponent,
+        selfplay_stats,
+        sampler,
+        ready_ack,
+    ) = start_stage(active_config)
+    prefetcher = None
+    try:
         if ready_ack.root is not None and not config.trainer.resume:
             metrics.write(
                 {
@@ -427,10 +510,10 @@ def run(config_path: str | Path) -> None:
                 }
             )
         if config.trainer.resume:
-            from gz.checkpoints import DirectorySource
             from gz.checkpoints.weights import load_state_dict
 
-            resolved = DirectorySource(str(config.paths.checkpoint_dir)).resolve_latest()
+            assert resume_resolved is not None
+            resolved = resume_resolved
             if resolved.manifest.feature_schema_hash != sampler.feature_schema_hash:
                 raise RuntimeError("resume checkpoint feature schema does not match the store")
             if ArchConfig.from_dict(resolved.manifest.arch_config) != arch:
@@ -439,9 +522,6 @@ def run(config_path: str | Path) -> None:
             model.load_state_dict(load_state_dict(resolved.weights_path))
             ema = EmaWeights(model, config.trainer.ema_decay)
             published_snapshot = ema.state_dict()
-            resume_start = resolved.manifest.training_step
-            if resume_start >= config.trainer.total_steps:
-                raise RuntimeError("resume checkpoint is at or past total_steps")
             metrics.write(
                 {
                     "event": "resume",
@@ -449,30 +529,64 @@ def run(config_path: str | Path) -> None:
                     "model_version": resolved.manifest.model_version.hex(),
                 }
             )
+        feature_schema = sampler.feature_schema
+        feature_schema_hash = sampler.feature_schema_hash
+        sample_max_batch = sampler.max_batch
+        metrics.write(
+            {
+                "event": "value_tasks",
+                "auxiliary_heads": arch.auxiliary_heads,
+                "horizons": [8, 32],
+                "score_scale": feature_schema.max_nodes,
+                "value_final_weight": config.trainer.value_final_weight,
+                "value_v8_weight": config.trainer.value_v8_weight,
+                "value_v32_weight": config.trainer.value_v32_weight,
+                "terminal_score_weight": config.trainer.terminal_score_weight,
+            }
+        )
         policy_stager = TrainingStager(
-            sampler.feature_schema,
-            sampler.max_batch,
+            feature_schema,
+            sample_max_batch,
             config.trainer.device,
+            validate_terminal_score=config.trainer.terminal_score_weight > 0.0,
         )
         value_stager = (
             TrainingStager(
-                sampler.feature_schema,
-                sampler.max_batch,
+                feature_schema,
+                sample_max_batch,
                 config.trainer.device,
+                validate_terminal_score=config.trainer.terminal_score_weight > 0.0,
             )
             if config.trainer.value_batch > 0
             else None
         )
         loop = TrainerLoop(
             model,
-            trainer_loop_config(config.trainer, data_seed),
+            trainer_loop_config(
+                config.trainer,
+                data_seed,
+                sampled_tree=_is_sampled_tree(config),
+                single_vanilla=_is_single_vanilla(config),
+                symmetric_selfplay=_is_symmetric_selfplay(config),
+                symmetric_mask_stop=config.selfplay.mask_stop,
+            ),
         )
         loop.step_index = resume_start
-        window = PerfWindow()
-        prefetcher = None
-        if config.trainer.prefetch:
-            prefetcher = SamplePrefetcher(
-                sampler,
+        window = PerfWindow(
+            progress.completed_rows,
+            progress.completed_episodes,
+        )
+
+        def start_prefetch(
+            stage_sampler: SampleClient,
+            start_step: int,
+            stage_index: int,
+        ) -> SamplePrefetcher | None:
+            if not config.trainer.prefetch:
+                return None
+            stage = config.episode_length_schedule.stages[stage_index]
+            result = SamplePrefetcher(
+                stage_sampler,
                 config.trainer.batch,
                 config.trainer.window_rows,
                 config.trainer.value_batch,
@@ -483,26 +597,38 @@ def run(config_path: str | Path) -> None:
                 config.trainer.reuse_gate_interval,
                 config.trainer.reuse_gate_episodes,
                 sampled_tree=_is_sampled_tree(config),
-                start_step=resume_start,
+                start_step=start_step,
+                gate_step_origin=stage.start_step if scheduled else 0,
                 value_sampler=(
-                    sampler.fork()
+                    stage_sampler.fork()
                     if config.trainer.value_batch > 0
                     and config.trainer.parallel_value_sampling
                     else None
                 ),
             )
-            prefetcher.start()
+            result.start()
+            return result
+
+        prefetcher = start_prefetch(sampler, resume_start, active_stage_index)
 
         def publish_training_step(training_step: int) -> None:
-            nonlocal published_snapshot
+            nonlocal published_snapshot, last_published_step
+            if training_step == last_published_step:
+                return
+            if training_step < last_published_step:
+                raise RuntimeError("training checkpoints must publish in step order")
             manifest = publish_ema(
                 config.paths.checkpoint_dir,
                 ema,
-                schema=sampler.feature_schema,
-                schema_hash=sampler.feature_schema_hash,
+                schema=feature_schema,
+                schema_hash=feature_schema_hash,
                 arch=arch,
                 training_step=training_step,
                 run_id=config.paths.run_dir.name,
+                checkpoint_pointers=_permanent_checkpoint_pointers(
+                    config.trainer,
+                    training_step,
+                ),
             )
             if (
                 arena_publisher is not None
@@ -522,12 +648,75 @@ def run(config_path: str | Path) -> None:
                     "checkpoints_pruned": len(pruned),
                 }
             )
+            last_published_step = training_step
 
+        last_published_step = resume_start
         produced_floor = 0
         value_produced_floor = 0
         episodes_floor = 0
         pending_publish_step = None
         for step in range(resume_start, config.trainer.total_steps):
+            next_stage_index = config.episode_length_schedule.stage_index(step)
+            if next_stage_index != active_stage_index:
+                transition_started = time.perf_counter()
+                publish_training_step(step)
+                if prefetcher is not None:
+                    prefetcher.stop()
+                kill_child(selfplay)
+                if prefetcher is not None:
+                    prefetcher.join()
+                sampler.close()
+                selfplay_pump.join(timeout=5.0)
+                completed_ack = _read_replay_ack(active_config)
+                stage_plan.advance(next_stage_index, completed_ack)
+                previous_stage = config.episode_length_schedule.stages[
+                    active_stage_index
+                ]
+                active_stage_index = stage_plan.stage_index
+                active_config = stage_plan.active_config
+                progress = stage_plan.progress
+                init_replay(active_config)
+                (
+                    selfplay,
+                    selfplay_pump,
+                    opponent,
+                    selfplay_stats,
+                    sampler,
+                    ready_ack,
+                ) = start_stage(active_config)
+                if sampler.feature_schema_hash != feature_schema_hash:
+                    raise RuntimeError(
+                        "episode length stage feature schema does not match the model"
+                    )
+                if sampler.max_batch != sample_max_batch:
+                    raise RuntimeError(
+                        "episode length stage sample capacity does not match the trainer"
+                    )
+                prefetcher = start_prefetch(sampler, step, active_stage_index)
+                window = PerfWindow(
+                    progress.completed_rows,
+                    progress.completed_episodes,
+                )
+                produced_floor = 0
+                value_produced_floor = 0
+                episodes_floor = 0
+                current_stage = config.episode_length_schedule.stages[
+                    active_stage_index
+                ]
+                metrics.write(
+                    {
+                        "event": "episode_length_transition",
+                        "training_step": step,
+                        "from_max_steps": previous_stage.max_steps,
+                        "to_max_steps": current_stage.max_steps,
+                        "stage_index": active_stage_index,
+                        "stage_seed": active_config.selfplay.seed,
+                        "completed_rows": progress.completed_rows,
+                        "completed_episodes": progress.completed_episodes,
+                        "transition_seconds": time.perf_counter()
+                        - transition_started,
+                    }
+                )
             opponent.raise_if_error()
             check_child(selfplay, "selfplay")
             if step % 50 == 0:
@@ -536,21 +725,23 @@ def run(config_path: str | Path) -> None:
             # batch: ~0 while sampling keeps up, the residual stall when it
             # does not. The reuse gate stalls inside the same window.
             sample_started = time.perf_counter()
+            stage = config.episode_length_schedule.stages[active_stage_index]
+            gate_step = step - stage.start_step if scheduled else step
             if config.trainer.max_reuse > 0 or config.trainer.reuse_gate_episodes > 0:
                 needed_rows = _required_produced_rows(
-                    step,
+                    gate_step,
                     config.trainer.batch,
                     config.trainer.max_reuse,
                     config.trainer.reuse_gate_interval,
                 )
                 needed_episodes = _required_episodes(
-                    step,
+                    gate_step,
                     config.trainer.reuse_gate_interval,
                     config.trainer.reuse_gate_episodes,
                 )
                 needed_value_rows = (
                     _required_produced_rows(
-                        step,
+                        gate_step,
                         config.trainer.value_batch,
                         config.trainer.max_reuse,
                         config.trainer.reuse_gate_interval,
@@ -569,7 +760,11 @@ def run(config_path: str | Path) -> None:
                         if _is_sampled_tree(config)
                         else ack.produced_rows
                     )
-                    value_produced_floor = ack.produced_rows
+                    value_produced_floor = (
+                        ack.produced_value_rows
+                        if _is_sampled_tree(config)
+                        else ack.produced_rows
+                    )
                     episodes_floor = ack.episodes
                     if (
                         produced_floor >= needed_rows
@@ -597,6 +792,8 @@ def run(config_path: str | Path) -> None:
                     run_seed=data_seed,
                     step=step,
                     produced_rows=ack.produced_rows,
+                    produced_policy_rows=ack.produced_policy_rows,
+                    produced_value_rows=ack.produced_value_rows,
                     sampled_tree=_is_sampled_tree(config),
                 )
             train_started = time.perf_counter()
@@ -625,6 +822,17 @@ def run(config_path: str | Path) -> None:
                 assert metrics_record is not None
                 ack = prefetcher.refresh() if prefetcher is not None else sampler.refresh()
                 produced = ack.produced_rows
+                produced_policy = ack.produced_policy_rows
+                produced_value = ack.produced_value_rows
+                total_produced = progress.completed_rows + produced
+                total_produced_policy = (
+                    progress.completed_policy_rows + produced_policy
+                )
+                total_produced_value = progress.completed_value_rows + produced_value
+                total_episodes = progress.completed_episodes + ack.episodes
+                value_batch = config.trainer.value_batch
+                if value_batch == 0 and config.trainer.value_weight != 0.0:
+                    value_batch = config.trainer.batch
                 stop_rate = ack.episodes_stopped / ack.episodes if ack.episodes else 0.0
                 record = {
                     "event": "step",
@@ -632,42 +840,77 @@ def run(config_path: str | Path) -> None:
                     "step": metrics_record.step,
                     "policy_loss": metrics_record.policy_loss,
                     "value_loss": metrics_record.value_loss,
+                    "value_final_loss": metrics_record.value_final_loss,
+                    "value_v8_loss": metrics_record.value_v8_loss,
+                    "value_v32_loss": metrics_record.value_v32_loss,
+                    "terminal_score_loss": metrics_record.terminal_score_loss,
+                    "terminal_score_mae": metrics_record.terminal_score_mae,
+                    "terminal_score_bias": metrics_record.terminal_score_bias,
                     "loss": metrics_record.loss,
                     "grad_norm": metrics_record.grad_norm,
                     "lr": metrics_record.lr,
-                    "value_accuracy": metrics_record.value_accuracy,
                     "fraction_valid": metrics_record.fraction_valid,
                     "label_mean": metrics_record.label_mean,
-                    "learner_win_rate": metrics_record.learner_win_rate,
                     "terminal_cost_ema": ack.episode_cost_ema,
                     "terminal_cost_best": ack.best_cost,
-                    "produced_rows": produced,
-                    "samples_per_row": ((step + 1) * config.trainer.batch / produced) if produced else 0.0,
+                    "produced_rows": total_produced,
+                    "produced_policy_rows": total_produced_policy,
+                    "produced_value_rows": total_produced_value,
+                    "stage_index": active_stage_index,
+                    "episode_max_steps": stage.max_steps,
+                    "stage_produced_rows": produced,
+                    "stage_produced_policy_rows": produced_policy,
+                    "stage_produced_value_rows": produced_value,
+                    "policy_reuse": _cumulative_reuse(
+                        gate_step,
+                        config.trainer.batch,
+                        produced_policy,
+                    ),
+                    "value_reuse": _cumulative_reuse(
+                        gate_step,
+                        value_batch,
+                        produced_value if _is_sampled_tree(config) else produced,
+                    ),
                     "stop_rate": stop_rate,
                     "episode_len_ema": ack.episode_len_ema,
                     "stop_rate_ema": ack.stop_rate_ema,
                     **opponent.step_fields(),
                     **selfplay_stats.step_fields(),
                 }
+                if _is_single_vanilla(config):
+                    record["value_mae"] = metrics_record.value_mae
+                    record["value_rmse"] = metrics_record.value_rmse
+                else:
+                    record["value_accuracy"] = metrics_record.value_accuracy
+                    record["learner_win_rate"] = metrics_record.learner_win_rate
                 # -1.0 = no labeled episode appended yet (unseeded EMA).
-                if ack.learner_win_rate_ema >= 0.0:
+                if not _is_single_vanilla(config) and ack.learner_win_rate_ema >= 0.0:
                     record["learner_win_rate_ema"] = ack.learner_win_rate_ema
+                if not _is_single_vanilla(config) and ack.value_sign_accuracy_early_ema >= 0.0:
+                    record["value_sign_accuracy_early_ema"] = (
+                        ack.value_sign_accuracy_early_ema
+                    )
+                if not _is_single_vanilla(config) and ack.value_sign_accuracy_late_ema >= 0.0:
+                    record["value_sign_accuracy_late_ema"] = ack.value_sign_accuracy_late_ema
                 if ack.episode_latency_ema >= 0.0:
                     record["episode_latency_s"] = ack.episode_latency_ema
+                if _is_symmetric_selfplay(config):
+                    record.update(_symmetric_step_fields(ack, total_episodes))
                 # Outcome gauges are per-store-open; a zero means unseeded
                 # (no episode appended by this selfplay process yet).
                 if ack.root is not None and ack.episode_cost_ema > 0.0:
                     record["reduction_ema"] = ack.root.cost - ack.episode_cost_ema
                 if ack.root is not None and ack.best_cost > 0.0:
                     record["reduction_best"] = ack.root.cost - ack.best_cost
-                record.update(window.drain(produced, ack.episodes))
+                record.update(window.drain(total_produced, total_episodes))
+                record.update(metrics_record.logging_fields())
                 for gate_event in opponent.drain_events():
                     metrics.write(gate_event)
                 if arena_publisher is not None:
                     for publish_event in arena_publisher.drain_events():
                         metrics.write(publish_event)
                 metrics.write(record)
-            if (step + 1) % config.trainer.publish_interval == 0:
+            if _checkpoint_due(config.trainer, step + 1):
                 if config.trainer.publish_lag_blocks:
                     pending_publish_step = step + 1
                 else:
@@ -678,16 +921,29 @@ def run(config_path: str | Path) -> None:
             prefetcher.stop()
         if pending_publish_step is not None:
             publish_training_step(pending_publish_step)
-        elif config.trainer.total_steps % config.trainer.publish_interval != 0:
+        elif not _checkpoint_due(config.trainer, config.trainer.total_steps):
             publish_training_step(config.trainer.total_steps)
         opponent.raise_if_error()
     except BaseException:
         # wandb's atexit hook marks the run crashed; only the clean path
         # finishes it explicitly.
+        if prefetcher is not None:
+            prefetcher.stop()
         kill_child(selfplay)
+        if prefetcher is not None:
+            try:
+                prefetcher.join()
+            except BaseException:
+                pass
+        sampler.close()
+        selfplay_pump.join(timeout=5.0)
         raise
     else:
         kill_child(selfplay)
+        if prefetcher is not None:
+            prefetcher.join()
+        sampler.close()
+        selfplay_pump.join(timeout=5.0)
         metrics.finish()
 
 
@@ -1092,6 +1348,7 @@ class SamplePrefetcher:
         reuse_gate_episodes: int,
         sampled_tree: bool = False,
         start_step: int = 0,
+        gate_step_origin: int = 0,
         *,
         value_sampler: SampleClient | None = None,
     ) -> None:
@@ -1107,6 +1364,7 @@ class SamplePrefetcher:
         self._reuse_gate_episodes = reuse_gate_episodes
         self._sampled_tree = sampled_tree
         self._start_step = start_step
+        self._gate_step_origin = gate_step_origin
         self._value_sampler = value_sampler
         # Depth 2 rides out replay-store read spikes (compaction bursts)
         # without letting sample timing drift more than two steps.
@@ -1125,6 +1383,11 @@ class SamplePrefetcher:
             self._queue.get_nowait()
         except queue.Empty:
             pass
+
+    def join(self, timeout: float = 10.0) -> None:
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise RuntimeError("sample prefetcher did not stop")
 
     def next(self) -> object:
         result, error = self._queue.get()
@@ -1147,20 +1410,23 @@ class SamplePrefetcher:
                 if self._stop.is_set():
                     return
                 try:
+                    gate_step = step - self._gate_step_origin
+                    if gate_step < 0:
+                        raise RuntimeError("sample prefetch gate step precedes its origin")
                     needed_rows = _required_produced_rows(
-                        step,
+                        gate_step,
                         self._batch,
                         self._max_reuse,
                         self._reuse_gate_interval,
                     )
                     needed_episodes = _required_episodes(
-                        step,
+                        gate_step,
                         self._reuse_gate_interval,
                         self._reuse_gate_episodes,
                     )
                     needed_value_rows = (
                         _required_produced_rows(
-                            step,
+                            gate_step,
                             self._value_batch,
                             self._max_reuse,
                             self._reuse_gate_interval,
@@ -1172,13 +1438,16 @@ class SamplePrefetcher:
                         with self._lock:
                             ack = self._sampler.refresh()
                         policy_rows = (
-                            ack.produced_policy_rows
-                            if self._sampled_tree
-                            else ack.produced_rows
+                            ack.produced_policy_rows if self._sampled_tree else ack.produced_rows
                         )
                         if (
                             policy_rows >= needed_rows
-                            and ack.produced_rows >= needed_value_rows
+                            and (
+                                ack.produced_value_rows
+                                if self._sampled_tree
+                                else ack.produced_rows
+                            )
+                            >= needed_value_rows
                             and ack.episodes >= needed_episodes
                         ):
                             break
@@ -1194,6 +1463,16 @@ class SamplePrefetcher:
                             run_seed=self._seed,
                             step=step,
                             produced_rows=ack.produced_rows,
+                            produced_policy_rows=(
+                                ack.produced_policy_rows
+                                if self._sampled_tree
+                                else ack.produced_rows
+                            ),
+                            produced_value_rows=(
+                                ack.produced_value_rows
+                                if self._sampled_tree
+                                else ack.produced_rows
+                            ),
                             sampled_tree=self._sampled_tree,
                             value_sampler=self._value_sampler,
                             value_executor=value_executor,
@@ -1215,10 +1494,11 @@ class SamplePrefetcher:
 class PerfWindow:
     """Accumulates per-step timings between metric writes."""
 
-    def __init__(self) -> None:
+    def __init__(self, produced_rows: int = 0, episodes: int = 0) -> None:
         self.window_started = time.perf_counter()
-        self.last_produced = 0
-        self.last_episodes = 0
+        self.last_produced = produced_rows
+        self.last_episodes = episodes
+        self.has_counter_baseline = False
         self.steps = 0
         self.sample_seconds = 0.0
         self.train_seconds = 0.0
@@ -1234,33 +1514,101 @@ class PerfWindow:
         steps = max(self.steps, 1)
         perf = {
             "steps_per_s": self.steps / elapsed,
-            "rows_per_s": max(produced - self.last_produced, 0) / elapsed if self.last_produced else 0.0,
-            "episodes_per_s": max(episodes - self.last_episodes, 0) / elapsed if self.last_episodes else 0.0,
+            "rows_per_s": (
+                max(produced - self.last_produced, 0) / elapsed
+                if self.has_counter_baseline
+                else 0.0
+            ),
+            "episodes_per_s": (
+                max(episodes - self.last_episodes, 0) / elapsed
+                if self.has_counter_baseline
+                else 0.0
+            ),
             "sample_ms": 1000.0 * self.sample_seconds / steps,
             "train_ms": 1000.0 * self.train_seconds / steps,
         }
         self.window_started = now
         self.last_produced = produced
         self.last_episodes = episodes
+        self.has_counter_baseline = True
         self.steps = 0
         self.sample_seconds = 0.0
         self.train_seconds = 0.0
         return perf
 
 
-# JSONL keys -> grouped wandb keys. Anything unlisted stays out of wandb,
-# which is the over-logging guard: extending the JSONL never widens wandb.
+# JSONL keys -> grouped wandb keys. Keeping diagnostics explicit here prevents
+# experimental fields from silently flooding the human-facing dashboard.
 WANDB_KEYS = {
     "policy_loss": "train/policy_loss",
     "value_loss": "train/value_loss",
+    "value_final_loss": "train/value_final_loss",
+    "value_v8_loss": "train/value_v8_loss",
+    "value_v32_loss": "train/value_v32_loss",
+    "terminal_score_loss": "train/terminal_score_loss",
+    "terminal_score_mae": "train/terminal_score_mae_nodes",
+    "terminal_score_bias": "train/terminal_score_bias_nodes",
     "loss": "train/loss",
     "grad_norm": "train/grad_norm",
+    "grad_clip_scale": "train/grad_clip_scale",
     "lr": "train/lr",
     "value_accuracy": "train/value_accuracy",
+    "value_mae": "train/value_mae",
+    "value_rmse": "train/value_rmse",
     "fraction_valid": "train/fraction_valid",
     "label_mean": "train/label_mean",
     "learner_win_rate": "train/learner_win_rate",
+    "aux_signal_v8_final_target_correlation": (
+        "auxiliary/signal/v8_final_target_correlation"
+    ),
+    "aux_signal_v32_final_target_correlation": (
+        "auxiliary/signal/v32_final_target_correlation"
+    ),
+    "aux_signal_v8_v32_target_correlation": (
+        "auxiliary/signal/v8_v32_target_correlation"
+    ),
+    "aux_signal_terminal_score_correlation": (
+        "auxiliary/signal/terminal_score_correlation"
+    ),
+    "aux_signal_early_v8_final_target_correlation": (
+        "auxiliary/signal/early_v8_final_target_correlation"
+    ),
+    "aux_signal_early_v32_final_target_correlation": (
+        "auxiliary/signal/early_v32_final_target_correlation"
+    ),
+    "aux_signal_early_v8_target_std": "auxiliary/signal/early_v8_target_std",
+    "aux_signal_early_v32_target_std": "auxiliary/signal/early_v32_target_std",
+    "aux_gradient_effective_auxiliary_norm": (
+        "auxiliary/readout_gradient/effective_auxiliary_norm"
+    ),
+    "aux_gradient_auxiliary_to_final_norm_ratio": (
+        "auxiliary/readout_gradient/auxiliary_to_final_norm_ratio"
+    ),
+    "aux_gradient_auxiliary_alignment_ratio": (
+        "auxiliary/readout_gradient/auxiliary_alignment_ratio"
+    ),
+    "aux_gradient_final_auxiliary_cosine": (
+        "auxiliary/readout_gradient/final_auxiliary_cosine"
+    ),
+    "aux_gradient_policy_auxiliary_cosine": (
+        "auxiliary/readout_gradient/policy_auxiliary_cosine"
+    ),
+    "parameter_trunk_gradient_norm": "optimizer/parameter/trunk_gradient_norm",
+    "parameter_trunk_update_to_parameter": (
+        "optimizer/parameter/trunk_update_to_parameter"
+    ),
+    "parameter_value_final_update_to_parameter": (
+        "optimizer/parameter/value_final_update_to_parameter"
+    ),
+    "parameter_value_horizons_update_to_parameter": (
+        "optimizer/parameter/value_horizons_update_to_parameter"
+    ),
+    "parameter_terminal_score_update_to_parameter": (
+        "optimizer/parameter/terminal_score_update_to_parameter"
+    ),
     "learner_win_rate_ema": "selfplay/learner_win_rate_ema",
+    "value_sign_accuracy_early_ema": "selfplay/value_sign_accuracy_early_ema",
+    "value_sign_accuracy_late_ema": "selfplay/value_sign_accuracy_late_ema",
     "episode_latency_s": "lag/episode_latency_s",
     "opponent_challenger_cost": "opponent/challenger_cost",
     "opponent_best_cost": "opponent/best_cost",
@@ -1292,6 +1640,25 @@ WANDB_KEYS = {
     "stop_rate": "selfplay/stop_rate",
     "episode_len_ema": "selfplay/episode_len_ema",
     "stop_rate_ema": "selfplay/stop_rate_ema",
+    "symmetric_games_completed": "symmetric/games_completed",
+    "symmetric_p1_win_rate_ema": "symmetric/p1_win_rate_ema",
+    "symmetric_p2_win_rate_ema": "symmetric/p2_win_rate_ema",
+    "symmetric_draw_rate_ema": "symmetric/draw_rate_ema",
+    "symmetric_decisive_rate_ema": "symmetric/decisive_rate_ema",
+    "symmetric_seat_advantage_ema": "symmetric/seat_advantage_ema",
+    "symmetric_p1_terminal_cost_ema": "symmetric/p1_terminal_cost_ema",
+    "symmetric_p2_terminal_cost_ema": "symmetric/p2_terminal_cost_ema",
+    "symmetric_mean_terminal_cost_ema": "symmetric/mean_terminal_cost_ema",
+    "symmetric_best_of_two_terminal_cost_ema": "symmetric/best_of_two_terminal_cost_ema",
+    "symmetric_terminal_cost_margin_ema": "symmetric/terminal_cost_margin_ema",
+    "symmetric_terminal_cost_best": "symmetric/terminal_cost_best",
+    "symmetric_p1_rewrites_ema": "symmetric/p1_rewrites_ema",
+    "symmetric_p2_rewrites_ema": "symmetric/p2_rewrites_ema",
+    "symmetric_game_rewrites_ema": "symmetric/game_rewrites_ema",
+    "symmetric_rewrite_margin_ema": "symmetric/rewrite_margin_ema",
+    "symmetric_value_sign_accuracy_early_ema": "symmetric/value_sign_accuracy_early_ema",
+    "symmetric_value_sign_accuracy_late_ema": "symmetric/value_sign_accuracy_late_ema",
+    "symmetric_game_latency_s": "symmetric/game_latency_s",
     "reduction_ema": "graph/reduction_ema",
     "reduction_best": "graph/reduction_best",
     "steps_per_s": "perf/steps_per_s",
@@ -1300,7 +1667,15 @@ WANDB_KEYS = {
     "sample_ms": "perf/sample_ms",
     "train_ms": "perf/train_ms",
     "produced_rows": "perf/produced_rows",
-    "samples_per_row": "perf/samples_per_row",
+    "produced_policy_rows": "perf/produced_policy_rows",
+    "produced_value_rows": "perf/produced_value_rows",
+    "stage_produced_rows": "perf/stage_produced_rows",
+    "stage_produced_policy_rows": "perf/stage_produced_policy_rows",
+    "stage_produced_value_rows": "perf/stage_produced_value_rows",
+    "policy_reuse": "perf/policy_reuse",
+    "value_reuse": "perf/value_reuse",
+    "stage_index": "curriculum/stage",
+    "episode_max_steps": "curriculum/max_steps",
 }
 
 
@@ -1327,6 +1702,9 @@ class WandbRun:
                 "trainer": asdict(config.trainer),
                 "selfplay": asdict(config.selfplay),
                 "arch": asdict(config.arch),
+                "episode_length_schedule": asdict(
+                    config.episode_length_schedule
+                ),
                 "run_dir": str(config.paths.run_dir),
             }
             if extra_config:
@@ -1349,7 +1727,11 @@ class WandbRun:
 
     def write(self, record: dict[str, object]) -> None:
         if record.get("event") == "step":
-            payload = {WANDB_KEYS[k]: v for k, v in record.items() if k in WANDB_KEYS}
+            payload = {
+                WANDB_KEYS[key]: value
+                for key, value in record.items()
+                if key in WANDB_KEYS
+            }
             self.run.log(payload, step=record["step"])
         elif record.get("event") == "graph":
             facts = {k: v for k, v in record.items() if k != "event"}
@@ -1365,6 +1747,17 @@ class WandbRun:
                 if key in record:
                     payload[f"publish/{key}"] = record[key]
             self.run.log(payload, step=record["training_step"])
+        elif record.get("event") == "episode_length_transition":
+            self.run.log(
+                {
+                    "curriculum/stage": record["stage_index"],
+                    "curriculum/max_steps": record["to_max_steps"],
+                    "curriculum/transition_seconds": record[
+                        "transition_seconds"
+                    ],
+                },
+                step=record["training_step"],
+            )
 
     def finish(self) -> None:
         self.run.finish()
@@ -1379,6 +1772,8 @@ def _validate(config: RunConfig) -> RunConfig:
         raise ValueError("publish_interval must be positive")
     if config.trainer.checkpoint_retain < 0:
         raise ValueError("checkpoint_retain must be non-negative")
+    if config.trainer.permanent_checkpoint_interval < 0:
+        raise ValueError("permanent_checkpoint_interval must be non-negative")
     if config.trainer.publish_lag_blocks not in (0, 1):
         raise ValueError("publish_lag_blocks must be 0 or 1")
     if config.trainer.batch < 1:
@@ -1389,6 +1784,27 @@ def _validate(config: RunConfig) -> RunConfig:
         raise ValueError("window_rows must be positive")
     if config.trainer.value_window_rows < 0:
         raise ValueError("value_window_rows must be non-negative")
+    if not math.isfinite(config.trainer.value_trunk_grad_scale) or not (
+        0.0 <= config.trainer.value_trunk_grad_scale <= 1.0
+    ):
+        raise ValueError("value_trunk_grad_scale must be finite and in [0, 1]")
+    task_weights = (
+        config.trainer.value_final_weight,
+        config.trainer.value_v8_weight,
+        config.trainer.value_v32_weight,
+        config.trainer.terminal_score_weight,
+    )
+    if any(not math.isfinite(weight) or weight < 0.0 for weight in task_weights):
+        raise ValueError("value task weights must be finite and non-negative")
+    if not math.isclose(sum(task_weights), 1.0, rel_tol=0.0, abs_tol=1.0e-6):
+        raise ValueError("value task weights must sum to one")
+    auxiliary_weight = any(weight > 0.0 for weight in task_weights[1:])
+    if auxiliary_weight and config.arch.auxiliary_heads != "v8-v32-score":
+        raise ValueError("auxiliary task weights require v8-v32-score model heads")
+    if config.arch.auxiliary_heads == "v8-v32-score" and not _is_symmetric_selfplay(
+        config
+    ):
+        raise ValueError("v8-v32-score auxiliary heads require symmetric-selfplay")
     if config.trainer.compile_mode not in (
         "default",
         "reduce-overhead",
@@ -1452,8 +1868,16 @@ def _validate(config: RunConfig) -> RunConfig:
         or config.selfplay.c_scale < 0.0
     ):
         raise ValueError("c_visit and c_scale must be finite and non-negative")
+    if config.selfplay.training_mode not in (
+        "competitive",
+        "single-vanilla",
+        "symmetric-selfplay",
+    ):
+        raise ValueError(f"unknown training_mode: {config.selfplay.training_mode}")
+    # gz-graph-v2 keeps its normalization architecture when blinded; the
+    # exporter supplies zeros to its remaining-budget projection.
     if (
-        config.arch.position_encoding in {"policy_budget", "remaining_budget"}
+        config.arch.position_encoding == "policy_budget"
         and not config.selfplay.position_features
     ):
         raise ValueError(
@@ -1464,7 +1888,12 @@ def _validate(config: RunConfig) -> RunConfig:
     # head's ONLY opponent signal unless the pair input carries the full
     # opponent graph through the separate opponent_* tensors. single and
     # scalar modes under blinding are unlearnable-by-construction.
-    if not config.selfplay.position_features and config.arch.value_input != "pair":
+    if (
+        not _is_single_vanilla(config)
+        and not _is_symmetric_selfplay(config)
+        and not config.selfplay.position_features
+        and config.arch.value_input != "pair"
+    ):
         raise ValueError(
             "position_features = false requires value_input = 'pair': "
             f"'{config.arch.value_input}' leaves the value head opponent-blind"
@@ -1479,6 +1908,8 @@ def _validate(config: RunConfig) -> RunConfig:
         raise ValueError(
             "admission_smoothing and admission_stagger_ms are mutually exclusive"
         )
+    if config.selfplay.wave_batching and not _is_symmetric_selfplay(config):
+        raise ValueError("wave_batching requires training_mode = 'symmetric-selfplay'")
     if config.selfplay.reference_trajectory_pool < 0:
         raise ValueError("reference_trajectory_pool must be non-negative")
     if not math.isfinite(config.selfplay.reference_gamma) or not (
@@ -1497,6 +1928,68 @@ def _validate(config: RunConfig) -> RunConfig:
             raise ValueError("graded scalar values require value_activation = 'tanh'")
     elif config.arch.value_head == "hl_gauss":
         raise ValueError("value_head = 'hl_gauss' requires value_reward = 'graded'")
+    if _is_single_vanilla(config):
+        if (
+            config.selfplay.reference != "none"
+            or config.selfplay.reference_ema_decay != 0.0
+            or config.selfplay.reference_gamma != 0.0
+            or config.selfplay.reference_trajectory_pool != 0
+            or config.selfplay.reference_arena_size != 0
+            or config.selfplay.reference_arena_interval != 0
+            or config.selfplay.policy_opponent_mode is not None
+            or config.selfplay.reference_mask_stop is not None
+            or config.selfplay.reference_max_batch != 0
+            or config.selfplay.challenger_max_batch != 0
+        ):
+            raise ValueError(
+                "single-vanilla requires all reference and arena settings disabled"
+            )
+        if config.selfplay.tree_reuse:
+            raise ValueError("single-vanilla requires tree_reuse = false")
+        if config.selfplay.mask_stop:
+            raise ValueError("single-vanilla requires mask_stop = false")
+        if config.selfplay.length_tiebreak:
+            raise ValueError("single-vanilla requires length_tiebreak = false")
+        if config.selfplay.value_reward != "sign":
+            raise ValueError("single-vanilla requires value_reward = 'sign'")
+        if config.trainer.value_mirror:
+            raise ValueError("single-vanilla requires value_mirror = false")
+        if config.arch.value_input != "single":
+            raise ValueError("single-vanilla requires value_input = 'single'")
+        if config.arch.value_head != "scalar":
+            raise ValueError("single-vanilla requires value_head = 'scalar'")
+        if config.arch.value_activation != "logit":
+            raise ValueError("single-vanilla requires value_activation = 'logit'")
+    if _is_symmetric_selfplay(config):
+        if (
+            config.selfplay.reference != "none"
+            or config.selfplay.reference_ema_decay != 0.0
+            or config.selfplay.reference_gamma != 0.0
+            or config.selfplay.reference_trajectory_pool != 0
+            or config.selfplay.reference_arena_size != 0
+            or config.selfplay.reference_arena_interval != 0
+            or config.selfplay.policy_opponent_mode is not None
+            or config.selfplay.reference_mask_stop is not None
+            or config.selfplay.reference_max_batch != 0
+            or config.selfplay.challenger_max_batch != 0
+        ):
+            raise ValueError(
+                "symmetric-selfplay requires all reference and arena settings disabled"
+            )
+        if not config.selfplay.mask_stop and not config.selfplay.position_features:
+            raise ValueError("STOP-enabled symmetric-selfplay requires position_features = true")
+        if not config.selfplay.length_tiebreak:
+            raise ValueError("symmetric-selfplay requires length_tiebreak = true")
+        if config.selfplay.value_reward != "sign":
+            raise ValueError("symmetric-selfplay requires value_reward = 'sign'")
+        if config.trainer.value_mirror:
+            raise ValueError("symmetric-selfplay requires value_mirror = false")
+        if config.arch.state_input != "joint-board":
+            raise ValueError("symmetric-selfplay requires state_input = 'joint-board'")
+        if config.arch.value_input != "single":
+            raise ValueError("symmetric-selfplay requires value_input = 'single'")
+    elif config.arch.state_input != "single-graph":
+        raise ValueError("state_input = 'joint-board' requires symmetric-selfplay")
     if config.selfplay.reference_arena_size < 0:
         raise ValueError("reference_arena_size must be non-negative")
     if config.selfplay.reference_arena_interval < 0:
@@ -1540,8 +2033,6 @@ def _validate(config: RunConfig) -> RunConfig:
                 raise ValueError("sampled-tree requires tree_reuse = false")
             if config.trainer.value_batch <= 0:
                 raise ValueError("sampled-tree requires a positive value_batch")
-            if config.trainer.value_mirror:
-                raise ValueError("sampled-tree requires value_mirror = false")
             if config.selfplay.eval_processes != 1:
                 raise ValueError("sampled-tree requires eval_processes = 1")
     if (
@@ -1583,11 +2074,72 @@ def _validate(config: RunConfig) -> RunConfig:
             raise ValueError("reference_arena_interval must not be shorter than publish_interval")
         if arena_interval % config.trainer.publish_interval:
             raise ValueError("reference_arena_interval must be a multiple of publish_interval")
+    if len(config.episode_length_schedule.stages) > 1:
+        if not _is_single_vanilla(config):
+            raise ValueError(
+                "episode length scheduling currently requires training_mode = 'single-vanilla'"
+            )
+        if config.selfplay.root_mode != "generated":
+            raise ValueError(
+                "episode length scheduling currently requires root_mode = 'generated'"
+            )
+        if config.trainer.publish_lag_blocks:
+            raise ValueError(
+                "episode length scheduling requires publish_lag_blocks = 0"
+            )
     return config
 
 
 def _is_sampled_tree(config: RunConfig) -> bool:
     return config.selfplay.policy_opponent_mode == "sampled-tree"
+
+
+def _is_single_vanilla(config: RunConfig) -> bool:
+    return config.selfplay.training_mode == "single-vanilla"
+
+
+def _is_symmetric_selfplay(config: RunConfig) -> bool:
+    return config.selfplay.training_mode == "symmetric-selfplay"
+
+
+def _symmetric_step_fields(ack: SampleAck, completed_games: int) -> dict[str, float | int]:
+    fields: dict[str, float | int] = {
+        "symmetric_games_completed": completed_games,
+    }
+    metrics = ack.symmetric_selfplay
+    if metrics is None:
+        return fields
+    fields.update(
+        {
+            "symmetric_p1_win_rate_ema": metrics.p1_win_rate_ema,
+            "symmetric_p2_win_rate_ema": metrics.p2_win_rate_ema,
+            "symmetric_draw_rate_ema": metrics.draw_rate_ema,
+            "symmetric_decisive_rate_ema": max(0.0, 1.0 - metrics.draw_rate_ema),
+            "symmetric_seat_advantage_ema": metrics.seat_advantage_ema,
+            "symmetric_p1_terminal_cost_ema": metrics.p1_terminal_cost_ema,
+            "symmetric_p2_terminal_cost_ema": metrics.p2_terminal_cost_ema,
+            "symmetric_mean_terminal_cost_ema": metrics.mean_terminal_cost_ema,
+            "symmetric_best_of_two_terminal_cost_ema": metrics.mean_terminal_cost_ema
+            - 0.5 * metrics.terminal_cost_margin_ema,
+            "symmetric_terminal_cost_margin_ema": metrics.terminal_cost_margin_ema,
+            "symmetric_terminal_cost_best": metrics.terminal_cost_best,
+            "symmetric_p1_rewrites_ema": metrics.p1_episode_len_ema,
+            "symmetric_p2_rewrites_ema": metrics.p2_episode_len_ema,
+            "symmetric_game_rewrites_ema": metrics.game_len_ema,
+            "symmetric_rewrite_margin_ema": metrics.episode_len_margin_ema,
+        }
+    )
+    if ack.value_sign_accuracy_early_ema >= 0.0:
+        fields["symmetric_value_sign_accuracy_early_ema"] = (
+            ack.value_sign_accuracy_early_ema
+        )
+    if ack.value_sign_accuracy_late_ema >= 0.0:
+        fields["symmetric_value_sign_accuracy_late_ema"] = (
+            ack.value_sign_accuracy_late_ema
+        )
+    if ack.episode_latency_ema >= 0.0:
+        fields["symmetric_game_latency_s"] = ack.episode_latency_ema
+    return fields
 
 
 def _uses_incumbent_evaluator(config: RunConfig) -> bool:
@@ -1606,6 +2158,23 @@ def _effective_arena_interval(config: RunConfig) -> int:
     return config.selfplay.reference_arena_interval or config.trainer.publish_interval
 
 
+def _read_replay_ack(config: RunConfig) -> SampleAck:
+    serve = spawn_replay_serve(config)
+    sampler = SampleClient(
+        config.paths.sample_socket,
+        startup_timeout=config.trainer.startup_timeout,
+        reconnect_limit=config.trainer.reconnect_limit,
+    )
+    try:
+        return sampler.wait_until_ready(
+            0,
+            alive_check=lambda: check_child(serve, "replay-serve"),
+        )
+    finally:
+        sampler.close()
+        stop_child(serve)
+
+
 def _prune_training_checkpoints(
     config: RunConfig,
     arena_publisher: ArenaCheckpointPublisher | None,
@@ -1620,6 +2189,26 @@ def _prune_training_checkpoints(
         config.trainer.checkpoint_retain,
         protected_model_versions=protected,
     )
+
+
+def _checkpoint_due(config: TrainerConfig, training_step: int) -> bool:
+    return training_step > 0 and (
+        training_step % config.publish_interval == 0
+        or bool(
+            config.permanent_checkpoint_interval
+            and training_step % config.permanent_checkpoint_interval == 0
+        )
+    )
+
+
+def _permanent_checkpoint_pointers(
+    config: TrainerConfig,
+    training_step: int,
+) -> tuple[str, ...]:
+    interval = config.permanent_checkpoint_interval
+    if training_step <= 0 or interval == 0 or training_step % interval:
+        return ()
+    return (f"step_{training_step}.json",)
 
 
 def load_config(path: str | Path) -> RunConfig:
@@ -1643,6 +2232,11 @@ def load_config(path: str | Path) -> RunConfig:
     replay_dir = replay_dir.absolute()
     checkpoint_dir = checkpoint_dir.absolute()
     sample_socket = sample_socket.absolute()
+    episode_length_schedule = _parse_episode_length_schedule(
+        data.get("episode_length_schedule"),
+        final_max_steps=selfplay.max_steps,
+        total_steps=trainer.total_steps,
+    )
     return _validate(RunConfig(
         trainer=trainer,
         selfplay=selfplay,
@@ -1655,6 +2249,7 @@ def load_config(path: str | Path) -> RunConfig:
         ),
         wandb=wandb,
         arch=arch,
+        episode_length_schedule=episode_length_schedule,
     ))
 
 
@@ -1737,6 +2332,8 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             str(config.selfplay.lanes),
             "--workers-per-lane",
             str(config.selfplay.workers_per_lane),
+            "--training-mode",
+            config.selfplay.training_mode,
             "--reference",
             config.selfplay.reference,
             "--root-mode",
@@ -1791,6 +2388,8 @@ def spawn_torch_selfplay(config: RunConfig) -> subprocess.Popen[bytes]:
             str(config.selfplay.admission_stagger_ms),
             "--admission-smoothing",
             "true" if config.selfplay.admission_smoothing else "false",
+            "--wave-batching",
+            "true" if config.selfplay.wave_batching else "false",
             "--evaluator",
             "torch",
             "--python-dir",
@@ -1865,7 +2464,15 @@ def _set_matmul_precision(precision: str) -> None:
     torch.set_float32_matmul_precision(precision)
 
 
-def trainer_loop_config(config: TrainerConfig, data_seed: int) -> LoopConfig:
+def trainer_loop_config(
+    config: TrainerConfig,
+    data_seed: int,
+    *,
+    sampled_tree: bool = False,
+    single_vanilla: bool = False,
+    symmetric_selfplay: bool = False,
+    symmetric_mask_stop: bool = True,
+) -> LoopConfig:
     return LoopConfig(
         lr=config.lr,
         lr_schedule=config.lr_schedule,
@@ -1874,6 +2481,11 @@ def trainer_loop_config(config: TrainerConfig, data_seed: int) -> LoopConfig:
         lr_decay_steps=config.lr_decay_steps,
         min_lr_ratio=config.min_lr_ratio,
         value_weight=config.value_weight,
+        value_trunk_grad_scale=config.value_trunk_grad_scale,
+        value_final_weight=config.value_final_weight,
+        value_v8_weight=config.value_v8_weight,
+        value_v32_weight=config.value_v32_weight,
+        terminal_score_weight=config.terminal_score_weight,
         weight_decay=config.weight_decay,
         optimizer=config.optimizer,
         adamw_lr=config.adamw_lr,
@@ -1883,6 +2495,8 @@ def trainer_loop_config(config: TrainerConfig, data_seed: int) -> LoopConfig:
         grad_clip=config.grad_clip,
         run_seed=data_seed,
         value_mirror=config.value_mirror,
+        value_objective="terminal_reward" if single_vanilla else "competitive",
+        mask_stop_loss=symmetric_selfplay and symmetric_mask_stop,
         compile_model=config.compile_model,
         compile_mode=config.compile_mode,
     )
@@ -1914,11 +2528,11 @@ def _load_initial_checkpoint(
         model.load_state_dict(state)
     elif scope == "policy":
         policy_state = {
-            name: tensor for name, tensor in state.items() if not name.startswith("value.")
+            name: tensor for name, tensor in state.items() if not _is_value_parameter(name)
         }
         incompatible = model.load_state_dict(policy_state, strict=False)
         expected_missing = {
-            name for name in model.state_dict() if name.startswith("value.")
+            name for name in model.state_dict() if _is_value_parameter(name)
         }
         if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
             raise RuntimeError("policy checkpoint scope did not isolate the value module")
@@ -1937,12 +2551,17 @@ def _policy_arch_config(arch: ArchConfig) -> dict[str, object]:
         "value_min",
         "value_max",
         "value_sigma_ratio",
+        "auxiliary_heads",
     }
     return {
         name: value
         for name, value in arch.to_dict().items()
         if name not in value_fields
     }
+
+
+def _is_value_parameter(name: str) -> bool:
+    return name.startswith(("value.", "horizon_value.", "terminal_score."))
 
 
 def check_memory(min_available_gb: float) -> None:

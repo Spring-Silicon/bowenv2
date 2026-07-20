@@ -23,6 +23,7 @@ from gz.proto import (
     FRAME_EVAL_RESULT,
     FRAME_HELLO,
     FRAME_HELLO_ACK,
+    FRAME_MODEL_RELEASE,
     FRAME_PING,
     FRAME_PONG,
     Hello,
@@ -45,11 +46,13 @@ def test_server_eval_and_ping(tmp_path: Path) -> None:
         assert struct.unpack_from("<Q", payload, 0)[0] == 99
         del payload
 
-        write_frame(client, FRAME_EVAL, struct.pack("<Q", 11), batch)
+        write_eval(client, 11, batch)
         frame_type, payload = read_frame(client, bytearray())
         assert frame_type == FRAME_EVAL_RESULT
         assert struct.unpack_from("<Q", payload, 0)[0] == 11
         assert bytes(payload[8:24]) == bytes(STUB_MODEL_VERSION)
+        assert struct.unpack_from("<Q", payload, 24)[0] == 1
+        assert bytes(payload[32:48]) == bytes(STUB_MODEL_VERSION)
 
         values, logits = stub(batch_view)
         expected = expected_output_bytes(
@@ -58,7 +61,7 @@ def test_server_eval_and_ping(tmp_path: Path) -> None:
             batch_view.row_count,
             batch_view.action_count[: batch_view.row_count],
         )
-        assert bytes(payload[24:]) == expected
+        assert bytes(payload[48:]) == expected
     finally:
         client.close()
         thread.join(timeout=1)
@@ -89,7 +92,7 @@ def test_server_rejects_bad_encoding(tmp_path: Path) -> None:
 def test_server_rejects_changed_schema_and_capacity(tmp_path: Path) -> None:
     client, thread = start_client(tmp_path, SCHEMA_HASH, 2)
     try:
-        write_frame(client, FRAME_EVAL, struct.pack("<Q", 1), make_batch(attr_dim=1, schema_hash=b"x" * 32))
+        write_eval(client, 1, make_batch(attr_dim=1, schema_hash=b"x" * 32))
         assert_error(client, ERROR_SCHEMA)
     finally:
         client.close()
@@ -97,8 +100,39 @@ def test_server_rejects_changed_schema_and_capacity(tmp_path: Path) -> None:
 
     client, thread = start_client(tmp_path, SCHEMA_HASH, 2)
     try:
-        write_frame(client, FRAME_EVAL, struct.pack("<Q", 1), make_batch(attr_dim=1, capacity=3))
+        write_eval(client, 1, make_batch(attr_dim=1, capacity=3))
         assert_error(client, ERROR_CAPACITY)
+    finally:
+        client.close()
+        thread.join(timeout=1)
+
+
+def test_server_rejects_an_unavailable_model_version(tmp_path: Path) -> None:
+    client, thread = start_client(tmp_path, SCHEMA_HASH, 2)
+    try:
+        write_frame(
+            client,
+            FRAME_EVAL,
+            struct.pack("<Q", 1),
+            b"x" * 16,
+            make_batch(attr_dim=1),
+        )
+        assert_error(client, ERROR_PROTOCOL)
+    finally:
+        client.close()
+        thread.join(timeout=1)
+
+
+def test_server_rejects_releasing_the_active_model(tmp_path: Path) -> None:
+    client, thread = start_client(tmp_path, SCHEMA_HASH, 2)
+    try:
+        write_frame(
+            client,
+            FRAME_MODEL_RELEASE,
+            struct.pack("<Q", 1),
+            bytes(STUB_MODEL_VERSION),
+        )
+        assert_error(client, ERROR_PROTOCOL)
     finally:
         client.close()
         thread.join(timeout=1)
@@ -166,6 +200,16 @@ def assert_error(client: socket.socket, code: int) -> None:
     assert frame_type == FRAME_ERROR
     actual, _message = decode_error(payload)
     assert actual == code
+
+
+def write_eval(client: socket.socket, batch_id: int, batch: bytes) -> None:
+    write_frame(
+        client,
+        FRAME_EVAL,
+        struct.pack("<Q", batch_id),
+        bytes(STUB_MODEL_VERSION),
+        batch,
+    )
 
 
 def expected_output_bytes(

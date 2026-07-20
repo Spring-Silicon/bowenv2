@@ -55,6 +55,7 @@ where
                     identity,
                     context,
                     sampled_tree: false,
+                    symmetric_selfplay: false,
                     pressure_reserved: false,
                     next_episode_id: &mut next_episode_id,
                 };
@@ -66,12 +67,17 @@ where
                 )?;
             }
 
-            episodes.extend(pool.drive(
-                &mut self.engine,
-                "batched driver blocked",
-                None,
-                |_, _, _| {},
-            )?);
+            episodes.extend(
+                pool.drive(
+                    &mut self.engine,
+                    "batched driver blocked",
+                    None,
+                    |_, _, _| {},
+                )?
+                .into_iter()
+                .map(crate::pool::CompletedTask::into_gumbel)
+                .collect::<EngineResult<Vec<_>>>()?,
+            );
 
             if roots_exhausted && !pool.active() {
                 return Ok(BatchedRun {

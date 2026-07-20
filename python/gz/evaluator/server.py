@@ -11,7 +11,7 @@ from threading import Event
 
 from gz.codec import BatchView
 from gz.codec.batch import EncodingError
-from gz.common.tags import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
+from gz.common.tags import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash, ModelVersion
 from gz.evaluator.backends import StubBackend
 from gz.proto import (
     BATCH_ENCODING_VERSION,
@@ -25,6 +25,7 @@ from gz.proto import (
     FRAME_EVAL_RESULT,
     FRAME_HELLO,
     FRAME_HELLO_ACK,
+    FRAME_MODEL_RELEASE,
     FRAME_PING,
     FRAME_PONG,
     Hello,
@@ -96,13 +97,15 @@ def _serve_connection(conn: socket.socket, backend: StubBackend) -> None:
                         _flush_oldest(conn, write_buf, backend, pending)
                     _handle_ping(conn, write_buf, payload)
                 elif frame_type == FRAME_EVAL:
-                    batch_id, view = _parse_eval(state, payload)
+                    batch_id, model_version, view = _parse_eval(state, payload)
                     backend.apply_pending_swap()
                     if len(pending) >= PIPELINE_DEPTH:
                         _flush_oldest(conn, write_buf, backend, pending)
-                    staged = backend.stage(view)
+                    staged = backend.stage(view, model_version)
                     del view
                     pending.append((batch_id, backend.launch(staged)))
+                elif frame_type == FRAME_MODEL_RELEASE:
+                    _handle_model_release(backend, payload)
                 else:
                     raise ProtocolError(ERROR_PROTOCOL, "unexpected frame type")
             finally:
@@ -133,12 +136,17 @@ def _handshake(
     if hello.batch_capacity == 0:
         raise ProtocolError(ERROR_CAPACITY, "zero batch capacity")
     model_version = backend.handshake(hello)
+    model_generation, generation_version = backend.model_generation()
+    if generation_version != model_version:
+        raise ProtocolError(ERROR_PROTOCOL, "handshake model generation mismatch")
+    if not 0 < model_generation <= 0xFFFF_FFFF_FFFF_FFFF:
+        raise ProtocolError(ERROR_PROTOCOL, "invalid model generation")
     _ensure_reply_send_buffer(conn, backend, hello.batch_capacity)
     write_frame_into(
         conn,
         write_buf,
         FRAME_HELLO_ACK,
-        HelloAck(PROTOCOL_VERSION, model_version).encode(),
+        HelloAck(PROTOCOL_VERSION, model_version, model_generation).encode(),
     )
     return _ConnectionState(
         feature_schema_hash=hello.feature_schema_hash,
@@ -165,7 +173,7 @@ def _ensure_reply_send_buffer(conn: socket.socket, backend: StubBackend, capacit
     # PIPELINE_DEPTH replies can be queued back-to-back while the client
     # is mid-write of its next request; the send buffer must hold all of
     # them for the reply writes to never block.
-    reply_frame = (45 + capacity * 4 + capacity * int(max_actions) * 4) * PIPELINE_DEPTH
+    reply_frame = (69 + capacity * 4 + capacity * int(max_actions) * 4) * PIPELINE_DEPTH
     conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, reply_frame)
     achieved = conn.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
     if achieved < reply_frame:
@@ -182,19 +190,30 @@ def _handle_ping(conn: socket.socket, write_buf: bytearray, payload: memoryview)
     write_frame_into(conn, write_buf, FRAME_PONG, payload)
 
 
-def _parse_eval(state: _ConnectionState, payload: memoryview) -> tuple[int, BatchView]:
-    if len(payload) < 8:
+def _parse_eval(
+    state: _ConnectionState, payload: memoryview
+) -> tuple[int, ModelVersion, BatchView]:
+    if len(payload) < 24:
         raise ProtocolError(ERROR_MALFORMED, "EVAL frame truncated")
     batch_id = struct.unpack_from("<Q", payload, 0)[0]
+    model_version = ModelVersion.from_bytes(payload[8:24])
     try:
-        batch = BatchView.parse(payload[8:])
+        batch = BatchView.parse(payload[24:])
     except EncodingError as error:
         raise ProtocolError(ERROR_ENCODING, str(error)) from error
     if batch.feature_schema_hash != state.feature_schema_hash:
         raise ProtocolError(ERROR_SCHEMA, "feature schema hash mismatch")
     if batch.batch_capacity != state.batch_capacity:
         raise ProtocolError(ERROR_CAPACITY, "batch capacity mismatch")
-    return batch_id, batch
+    return batch_id, model_version, batch
+
+
+def _handle_model_release(backend: StubBackend, payload: memoryview) -> None:
+    if len(payload) != 24:
+        raise ProtocolError(ERROR_MALFORMED, "bad MODEL_RELEASE length")
+    generation = struct.unpack_from("<Q", payload, 0)[0]
+    version = ModelVersion.from_bytes(payload[8:24])
+    backend.release_model_generation(generation, version)
 
 
 def _flush_oldest(
@@ -205,12 +224,15 @@ def _flush_oldest(
 ) -> None:
     batch_id, handle = pending.popleft()
     result = backend.finish(handle)
+    active_generation, active_version = backend.model_generation()
     write_frame_into(
         conn,
         write_buf,
         FRAME_EVAL_RESULT,
         struct.pack("<Q", batch_id),
         bytes(result.model_version),
+        struct.pack("<Q", active_generation),
+        bytes(active_version),
         result.payload,
     )
 

@@ -91,12 +91,10 @@ fn policy_and_value_streams_filter_competitive_rows() {
     assert!(policy.iter().all(|(id, row)| {
         *id == primary_id && row.policy_target.iter().any(|target| *target > 0.0)
     }));
-    assert_eq!(
-        store
-            .sample_rows_kind(sample_config(1, 2, 7), SampleKind::Policy)
-            .unwrap_err(),
-        ReplayError::Empty
-    );
+    let recent_policy = store
+        .sample_rows_kind(sample_config(16, 2, 7), SampleKind::Policy)
+        .unwrap();
+    assert!(recent_policy.iter().all(|(id, _)| *id == primary_id));
     let value = store
         .sample_rows_kind(sample_config(32, 4, 11), SampleKind::Value)
         .unwrap();

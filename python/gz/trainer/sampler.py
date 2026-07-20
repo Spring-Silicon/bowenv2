@@ -17,7 +17,9 @@ from gz.proto import (
     write_frame,
 )
 
-SAMPLE_PROTOCOL_VERSION = 7
+SAMPLE_PROTOCOL_VERSION = 10
+
+HELLO_ACK_FIXED_LEN = 176
 
 FRAME_HELLO = 1
 FRAME_HELLO_ACK = 2
@@ -38,19 +40,40 @@ class SampleResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SymmetricSelfplayMetrics:
+    p1_win_rate_ema: float
+    p2_win_rate_ema: float
+    draw_rate_ema: float
+    seat_advantage_ema: float
+    p1_terminal_cost_ema: float
+    p2_terminal_cost_ema: float
+    mean_terminal_cost_ema: float
+    terminal_cost_margin_ema: float
+    terminal_cost_best: float
+    p1_episode_len_ema: float
+    p2_episode_len_ema: float
+    game_len_ema: float
+    episode_len_margin_ema: float
+
+
+@dataclass(frozen=True, slots=True)
 class SampleAck:
     feature_schema_hash: FeatureSchemaHash
     max_batch: int
     produced_rows: int
     produced_policy_rows: int
+    produced_value_rows: int
     episodes: int
     episodes_stopped: int
     episode_cost_ema: float
     episode_len_ema: float
     stop_rate_ema: float
     learner_win_rate_ema: float
+    value_sign_accuracy_early_ema: float
+    value_sign_accuracy_late_ema: float
     episode_latency_ema: float
     best_cost: float
+    symmetric_selfplay: SymmetricSelfplayMetrics | None
     root: RootInfo | None
     feature_schema: FeatureSchemaConfig
 
@@ -236,7 +259,7 @@ class SampleClient:
 
 
 def decode_ack(payload: memoryview) -> SampleAck:
-    if len(payload) < 116:
+    if len(payload) < HELLO_ACK_FIXED_LEN:
         raise SampleError("sample HELLO_ACK truncated")
     protocol_version = struct.unpack_from("<I", payload, 0)[0]
     if protocol_version != SAMPLE_PROTOCOL_VERSION:
@@ -253,6 +276,42 @@ def decode_ack(payload: memoryview) -> SampleAck:
     root_cost = struct.unpack_from("<f", payload, 92)[0]
     root_nodes, root_edges, root_candidates = struct.unpack_from("<III", payload, 96)
     produced_policy_rows = struct.unpack_from("<Q", payload, 108)[0]
+    produced_value_rows = struct.unpack_from("<Q", payload, 116)[0]
+    value_sign_early_ema, value_sign_late_ema = struct.unpack_from("<ff", payload, 124)
+    symmetric_present = struct.unpack_from("<I", payload, 132)[0]
+    if symmetric_present not in (0, 1):
+        raise SampleError("sample HELLO_ACK has invalid symmetric metrics flag")
+    symmetric_values = struct.unpack_from("<10f", payload, 136)
+    symmetric = None
+    if symmetric_present:
+        (
+            p1_win_rate_ema,
+            p2_win_rate_ema,
+            draw_rate_ema,
+            p1_terminal_cost_ema,
+            p2_terminal_cost_ema,
+            terminal_cost_margin_ema,
+            terminal_cost_best,
+            p1_episode_len_ema,
+            p2_episode_len_ema,
+            episode_len_margin_ema,
+        ) = symmetric_values
+        symmetric = SymmetricSelfplayMetrics(
+            p1_win_rate_ema=p1_win_rate_ema,
+            p2_win_rate_ema=p2_win_rate_ema,
+            draw_rate_ema=draw_rate_ema,
+            seat_advantage_ema=p1_win_rate_ema - p2_win_rate_ema,
+            p1_terminal_cost_ema=p1_terminal_cost_ema,
+            p2_terminal_cost_ema=p2_terminal_cost_ema,
+            mean_terminal_cost_ema=0.5
+            * (p1_terminal_cost_ema + p2_terminal_cost_ema),
+            terminal_cost_margin_ema=terminal_cost_margin_ema,
+            terminal_cost_best=terminal_cost_best,
+            p1_episode_len_ema=p1_episode_len_ema,
+            p2_episode_len_ema=p2_episode_len_ema,
+            game_len_ema=p1_episode_len_ema + p2_episode_len_ema,
+            episode_len_margin_ema=episode_len_margin_ema,
+        )
     root = (
         RootInfo(
             cost=root_cost,
@@ -268,6 +327,7 @@ def decode_ack(payload: memoryview) -> SampleAck:
         max_batch=max_batch,
         produced_rows=produced_rows,
         produced_policy_rows=produced_policy_rows,
+        produced_value_rows=produced_value_rows,
         episodes=episodes,
         episodes_stopped=episodes_stopped,
         episode_cost_ema=cost_ema,
@@ -275,11 +335,14 @@ def decode_ack(payload: memoryview) -> SampleAck:
         stop_rate_ema=stop_ema,
         # -1.0 = unseeded (no labeled episode yet); 0.0 is a real rate.
         learner_win_rate_ema=win_ema,
+        value_sign_accuracy_early_ema=value_sign_early_ema,
+        value_sign_accuracy_late_ema=value_sign_late_ema,
         # -1.0 = unseeded (no completion observed by this process yet).
         episode_latency_ema=latency_ema,
         best_cost=best_cost,
+        symmetric_selfplay=symmetric,
         root=root,
-        feature_schema=FeatureSchemaConfig.decode(payload[116:]),
+        feature_schema=FeatureSchemaConfig.decode(payload[HELLO_ACK_FIXED_LEN:]),
     )
 
 

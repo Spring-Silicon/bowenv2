@@ -3,7 +3,7 @@ use super::{
     PuctEpisode, PuctEpisodeContext, PuctHandleBatch, PuctMcts, PuctRootResult, PuctSearchContext,
 };
 use crate::mcts::task::{MctsEpisodeTask, MctsRootTask};
-use crate::mcts::types::{MctsConfig, MctsEpisode, MctsEpisodeContext, MctsSearchContext};
+use crate::mcts::types::MctsConfig;
 use crate::work::{EngineIdentity, SearchPoll, SearchWorkResult, WorkToken};
 use gz_engine::{EngineResult, ReplayGraphContext};
 use std::hash::Hash;
@@ -29,7 +29,7 @@ where
                 PuctStrategy::new(search.config),
                 identity,
                 root,
-                common_search_context(context),
+                context,
             ),
         }
     }
@@ -70,17 +70,13 @@ where
                 search.search_config_hash,
                 identity,
                 root,
-                common_episode_context(context),
+                context,
             ),
         }
     }
 
     pub fn poll(&mut self) -> EngineResult<SearchPoll<G, C, PuctEpisode<G, C>>> {
-        match self.inner.poll()? {
-            SearchPoll::Work(work) => Ok(SearchPoll::Work(work)),
-            SearchPoll::Blocked => Ok(SearchPoll::Blocked),
-            SearchPoll::Done(episode) => Ok(SearchPoll::Done(puct_episode(episode))),
-        }
+        self.inner.poll()
     }
 
     pub fn resume(&mut self, token: WorkToken, result: SearchWorkResult<G, C>) -> EngineResult<()> {
@@ -115,42 +111,8 @@ pub(crate) fn common_config(search: &PuctMcts) -> MctsConfig {
         export_position: search.config.export_position,
         mask_stop: search.config.mask_stop,
         no_backtrack: search.config.no_backtrack,
+        predicted_horizon: false,
         candidate_options: search.config.candidate_options,
         measure_options: search.config.measure_options,
-    }
-}
-
-pub(crate) fn common_search_context(context: PuctSearchContext) -> MctsSearchContext {
-    MctsSearchContext {
-        root_step: context.root_step,
-        budget_fraction: context.budget_fraction,
-        budget_step: context.budget_step,
-        selection_temperature: context.selection_temperature,
-        opponent: context.opponent,
-        noise_seed: context.noise_seed,
-        export_position: context.export_position,
-    }
-}
-
-pub(crate) fn common_episode_context(context: PuctEpisodeContext) -> MctsEpisodeContext {
-    MctsEpisodeContext {
-        opponent: context.opponent,
-        noise_seed: context.noise_seed,
-    }
-}
-
-pub(crate) fn puct_episode<G, C>(episode: MctsEpisode<G, C>) -> PuctEpisode<G, C> {
-    PuctEpisode {
-        root: episode.root,
-        final_graph: episode.final_graph,
-        root_context: episode.root_context,
-        final_context: episode.final_context,
-        steps: episode.steps,
-        root_stats: episode.root_stats,
-        created_graphs: episode.created_graphs,
-        created_candidates: episode.created_candidates,
-        final_measure: episode.final_measure,
-        stop_reason: episode.stop_reason,
-        search_config_hash: episode.search_config_hash,
     }
 }

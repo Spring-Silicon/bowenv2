@@ -1,0 +1,21 @@
+extends = "bases/whittle-generated-exphormer-v2-symmetric-selfplay.toml"
+
+[trainer]
+total_steps = 10000
+model_seed = 5
+data_seed = 42
+
+[selfplay]
+root_mode = "fixed"
+lanes = 44
+workers_per_lane = 4
+max_steps = 64
+seed = 42
+wave_batching = true
+
+[wandb]
+run_name = "whittle-symmetric-fixed-s42-m5-l64-w4-wave-10k-a3"
+
+[paths]
+run_dir = "runs/whittle-symmetric-fixed-s42-m5-l64-w4-wave-10k-a3"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/whittle-symmetric-fixed-s42-m5-l64-w4-wave-10k-a3"

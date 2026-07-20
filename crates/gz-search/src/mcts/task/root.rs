@@ -296,7 +296,7 @@ where
             Some(action) => action,
             None => self
                 .strategy
-                .select_nonroot(&run.strategy, &self.tree, descent.node_index),
+                .select_nonroot(&mut run.strategy, &self.tree, descent.node_index),
         };
 
         if self.tree.nodes[descent.node_index].is_stop(action) {
@@ -465,6 +465,14 @@ where
             action,
         });
         if let Some(child) = self.tree.nodes[descent.node_index].children[action] {
+            if self.tree.nodes[child].terminal {
+                let value = self.tree.nodes[child].value;
+                self.tree.backup(&descent.path, value);
+                run.descent = Some(descent);
+                run.complete_simulation();
+                self.state = RootTaskState::Running(run);
+                return Ok(());
+            }
             if !descent.seen.insert(self.tree.nodes[child].context) {
                 let value = self.tree.nodes[child].value;
                 self.tree.backup(&descent.path, value);
@@ -535,6 +543,8 @@ where
             expansion.summaries,
             output,
             self.config.mask_stop,
+            self.config.predicted_horizon
+                && self.context.root_step as usize + expansion.depth >= self.config.max_steps,
         );
         self.tree.eval_count += 1;
         self.tree.nodes.push(node);

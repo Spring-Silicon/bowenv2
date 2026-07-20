@@ -56,7 +56,7 @@ def test_hello_roundtrip() -> None:
         engine_version=EngineVersion.from_bytes(b"v" * 16),
         action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
     )
-    ack = HelloAck(1, ModelVersion.from_bytes(b"m" * 16))
+    ack = HelloAck(1, ModelVersion.from_bytes(b"m" * 16), 7)
 
     assert Hello.decode(memoryview(hello.encode())) == hello
     assert HelloAck.decode(memoryview(ack.encode())) == ack

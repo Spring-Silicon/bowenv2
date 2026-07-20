@@ -141,6 +141,7 @@ pub fn send_ack(stream: &mut UnixStream) -> ServiceResult<()> {
     HelloAck {
         protocol_version: PROTOCOL_VERSION,
         model_version: STUB_MODEL_VERSION,
+        model_generation: 1,
     }
     .encode(&mut payload);
     let mut write_buf = Vec::new();

@@ -281,9 +281,9 @@ puct/strategy.rs
   PUCT root state, PUCT action score, visit target, and PUCT root election
 ```
 
-`gumbel/categorical.rs` and `gumbel/sampled_tree/` remain specialized paths.
-They may reuse common node/math helpers where natural, but this spec does not
-require rewriting them around the generic standard episode task.
+`policy_rollout.rs` and `gumbel/sampled_tree/` remain specialized paths. They
+may reuse common node/math helpers where natural, but this spec does not require
+rewriting them around the generic standard episode task.
 
 ## Shared Internal Configuration
 

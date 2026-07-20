@@ -510,6 +510,7 @@ fn build_example(
         policy_target: label.policy_target,
         selected_action,
         value_target: None,
+        horizon_value_targets: None,
         reward_target: Some(learner_reward),
         final_measure,
         model_version: None,

@@ -167,9 +167,13 @@ side, then adopt it between frames on the serving thread, which runs the
 compile/capture warmup at adoption — CUDA graph capture (reduce-overhead)
 only works on the thread that serves, and a same-arch checkpoint hits the
 inductor cache so the warmup pause is near zero. In-flight batches finish
-on the old version. A new checkpoint whose tags disagree with the serving
-configuration is refused loudly on stderr and the evaluator keeps serving
-the old version — fail fast on the artifact without killing selfplay.
+on their requested version. The evaluator retains the previous serving slot
+until the Rust client releases its final episode lease; requests name the exact
+ModelVersion they require. Residency is bounded to the active and one retained
+generation, so checkpoint polling waits instead of loading a third model. A new
+checkpoint whose tags disagree with the serving configuration is refused loudly
+on stderr and the evaluator keeps serving the old model — fail fast on the
+artifact without killing selfplay.
 ```
 
 Implemented in `python/gz/checkpoints`: local directory source, strict

@@ -83,31 +83,35 @@ work does not increment learner episode or replay-row counters.
 
 ### Active Model Contract
 
-Reference eval requests use the same active evaluator path as learner evals.
-Checkpoint publication may hot-swap the active model between any two rollout
-steps. This is intentional.
+Reference eval requests use the same evaluator route as learner evals. Before
+the first request, the orchestrator leases that route's active model generation
+for the episode. Every later request names the leased ModelVersion, including
+the reference prelude and learner phase when they share an episode ID.
 
 ```text
-step 0 may use checkpoint t
-step 1 may use checkpoint t
-step 2 may use checkpoint t+1
+episode E leases checkpoint t
+every reference and learner request for E targets checkpoint t
+checkpoint t+1 may become active while E is running
+new episode E+1 leases checkpoint t+1
+checkpoint t is released after E's final request and completion
 ```
 
-The resulting graph sequence and measured reward are fixed before learner
-search begins, so the learner still receives one immutable opponent
-trajectory.
+The evaluator retains at most the active and one previous generation. The eval
+batcher groups work by exact generation, so one backend batch never mixes model
+versions. Loading another checkpoint waits until the previous generation's
+last episode lease is released.
 
 The rollout task observes the model version returned for every policy
 decision. The trajectory-level replay `model_version` is:
 
 ```text
 Some(version)  every played reference step used that version
-None           the rollout crossed a hot-swap, or has no policy step
+None           the rollout has no policy step
 ```
 
-The implementation never attributes a mixed rollout to one checkpoint. There
-are no model-version leases, targeted eval frames, historical model slots, or
-version-homogeneous batching in this mode.
+The implementation rejects a result served by any version other than the
+episode's request. This makes mixed-version rollouts a contract violation
+rather than an accepted unattributed case.
 
 The gated-policy challenge and `reference_gamma` identity selection are not
 used by sampled-trajectory. `ReplayReferenceKind::Gumbel` identifies the
@@ -129,6 +133,8 @@ At each reference state:
 Unit-scale Gumbel top-1 is exactly categorical sampling from softmax(policy
 logits). This is direct policy sampling, not one-simulation MCTS: no child
 value evaluation, sequential halving, overlap tempering, or tree reuse occurs.
+The implementation is the top-level `gz-search` policy rollout, independent of
+the Gumbel-MCTS module and configured explicitly by the orchestrator.
 
 The rollout inherits:
 
@@ -248,8 +254,9 @@ the prelude never enters replay or learner counters
 each episode receives a unique nonzero trajectory ID
 categorical ranking skips rejected and no-backtrack actions without re-drawing
 reference measurement finishes before learner admission
-mid-rollout model-version changes are accepted
-mixed rollouts store no false trajectory-level model attribution
+mid-rollout checkpoint swaps leave the existing episode on its pinned version
+new episodes adopt the advertised active generation
+the previous generation is released only after its final episode completes
 learner evals and replay rows use the same aligned opponent states
 STOP re-evaluation clamps to the terminal opponent row
 all success and failure paths release every created engine handle once

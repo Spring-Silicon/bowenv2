@@ -89,6 +89,7 @@ def publish_ema(
     training_step: int,
     run_id: str,
     tags: PublishTags | None = None,
+    checkpoint_pointers: tuple[str, ...] = (),
 ) -> CheckpointManifest:
     ema.assert_finite()
     tags = tags or PublishTags.zeros()
@@ -105,4 +106,5 @@ def publish_ema(
         action_set_hash=tags.action_set_hash,
         training_step=training_step,
         run_id=run_id,
+        checkpoint_pointers=checkpoint_pointers,
     )

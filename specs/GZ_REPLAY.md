@@ -183,8 +183,10 @@ action_history is the selected action refs from the root to s_t;
 action_history.len() == step_index.
 value_target and reward_target duplicate episode-level values onto every
 row so sampling never needs a join.
-model_version is the step's root eval model version; it may differ across
-rows if a checkpoint swap lands mid-episode.
+model_version is the step's root eval model version. Episode leases keep every
+step on a given evaluator route version-homogeneous even if a checkpoint swap
+lands mid-episode; sampled-tree actors on different routes may use different
+pinned versions.
 No engine-local handles, graph bodies, artifacts, display strings, or
 adapter metadata anywhere in stored records. `feature_row` is the sole
 exception to the old "no graph bodies" wording: it stores a portable encoded
@@ -260,10 +262,8 @@ rows.
 
 ## Storage Layout
 
-Schema version: 4. Version 4 records the expander fields in the persisted
-FeatureSchemaConfig metadata. Version 3 added optional per-row GZFR feature
-payloads and the persisted FeatureSchemaConfig metadata. Version 1, 2, and 3
-stores fail to open with SchemaMismatch.
+Schema version: 7. Version 7 adds independent dense policy/value row indexes;
+older stores fail to open with SchemaMismatch.
 
 ```text
 RocksDB, one database directory, column families:
@@ -272,6 +272,8 @@ RocksDB, one database directory, column families:
   episodes  key: episode_seq u64 BE            value: ReplayEpisodeRecord
   rows      key: episode_seq u64 BE || step_index u32 BE   value: ReplayRow
   row_index key: row_seq u64 BE                value: rows key
+  policy_row_index key: policy_row_seq u64 BE  value: rows key
+  value_row_index  key: value_row_seq u64 BE   value: rows key
 ```
 
 Rules:
@@ -279,8 +281,9 @@ Rules:
 ```text
 Keys are episode-major (decided; closes CODEBASE_OUTLINE design question 1).
 Ordered keys give episode iteration and windowed scans for free.
-row_index assigns every row a dense global sequence number so uniform
-window sampling is O(1) lookups, not scans.
+Each index assigns its eligible rows a dense sequence number. Policy/value
+windows therefore count policy/value rows directly and sample with O(1)
+lookups even when either stream is sparse.
 Values are postcard-encoded via serde. Hashes and ids serialize as raw
 bytes through gz-engine's binary serde representation.
 meta stores a schema version written at creation; opening a store with a
@@ -331,6 +334,8 @@ pub struct SampleConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplayCounters {
     pub produced_rows: u64,
+    pub produced_policy_rows: u64,
+    pub produced_value_rows: u64,
     pub consumed_rows: u64,
 }
 ```
@@ -339,14 +344,18 @@ Sampling rules:
 
 ```text
 sample_rows draws batch row sequence numbers uniformly, with replacement,
-from the last window_rows rows (clamped to what exists), using an internal
-deterministic RNG seeded from SampleConfig.seed.
+from the last window_rows rows in the selected dense stream (clamped to what
+exists), using an internal deterministic RNG seeded from SampleConfig.seed.
 identical (store contents, config) -> identical sample; the trainer varies
 the seed per batch.
 sampling an empty store returns Empty.
 sample_rows adds batch to consumed_rows; append_episode adds row_count to
 produced_rows. sample_ratio = consumed / produced is computed by the
 orchestrator's ratio controller, not here.
+Sampled-tree competitive games persist only learner rows. Pair-value training
+evaluates each row in its stored orientation with target z and its swapped
+orientation with target -z; opponent trajectory length never changes label
+weight.
 Python never reads RocksDB directly; a later service layer wraps this API.
 ```
 

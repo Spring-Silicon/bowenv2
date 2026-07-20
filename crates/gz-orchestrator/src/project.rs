@@ -50,6 +50,8 @@ pub(crate) fn artifact_from_episode<G, C>(
                 selected_action: step.selected_action,
                 legal_actions: step.legal_actions.clone(),
                 policy_target: step.policy_target.clone(),
+                root_value: Some(step.root_value),
+                root_search_value: Some(step.root_search_value),
                 model_version: Some(step.model_version),
             })
             .collect(),

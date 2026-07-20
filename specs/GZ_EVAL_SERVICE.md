@@ -57,14 +57,15 @@ The decisions this spec fixes (review before implementation):
    untouched. A FeatureEvalBackend trait abstracts "bytes in, outputs out"
    so the in-process stub and the socket client are interchangeable.
 
-6. Single in-flight batch per connection in v1. The protocol carries
-   batch_id from day one so pipelining (2-3 in flight) is a client change
-   later, not a protocol change. ModelVersion rides every EVAL_RESULT so
-   checkpoint hot-swap also lands later without protocol change.
+6. Protocol v2 permits a bounded pipeline per connection. Each request names
+   its episode-leased ModelVersion; each result reports the served version and
+   the generation active for future admissions. The client releases retained
+   generations explicitly after their final episode completes.
 
-Deliberately deferred: the trainer, checkpoint loading/hot-swap, torch,
-batcher pipelining, evaluator restart policy, shared-memory transport,
-opponent trajectory registration (job 2).
+Deliberately deferred from the original slice: the trainer, checkpoint
+loading/hot-swap, torch, batcher pipelining, evaluator restart policy,
+shared-memory transport, opponent trajectory registration (job 2). Hot-swap
+and pipelining have since been implemented under their later work orders.
 ```
 
 ## Role
@@ -140,16 +141,25 @@ pub trait FeatureEvalBackend {
         batch_bytes: &[u8],
         action_counts: &[u32],
     ) -> ServiceResult<BackendOutputs>;
+    fn model_generation(&self) -> ModelGeneration;
+    fn submit_for_model(
+        &mut self,
+        model: ModelGeneration,
+        batch_bytes: &[u8],
+        action_counts: &[u32],
+    ) -> ServiceResult<PendingBatch>;
+    fn release_model_generation(&mut self, model: ModelGeneration) -> ServiceResult<()>;
 }
 
 pub struct BackendOutputs {
     pub model_version: ModelVersion,
+    pub active_generation: ModelGeneration,
     pub rows: Vec<RowOutput>,          // gz-features RowOutput
 }
 
 pub struct StubBackend { /* collator-compatible; pure Rust */ }
 
-pub struct ProcessBackend { /* owns the connection; single in-flight */ }
+pub struct ProcessBackend { /* owns the connection; bounded FIFO pipeline */ }
 
 pub struct EvaluatorProcess { /* child + socket path; kill on drop */ }
 
@@ -188,9 +198,9 @@ connect retries UnixStream::connect on the configured socket path until
 ready_timeout, then sends HELLO on that same connection and requires
 HELLO_ACK.
 Drop for EvaluatorProcess kills and reaps the child; no orphans.
-ProcessBackend::eval writes one EVAL frame and blocks for its EVAL_RESULT;
-ERROR frames or connection loss map to ServiceError::Backend and are
-fail-fast for the caller.
+ProcessBackend submits EVAL frames for exact leased ModelVersions and receives
+EVAL_RESULT frames in FIFO order; ERROR frames or connection loss map to
+ServiceError::Backend and are fail-fast for the caller.
 ServiceError is small: Handshake, Protocol, Backend, Io(bounded message).
 ```
 
@@ -318,9 +328,7 @@ gz-engine, gz-eval, gz-replay, and the goldens are untouched throughout.
 ## Deferred
 
 ```text
-trainer, checkpoint manifest/loading/hot-swap (protocol already carries
-ModelVersion)
-batcher pipelining (protocol already carries batch_id)
+trainer
 evaluator restart/backoff policy
 torch, the real Exphormer model, GPU placement
 shared-memory transport

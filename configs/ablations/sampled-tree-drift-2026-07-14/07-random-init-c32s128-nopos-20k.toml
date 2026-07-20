@@ -1,0 +1,28 @@
+extends = "../../bases/whittle-generated-exphormer-v2-sampled-tree.toml"
+
+# Exact random-init c32/s128 recipe with the explicit clock blinded. The v2
+# remaining-budget projection is retained but receives zeros for every row.
+
+[arch]
+value_head = "scalar"
+
+[trainer]
+total_steps = 20000
+value_mirror = false
+resume = false
+init_checkpoint = ""
+init_checkpoint_scope = "all"
+
+[selfplay]
+workers_per_lane = 12
+simulations = 128
+max_considered = 32
+value_reward = "sign"
+position_features = false
+
+[wandb]
+run_name = "whittle-generated-exphormer-v2-sampled-tree-2-c32s128-sign-random-init-nopos-nomirror-20k-1"
+
+[paths]
+run_dir = "runs/gz-c32s128-rinit-s42-nopos-nomirror-20k-1"
+replay_dir = "/opt/dlami/nvme/graphzero-replay/gz-c32s128-rinit-s42-nopos-nomirror-20k-1"

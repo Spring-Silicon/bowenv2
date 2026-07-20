@@ -300,6 +300,8 @@ def make_batch(schema: object, capacity: int, device: object, seed: int) -> Trai
         policy=policy,
         value=value,
         value_valid=torch.ones(capacity, device=device),
+        horizon_value=torch.zeros((capacity, 2), device=device),
+        horizon_value_valid=torch.zeros(capacity, device=device),
         reward=-torch.ones(capacity, device=device),
         row_count=capacity,
     )

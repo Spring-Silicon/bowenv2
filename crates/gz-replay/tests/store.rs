@@ -1,7 +1,9 @@
 mod common;
 
 use common::{episode_with_feature_rows, episode_with_rows, feature_schema_config, measure};
-use gz_replay::{ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig};
+use gz_replay::{
+    ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig, SampleKind,
+};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 
 #[test]
@@ -41,6 +43,100 @@ fn competitive_pair_is_atomic_and_counts_as_one_game() {
     assert_eq!(reopened.episode_counters(), (1, 0));
     assert_eq!(reopened.outcome_emas().unwrap().0, -5.0);
     assert_eq!(reopened.best_cost(), Some(-5.0));
+}
+
+#[test]
+fn symmetric_metrics_track_both_seats_and_survive_reopen() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store
+        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
+        .unwrap();
+    assert_eq!(store.symmetric_selfplay_metrics(), None);
+
+    let p1_win = symmetric_episode(2, -4.0, 1.0);
+    let p2_loss = symmetric_episode(3, -6.0, -1.0);
+    assert_eq!(
+        store.append_episode(&p1_win.0, &p1_win.1).unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+    let same_sign = symmetric_episode(3, -6.0, 1.0);
+    assert_eq!(
+        store
+            .append_episode_pair((&p1_win.0, &p1_win.1), (&same_sign.0, &same_sign.1))
+            .unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+    assert_eq!(store.symmetric_selfplay_metrics(), None);
+    store
+        .append_episode_pair((&p1_win.0, &p1_win.1), (&p2_loss.0, &p2_loss.1))
+        .unwrap();
+
+    let first = store.symmetric_selfplay_metrics().unwrap();
+    assert_eq!(first.p1_win_rate_ema, 1.0);
+    assert_eq!(first.p2_win_rate_ema, 0.0);
+    assert_eq!(first.draw_rate_ema, 0.0);
+    assert_eq!(first.seat_advantage_ema, 1.0);
+    assert_eq!(first.p1_terminal_cost_ema, 4.0);
+    assert_eq!(first.p2_terminal_cost_ema, 6.0);
+    assert_eq!(first.mean_terminal_cost_ema, 5.0);
+    assert_eq!(first.terminal_cost_margin_ema, 2.0);
+    assert_eq!(first.terminal_cost_best, 4.0);
+    assert_eq!(first.p1_episode_len_ema, 2.0);
+    assert_eq!(first.p2_episode_len_ema, 3.0);
+    assert_eq!(first.game_len_ema, 5.0);
+    assert_eq!(first.episode_len_margin_ema, 1.0);
+
+    let p1_loss = symmetric_episode(4, -8.0, -1.0);
+    let p2_win = symmetric_episode(1, -5.0, 1.0);
+    store
+        .append_episode_pair((&p1_loss.0, &p1_loss.1), (&p2_win.0, &p2_win.1))
+        .unwrap();
+    let second = store.symmetric_selfplay_metrics().unwrap();
+    assert!((second.p1_win_rate_ema - 0.99).abs() < 1.0e-12);
+    assert!((second.p2_win_rate_ema - 0.01).abs() < 1.0e-12);
+    assert_eq!(second.draw_rate_ema, 0.0);
+    assert!((second.p1_terminal_cost_ema - 4.04).abs() < 1.0e-12);
+    assert!((second.p2_terminal_cost_ema - 5.99).abs() < 1.0e-12);
+    assert!((second.terminal_cost_margin_ema - 2.01).abs() < 1.0e-12);
+    assert_eq!(second.terminal_cost_best, 4.0);
+    assert!((second.p1_episode_len_ema - 2.02).abs() < 1.0e-12);
+    assert!((second.p2_episode_len_ema - 2.98).abs() < 1.0e-12);
+    assert!((second.episode_len_margin_ema - 1.02).abs() < 1.0e-12);
+
+    let p1_draw = symmetric_episode(2, -7.0, 0.0);
+    let p2_draw = symmetric_episode(2, -7.0, 0.0);
+    store
+        .append_episode_pair((&p1_draw.0, &p1_draw.1), (&p2_draw.0, &p2_draw.1))
+        .unwrap();
+    let expected = store.symmetric_selfplay_metrics().unwrap();
+    assert!((expected.p1_win_rate_ema - 0.9801).abs() < 1.0e-12);
+    assert!((expected.p2_win_rate_ema - 0.0099).abs() < 1.0e-12);
+    assert!((expected.draw_rate_ema - 0.01).abs() < 1.0e-12);
+
+    drop(store);
+    let reopened = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.symmetric_selfplay_metrics(), Some(expected));
+}
+
+#[test]
+fn sampled_tree_rejects_two_trajectory_replay() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store.ensure_data_mode(ReplayDataMode::SampledTree).unwrap();
+    let (primary_record, primary_rows) = episode_with_rows(1);
+    let (secondary_record, secondary_rows) = episode_with_rows(4);
+
+    assert_eq!(
+        store
+            .append_episode_pair(
+                (&primary_record, &primary_rows),
+                (&secondary_record, &secondary_rows),
+            )
+            .unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+    assert_eq!(store.counters().produced_rows, 0);
 }
 
 #[test]
@@ -97,6 +193,73 @@ fn replay_data_mode_prevents_standard_and_sampled_tree_mixing() {
         ReplayError::DataModeMismatch
     );
     legacy.ensure_data_mode(ReplayDataMode::Standard).unwrap();
+
+    let symmetric_dir = common::temp_dir();
+    let symmetric = ReplayStore::open(symmetric_dir.path()).unwrap();
+    symmetric
+        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
+        .unwrap();
+    assert_eq!(
+        symmetric
+            .ensure_data_mode(ReplayDataMode::SymmetricSelfplayStop)
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
+    drop(symmetric);
+    let reopened = ReplayStore::open(symmetric_dir.path()).unwrap();
+    assert_eq!(
+        reopened.data_mode().unwrap(),
+        ReplayDataMode::SymmetricSelfplay
+    );
+}
+
+#[test]
+fn single_vanilla_mode_requires_raw_reward_targets_without_references() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    store
+        .ensure_data_mode(ReplayDataMode::SingleVanilla)
+        .unwrap();
+    let (mut record, mut rows) = episode_with_rows(2);
+    record.outcome.reference = None;
+    record.outcome.value_target = Some(record.outcome.learner_reward);
+    for row in &mut rows {
+        row.value_target = Some(record.outcome.learner_reward);
+    }
+
+    store.append_episode(&record, &rows).unwrap();
+    assert_eq!(store.counters().produced_value_rows, 2);
+    assert_eq!(store.win_rate_ema(), None);
+
+    let mut wrong_record = record.clone();
+    let mut wrong_rows = rows.clone();
+    wrong_record.outcome.value_target = Some(4.0);
+    for row in &mut wrong_rows {
+        row.value_target = Some(4.0);
+    }
+    assert_eq!(
+        store
+            .append_episode(&wrong_record, &wrong_rows)
+            .unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+
+    assert_eq!(
+        store
+            .append_episode_pair((&record, &rows), (&record, &rows))
+            .unwrap_err(),
+        ReplayError::InvalidRecord
+    );
+    drop(store);
+
+    let reopened = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.data_mode().unwrap(), ReplayDataMode::SingleVanilla);
+    assert_eq!(
+        reopened
+            .ensure_data_mode(ReplayDataMode::Standard)
+            .unwrap_err(),
+        ReplayError::DataModeMismatch
+    );
 }
 
 #[test]
@@ -468,6 +631,8 @@ fn raw_db(path: &std::path::Path) -> DB {
             ColumnFamilyDescriptor::new("episodes", Options::default()),
             ColumnFamilyDescriptor::new("rows", Options::default()),
             ColumnFamilyDescriptor::new("row_index", Options::default()),
+            ColumnFamilyDescriptor::new("policy_row_index", Options::default()),
+            ColumnFamilyDescriptor::new("value_row_index", Options::default()),
         ],
     )
     .unwrap()
@@ -482,33 +647,47 @@ fn retention_deletes_old_episodes_and_clamps_sampling() {
         .unwrap();
 
     // 4-row episodes; retention 20 rows triggers past 25 produced.
-    for _ in 0..20 {
-        let (record, rows) = episode_with_feature_rows(4);
+    for episode in 0..20 {
+        let (record, mut rows) = episode_with_feature_rows(4);
+        if episode % 2 == 0 {
+            for row in &mut rows {
+                row.policy_target.fill(0.0);
+            }
+        }
         store.append_episode(&record, &rows).unwrap();
     }
 
     let counters = store.counters();
     assert_eq!(counters.produced_rows, 80);
+    assert_eq!(counters.produced_policy_rows, 40);
+    assert_eq!(counters.produced_value_rows, 80);
     // Old episodes are gone; recent ones remain.
     assert!(store.episode(ReplayEpisodeId::new(0)).unwrap().is_none());
     assert!(store.episode(ReplayEpisodeId::new(19)).unwrap().is_some());
 
     // Sampling a huge window never touches deleted rows.
     for seed in 0..50 {
-        let sampled = store
-            .sample_rows(SampleConfig {
-                batch: std::num::NonZeroUsize::new(8).unwrap(),
-                window_rows: std::num::NonZeroU64::new(1_000_000).unwrap(),
-                seed,
-            })
-            .unwrap();
-        assert_eq!(sampled.len(), 8);
+        for kind in [SampleKind::Any, SampleKind::Policy, SampleKind::Value] {
+            let sampled = store
+                .sample_rows_kind(
+                    SampleConfig {
+                        batch: std::num::NonZeroUsize::new(8).unwrap(),
+                        window_rows: std::num::NonZeroU64::new(1_000_000).unwrap(),
+                        seed,
+                    },
+                    kind,
+                )
+                .unwrap();
+            assert_eq!(sampled.len(), 8);
+        }
     }
 
     // Floors survive reopen.
     drop(store);
     let reopened = ReplayStore::open_with_retention(dir.path(), Some(20)).unwrap();
     assert!(reopened.episode(ReplayEpisodeId::new(0)).unwrap().is_none());
+    assert_eq!(reopened.counters().produced_policy_rows, 40);
+    assert_eq!(reopened.counters().produced_value_rows, 80);
     let sampled = reopened
         .sample_rows(SampleConfig {
             batch: std::num::NonZeroUsize::new(8).unwrap(),
@@ -624,4 +803,42 @@ fn win_rate_ema_distinguishes_all_loss_from_unseeded() {
     rows[0].value_target = Some(1.0);
     store.append_episode(&record, &rows).unwrap();
     assert!((store.win_rate_ema().unwrap() - 0.01).abs() < 1e-9);
+}
+
+#[test]
+fn value_sign_accuracy_ema_distinguishes_zero_from_unseeded() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(store.value_sign_accuracy_emas(), (None, None));
+
+    store.observe_value_sign_accuracy(Some(0.0), None);
+    assert_eq!(store.value_sign_accuracy_emas(), (Some(0.0), None));
+
+    store.observe_value_sign_accuracy(Some(1.0), Some(0.5));
+    let (early, late) = store.value_sign_accuracy_emas();
+    assert!((early.unwrap() - 0.01).abs() < 1e-9);
+    assert!((late.unwrap() - 0.5).abs() < 1e-9);
+}
+
+fn symmetric_episode(
+    row_count: usize,
+    reward: f32,
+    value_target: f32,
+) -> (gz_replay::ReplayEpisodeRecord, Vec<gz_replay::ReplayRow>) {
+    let (mut record, mut rows) = episode_with_rows(row_count);
+    let final_measure = measure(Some(reward), true, true);
+    record.final_measure = final_measure.clone();
+    record.outcome.reference = None;
+    record.outcome.learner_reward = reward;
+    record.outcome.value_target = Some(value_target);
+    record.outcome.stopped = false;
+    for row in &mut rows {
+        row.legal_actions.truncate(1);
+        row.policy_target.truncate(1);
+        row.value_target = Some(value_target);
+        row.horizon_value_targets = Some([value_target; 2]);
+        row.reward_target = Some(reward);
+        row.final_measure = final_measure.clone();
+    }
+    (record, rows)
 }

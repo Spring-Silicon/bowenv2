@@ -9,7 +9,7 @@ pub const ERROR_CAPACITY: u32 = 4;
 pub const ERROR_MALFORMED: u32 = 5;
 
 const HELLO_LEN: usize = 108;
-const HELLO_ACK_LEN: usize = 20;
+const HELLO_ACK_LEN: usize = 28;
 const ERROR_HEADER_LEN: usize = 6;
 const MAX_ERROR_MESSAGE: usize = 512;
 
@@ -75,6 +75,7 @@ impl Hello {
 pub struct HelloAck {
     pub protocol_version: u32,
     pub model_version: ModelVersion,
+    pub model_generation: u64,
 }
 
 impl HelloAck {
@@ -82,6 +83,7 @@ impl HelloAck {
         out.clear();
         out.extend_from_slice(&self.protocol_version.to_le_bytes());
         out.extend_from_slice(self.model_version.as_bytes());
+        out.extend_from_slice(&self.model_generation.to_le_bytes());
     }
 
     pub fn decode(bytes: &[u8]) -> ServiceResult<Self> {
@@ -91,6 +93,7 @@ impl HelloAck {
         Ok(Self {
             protocol_version: read_u32(bytes, 0)?,
             model_version: ModelVersion::from_bytes(read_array(bytes, 4)?),
+            model_generation: u64::from_le_bytes(read_array(bytes, 20)?),
         })
     }
 }

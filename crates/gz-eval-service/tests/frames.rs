@@ -1,7 +1,8 @@
 use gz_engine::{ActionSetHash, EngineId, EngineVersion};
 use gz_eval_service::{
-    FRAME_ERROR, FRAME_EVAL, FRAME_EVAL_RESULT, FRAME_HELLO, FRAME_HELLO_ACK, FRAME_PING,
-    FRAME_PONG, Hello, PROTOCOL_VERSION, ServiceError, decode_error, read_frame, write_frame,
+    FRAME_ERROR, FRAME_EVAL, FRAME_EVAL_RESULT, FRAME_HELLO, FRAME_HELLO_ACK, FRAME_MODEL_RELEASE,
+    FRAME_PING, FRAME_PONG, Hello, PROTOCOL_VERSION, ServiceError, decode_error, read_frame,
+    write_frame,
 };
 use gz_features::{BATCH_ENCODING_VERSION, FeatureSchemaHash};
 use std::io::Write;
@@ -17,6 +18,7 @@ fn frame_roundtrip_accepts_every_known_type() {
         FRAME_PING,
         FRAME_PONG,
         FRAME_ERROR,
+        FRAME_MODEL_RELEASE,
     ] {
         let (mut left, mut right) = UnixStream::pair().unwrap();
         let mut write_buf = Vec::new();

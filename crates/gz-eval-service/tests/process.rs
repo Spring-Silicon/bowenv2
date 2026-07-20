@@ -3,9 +3,10 @@ mod common;
 use common::{
     ScriptedServer, hello, output_payload, read_frame_type, row, schema, send_ack, send_error,
 };
+use gz_engine::ModelVersion;
 use gz_eval_service::{
     ERROR_PROTOCOL, EvaluatorProcess, EvaluatorProcessConfig, FRAME_EVAL_RESULT,
-    FeatureEvalBackend, ServiceError, StubBackend, write_frame,
+    FeatureEvalBackend, ModelGeneration, ServiceError, StubBackend, write_frame,
 };
 use std::fs;
 use std::os::unix::net::UnixStream;
@@ -87,9 +88,12 @@ fn scripted_server_can_drive_eval_result_decoding() {
         let (frame_type, payload) =
             gz_eval_service::read_frame(&mut stream, &mut read_buf).unwrap();
         assert_eq!(frame_type, gz_eval_service::FRAME_EVAL);
+        assert_eq!(&payload[8..24], &common::model_version_bytes());
         let batch_id = &payload[0..8];
         let mut parts = Vec::new();
         parts.extend_from_slice(batch_id);
+        parts.extend_from_slice(&common::model_version_bytes());
+        parts.extend_from_slice(&1u64.to_le_bytes());
         parts.extend_from_slice(&common::model_version_bytes());
         parts.extend_from_slice(&result_payload);
         let mut write_buf = Vec::new();
@@ -107,6 +111,62 @@ fn scripted_server_can_drive_eval_result_decoding() {
     let actual = backend.eval(&batch, &action_counts).unwrap();
 
     common::assert_outputs_equal_bits(&actual.rows, &expected.rows);
+}
+
+#[test]
+fn process_backend_targets_and_releases_model_generations() {
+    let schema = schema("process-model-generation", 4);
+    let rows = [row(3, 2)];
+    let (batch, action_counts) = common::collate(schema.clone(), 2, &rows);
+    let expected = StubBackend.eval(&batch, &action_counts).unwrap();
+    let result_payload = output_payload(&expected.rows, 2, 4);
+    let old = ModelGeneration::initial(gz_eval_service::STUB_MODEL_VERSION);
+    let active = ModelGeneration {
+        id: 2,
+        version: ModelVersion::from_bytes([9; 16]),
+    };
+    let server = ScriptedServer::new("process-model-generation", move |mut stream| {
+        assert_eq!(read_frame_type(&mut stream), gz_eval_service::FRAME_HELLO);
+        send_ack(&mut stream).unwrap();
+        let mut read_buf = Vec::new();
+        let mut write_buf = Vec::new();
+        for _ in 0..2 {
+            let (frame_type, payload) =
+                gz_eval_service::read_frame(&mut stream, &mut read_buf).unwrap();
+            assert_eq!(frame_type, gz_eval_service::FRAME_EVAL);
+            assert_eq!(&payload[8..24], old.version.as_bytes());
+            let mut result = Vec::new();
+            result.extend_from_slice(&payload[0..8]);
+            result.extend_from_slice(old.version.as_bytes());
+            result.extend_from_slice(&active.id.to_le_bytes());
+            result.extend_from_slice(active.version.as_bytes());
+            result.extend_from_slice(&result_payload);
+            write_frame(&mut stream, &mut write_buf, FRAME_EVAL_RESULT, &[&result]).unwrap();
+        }
+        let (frame_type, payload) =
+            gz_eval_service::read_frame(&mut stream, &mut read_buf).unwrap();
+        assert_eq!(frame_type, gz_eval_service::FRAME_MODEL_RELEASE);
+        assert_eq!(&payload[0..8], &old.id.to_le_bytes());
+        assert_eq!(&payload[8..24], old.version.as_bytes());
+    });
+
+    let stream = UnixStream::connect(&server.path).unwrap();
+    let mut backend = gz_eval_service::ProcessBackend::connect_stream(
+        stream,
+        &hello(&schema, 2),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let pending = backend
+            .submit_for_model(old, &batch, &action_counts)
+            .unwrap();
+        let outputs = backend.receive(pending).unwrap();
+        assert_eq!(outputs.model_version, old.version);
+        assert_eq!(outputs.active_generation, active);
+    }
+    assert_eq!(backend.model_generation(), active);
+    backend.release_model_generation(old).unwrap();
 }
 
 #[test]

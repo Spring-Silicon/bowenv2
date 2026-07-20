@@ -103,7 +103,13 @@ def _muon_excluded_parameter_ids(model: object, torch: object) -> set[int]:
     # Muon is reserved for hidden transformations. The policy/value outputs
     # (and WhittleZero's retained STOP head) are classifier heads and stay on
     # the auxiliary AdamW optimizer, including their 2D matrices.
-    for module_name in ("policy", "value", "stop"):
+    for module_name in (
+        "policy",
+        "value",
+        "horizon_value",
+        "terminal_score",
+        "stop",
+    ):
         module = getattr(model, module_name, None)
         if isinstance(module, torch.nn.Module):
             excluded.update(id(parameter) for parameter in module.parameters())

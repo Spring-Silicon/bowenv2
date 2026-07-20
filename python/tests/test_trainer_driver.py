@@ -10,18 +10,27 @@ import pytest
 
 from gz.trainer.driver import (
     ArenaCheckpointPublisher,
+    EpisodeLengthProgress,
+    EpisodeLengthStage,
     OpponentTracker,
     SamplePrefetcher,
     SelfplayStatsTracker,
     TrainerConfig,
     WandbRun,
+    _checkpoint_due,
+    _cumulative_reuse,
+    _episode_length_stage_config,
+    _load_episode_length_progress,
     _required_episodes,
     _required_produced_rows,
     _load_initial_checkpoint,
     _policy_arch_config,
+    _permanent_checkpoint_pointers,
     _resolved_trainer_seeds,
     _sample_training_batches,
     _sample_window_rows,
+    _symmetric_step_fields,
+    _write_episode_length_progress,
     init_replay,
     load_config,
     pump_selfplay_stderr,
@@ -55,6 +64,7 @@ graphzero_bin = "graphzero-test"
     assert config.trainer.batch == 4
     assert config.trainer.total_steps == 3
     assert config.trainer.checkpoint_retain == 0
+    assert config.trainer.permanent_checkpoint_interval == 1000
     assert config.selfplay.lanes == 1
     assert config.selfplay.reference_gamma == 0.25
     assert config.selfplay.reference_trajectory_pool == 0
@@ -74,6 +84,50 @@ def test_trainer_seed_overrides_are_independent_and_backward_compatible() -> Non
     ) == (5, 17)
 
 
+def test_cumulative_reuse_uses_stream_specific_batch_and_row_counts() -> None:
+    assert _cumulative_reuse(step=7, batch=512, produced_rows=2048) == 2.0
+    assert _cumulative_reuse(step=7, batch=64, produced_rows=4096) == 0.125
+    assert _cumulative_reuse(step=7, batch=0, produced_rows=4096) == 0.0
+    assert _cumulative_reuse(step=7, batch=64, produced_rows=0) == 0.0
+
+
+def test_symmetric_step_fields_report_both_seats_and_game_metrics() -> None:
+    metrics = SimpleNamespace(
+        p1_win_rate_ema=0.45,
+        p2_win_rate_ema=0.35,
+        draw_rate_ema=0.2,
+        seat_advantage_ema=0.1,
+        p1_terminal_cost_ema=60.0,
+        p2_terminal_cost_ema=64.0,
+        mean_terminal_cost_ema=62.0,
+        terminal_cost_margin_ema=4.0,
+        terminal_cost_best=42.0,
+        p1_episode_len_ema=70.0,
+        p2_episode_len_ema=74.0,
+        game_len_ema=144.0,
+        episode_len_margin_ema=4.0,
+    )
+    ack = SimpleNamespace(
+        symmetric_selfplay=metrics,
+        value_sign_accuracy_early_ema=0.6,
+        value_sign_accuracy_late_ema=0.7,
+        episode_latency_ema=12.0,
+    )
+
+    fields = _symmetric_step_fields(ack, 123)
+
+    assert fields["symmetric_games_completed"] == 123
+    assert fields["symmetric_p1_win_rate_ema"] == 0.45
+    assert fields["symmetric_p2_win_rate_ema"] == 0.35
+    assert fields["symmetric_draw_rate_ema"] == 0.2
+    assert fields["symmetric_decisive_rate_ema"] == 0.8
+    assert fields["symmetric_mean_terminal_cost_ema"] == 62.0
+    assert fields["symmetric_best_of_two_terminal_cost_ema"] == 60.0
+    assert fields["symmetric_game_rewrites_ema"] == 144.0
+    assert fields["symmetric_value_sign_accuracy_late_ema"] == 0.7
+    assert fields["symmetric_game_latency_s"] == 12.0
+
+
 def test_trainer_compile_config_reaches_loop(tmp_path: Path) -> None:
     config_path = tmp_path / "compile.toml"
     config_path.write_text(
@@ -86,6 +140,45 @@ def test_trainer_compile_config_reaches_loop(tmp_path: Path) -> None:
 
     assert loop.compile_model is True
     assert loop.compile_mode == "reduce-overhead"
+
+
+def test_value_trunk_gradient_scale_reaches_loop(tmp_path: Path) -> None:
+    config_path = tmp_path / "value-gradient.toml"
+    config_path.write_text(
+        "[trainer]\nvalue_trunk_grad_scale = 0.1\n",
+        encoding="utf-8",
+    )
+
+    trainer = load_config(config_path).trainer
+
+    assert trainer_loop_config(trainer, data_seed=7).value_trunk_grad_scale == 0.1
+
+
+@pytest.mark.parametrize("scale", [-0.1, 1.1])
+def test_load_config_rejects_invalid_value_trunk_gradient_scale(
+    tmp_path: Path,
+    scale: float,
+) -> None:
+    config_path = tmp_path / "bad-value-gradient.toml"
+    config_path.write_text(
+        f"[trainer]\nvalue_trunk_grad_scale = {scale}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="value_trunk_grad_scale"):
+        load_config(config_path)
+
+
+def test_sampled_tree_respects_paired_value_training_config() -> None:
+    trainer = TrainerConfig(value_mirror=False)
+
+    assert trainer_loop_config(trainer, data_seed=7).value_mirror is False
+    assert trainer_loop_config(trainer, data_seed=7, sampled_tree=True).value_mirror is False
+    assert trainer_loop_config(
+        TrainerConfig(value_mirror=True),
+        data_seed=7,
+        sampled_tree=True,
+    ).value_mirror is True
 
 
 def test_load_config_rejects_unknown_trainer_compile_mode(tmp_path: Path) -> None:
@@ -108,6 +201,35 @@ def test_load_config_rejects_negative_checkpoint_retention(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="checkpoint_retain must be non-negative"):
         load_config(config_path)
+
+
+def test_load_config_rejects_negative_permanent_checkpoint_interval(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "bad-permanent-checkpoint-interval.toml"
+    config_path.write_text(
+        "[trainer]\npermanent_checkpoint_interval = -1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="permanent_checkpoint_interval must be non-negative",
+    ):
+        load_config(config_path)
+
+
+def test_checkpoint_schedule_includes_exact_permanent_milestones() -> None:
+    config = TrainerConfig(
+        publish_interval=256,
+        permanent_checkpoint_interval=1000,
+    )
+
+    assert not _checkpoint_due(config, 999)
+    assert _checkpoint_due(config, 1000)
+    assert _checkpoint_due(config, 1024)
+    assert _permanent_checkpoint_pointers(config, 1000) == ("step_1000.json",)
+    assert _permanent_checkpoint_pointers(config, 1024) == ()
 
 
 def test_load_config_accepts_trainer_matmul_precision(tmp_path: Path) -> None:
@@ -435,6 +557,424 @@ run_dir = "runs/clean-arena"
     assert config.paths.graphzero_bin == "graphzero-base"
 
 
+def test_single_vanilla_config_selects_raw_reward_training_and_cli_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    class FakeProcess:
+        pass
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr("gz.trainer.driver.subprocess.Popen", fake_popen)
+    config_path = tmp_path / "single.toml"
+    config_path.write_text(
+        """
+[arch]
+value_input = "single"
+value_head = "scalar"
+value_activation = "logit"
+
+[trainer]
+value_mirror = false
+
+[selfplay]
+training_mode = "single-vanilla"
+reference = "none"
+reference_ema_decay = 0.0
+reference_gamma = 0.0
+reference_trajectory_pool = 0
+reference_arena_size = 0
+reference_arena_interval = 0
+reference_max_batch = 0
+challenger_max_batch = 0
+tree_reuse = false
+mask_stop = false
+length_tiebreak = false
+
+[paths]
+run_dir = "run"
+graphzero_bin = "graphzero-test"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config.selfplay.training_mode == "single-vanilla"
+    assert trainer_loop_config(
+        config.trainer,
+        data_seed=7,
+        single_vanilla=True,
+    ).value_objective == "terminal_reward"
+    spawn_torch_selfplay(config)
+    command, kwargs = calls[0]
+    assert command[command.index("--training-mode") + 1] == "single-vanilla"
+    assert "--reference-checkpoint-pointer" not in command
+    assert kwargs["start_new_session"] is True
+
+
+@pytest.mark.parametrize("mask_stop", [True, False])
+@pytest.mark.parametrize("tree_reuse", [True, False])
+def test_symmetric_selfplay_config_selects_joint_board_and_stop_loss_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mask_stop: bool,
+    tree_reuse: bool,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    class FakeProcess:
+        pass
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr("gz.trainer.driver.subprocess.Popen", fake_popen)
+    config_path = tmp_path / "symmetric.toml"
+    config_path.write_text(
+        f"""
+[arch]
+state_input = "joint-board"
+value_input = "single"
+
+[trainer]
+value_mirror = false
+
+[selfplay]
+training_mode = "symmetric-selfplay"
+reference = "none"
+reference_ema_decay = 0.0
+reference_gamma = 0.0
+reference_trajectory_pool = 0
+reference_arena_size = 0
+reference_arena_interval = 0
+reference_max_batch = 0
+challenger_max_batch = 0
+tree_reuse = {str(tree_reuse).lower()}
+mask_stop = {str(mask_stop).lower()}
+length_tiebreak = true
+
+[paths]
+run_dir = "run"
+graphzero_bin = "graphzero-test"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    loop = trainer_loop_config(
+        config.trainer,
+        data_seed=7,
+        symmetric_selfplay=True,
+        symmetric_mask_stop=config.selfplay.mask_stop,
+    )
+    assert config.arch.state_input == "joint-board"
+    assert loop.mask_stop_loss is mask_stop
+    spawn_torch_selfplay(config)
+    command, kwargs = calls[0]
+    assert command[command.index("--training-mode") + 1] == "symmetric-selfplay"
+    assert command[command.index("--mask-stop") + 1] == str(mask_stop).lower()
+    assert command[command.index("--tree-reuse") + 1] == str(tree_reuse).lower()
+    assert "--reference-checkpoint-pointer" not in command
+    assert kwargs["start_new_session"] is True
+
+
+def test_symmetric_selfplay_stop_requires_position_features(tmp_path: Path) -> None:
+    config_path = tmp_path / "symmetric-invalid.toml"
+    config_path.write_text(
+        """
+[arch]
+state_input = "joint-board"
+value_input = "single"
+
+[trainer]
+value_mirror = false
+
+[selfplay]
+training_mode = "symmetric-selfplay"
+reference = "none"
+reference_ema_decay = 0.0
+reference_gamma = 0.0
+reference_trajectory_pool = 0
+reference_arena_size = 0
+reference_arena_interval = 0
+reference_max_batch = 0
+challenger_max_batch = 0
+tree_reuse = false
+mask_stop = false
+position_features = false
+length_tiebreak = true
+
+[paths]
+run_dir = "run"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="STOP-enabled symmetric-selfplay requires position_features = true"
+    ):
+        load_config(config_path)
+
+
+def test_explicit_episode_length_schedule_resolves_stage_paths_and_seeds(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "single-schedule.toml"
+    config_path.write_text(
+        """
+[arch]
+value_input = "single"
+value_head = "scalar"
+value_activation = "logit"
+
+[trainer]
+total_steps = 300
+value_mirror = false
+
+[selfplay]
+training_mode = "single-vanilla"
+reference = "none"
+reference_ema_decay = 0.0
+tree_reuse = false
+length_tiebreak = false
+root_mode = "generated"
+max_steps = 20
+seed = 42
+
+[episode_length_schedule]
+mode = "explicit"
+
+[[episode_length_schedule.stages]]
+start_step = 0
+max_steps = 5
+
+[[episode_length_schedule.stages]]
+start_step = 100
+max_steps = 10
+
+[[episode_length_schedule.stages]]
+start_step = 200
+max_steps = 20
+
+[paths]
+run_dir = "run"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.episode_length_schedule.stages == (
+        EpisodeLengthStage(start_step=0, max_steps=5),
+        EpisodeLengthStage(start_step=100, max_steps=10),
+        EpisodeLengthStage(start_step=200, max_steps=20),
+    )
+    assert config.episode_length_schedule.stage_index(0) == 0
+    assert config.episode_length_schedule.stage_index(99) == 0
+    assert config.episode_length_schedule.stage_index(100) == 1
+    assert config.episode_length_schedule.stage_index(299) == 2
+    first = _episode_length_stage_config(config, 0)
+    second = _episode_length_stage_config(config, 1)
+    assert first.selfplay.max_steps == 5
+    assert first.selfplay.seed == 42
+    assert first.paths.replay_dir.name == "stage-00-max-0005"
+    assert second.selfplay.max_steps == 10
+    assert second.selfplay.seed != 42
+    assert second.paths.replay_dir.name == "stage-01-max-0010"
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected"),
+    [
+        (
+            "mode = 'linear'\nstart = 5\nincrement = 5\ninterval_steps = 25\nmaximum = 20",
+            ((0, 5), (25, 10), (50, 15), (75, 20)),
+        ),
+        (
+            "mode = 'exponential'\nstart = 5\nfactor = 2.0\ninterval_steps = 25\nmaximum = 20",
+            ((0, 5), (25, 10), (50, 20)),
+        ),
+    ],
+)
+def test_generated_episode_length_schedules(
+    tmp_path: Path,
+    schedule: str,
+    expected: tuple[tuple[int, int], ...],
+) -> None:
+    config_path = tmp_path / "generated-schedule.toml"
+    config_path.write_text(
+        f"""
+[arch]
+value_input = "single"
+value_head = "scalar"
+value_activation = "logit"
+
+[trainer]
+total_steps = 100
+
+[selfplay]
+training_mode = "single-vanilla"
+reference = "none"
+reference_ema_decay = 0.0
+tree_reuse = false
+root_mode = "generated"
+max_steps = 20
+
+[episode_length_schedule]
+{schedule}
+""",
+        encoding="utf-8",
+    )
+
+    stages = load_config(config_path).episode_length_schedule.stages
+
+    assert tuple((stage.start_step, stage.max_steps) for stage in stages) == expected
+
+
+def test_episode_length_schedule_rejects_unreached_final_horizon(tmp_path: Path) -> None:
+    config_path = tmp_path / "bad-schedule.toml"
+    config_path.write_text(
+        """
+[arch]
+value_input = "single"
+value_head = "scalar"
+value_activation = "logit"
+
+[trainer]
+total_steps = 30
+
+[selfplay]
+training_mode = "single-vanilla"
+reference = "none"
+reference_ema_decay = 0.0
+tree_reuse = false
+root_mode = "generated"
+max_steps = 20
+
+[episode_length_schedule]
+mode = "linear"
+start = 5
+increment = 5
+interval_steps = 20
+maximum = 20
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not reach maximum"):
+        load_config(config_path)
+
+
+def test_episode_length_progress_round_trips_and_rejects_schedule_changes(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "schedule.toml"
+    config_path.write_text(
+        f"""
+[arch]
+value_input = "single"
+value_head = "scalar"
+value_activation = "logit"
+
+[trainer]
+total_steps = 20
+
+[selfplay]
+training_mode = "single-vanilla"
+reference = "none"
+reference_ema_decay = 0.0
+tree_reuse = false
+root_mode = "generated"
+max_steps = 10
+
+[episode_length_schedule]
+mode = "explicit"
+
+[[episode_length_schedule.stages]]
+start_step = 0
+max_steps = 5
+
+[[episode_length_schedule.stages]]
+start_step = 10
+max_steps = 10
+
+[paths]
+run_dir = "{tmp_path / 'run'}"
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    config.paths.run_dir.mkdir(parents=True)
+    progress = EpisodeLengthProgress(
+        stage_index=1,
+        completed_rows=123,
+        completed_policy_rows=100,
+        completed_value_rows=23,
+        completed_episodes=7,
+    )
+
+    _write_episode_length_progress(config, progress)
+
+    assert _load_episode_length_progress(config) == progress
+    changed = replace(
+        config,
+        episode_length_schedule=replace(
+            config.episode_length_schedule,
+            stages=(
+                EpisodeLengthStage(start_step=0, max_steps=4),
+                EpisodeLengthStage(start_step=10, max_steps=10),
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="does not match"):
+        _load_episode_length_progress(changed)
+
+
+@pytest.mark.parametrize(
+    ("table", "message"),
+    [
+        (
+            "reference = 'root'\ntree_reuse = false",
+            "reference and arena settings disabled",
+        ),
+        ("reference = 'none'\ntree_reuse = true", "tree_reuse = false"),
+        (
+            "reference = 'none'\ntree_reuse = false\nmask_stop = true",
+            "mask_stop = false",
+        ),
+    ],
+)
+def test_single_vanilla_rejects_competitive_state(
+    tmp_path: Path, table: str, message: str
+) -> None:
+    config_path = tmp_path / "single-invalid.toml"
+    config_path.write_text(
+        f"""
+[arch]
+value_input = "single"
+value_head = "scalar"
+value_activation = "logit"
+
+[selfplay]
+training_mode = "single-vanilla"
+reference_ema_decay = 0.0
+{table}
+
+[paths]
+run_dir = "run"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_config(config_path)
+
+
 def test_load_config_extends_is_one_layer_only(tmp_path: Path) -> None:
     base_dir = tmp_path / "bases"
     base_dir.mkdir()
@@ -511,9 +1051,23 @@ def test_wandb_run_maps_step_records_to_grouped_keys() -> None:
             "policy_loss": 4.5,
             "terminal_cost_ema": 62.5,
             "terminal_cost_best": 51.0,
+            "value_sign_accuracy_early_ema": 0.6,
+            "value_sign_accuracy_late_ema": 0.8,
+            "symmetric_games_completed": 123,
+            "symmetric_p1_win_rate_ema": 0.45,
+            "symmetric_draw_rate_ema": 0.2,
+            "symmetric_mean_terminal_cost_ema": 62.0,
+            "symmetric_best_of_two_terminal_cost_ema": 60.0,
             "admission_waiting": 17,
             "rows_per_s": 200.0,
             "produced_rows": 4096,
+            "produced_policy_rows": 2048,
+            "produced_value_rows": 1024,
+            "policy_reuse": 2.0,
+            "value_reuse": 0.25,
+            "aux_gradient_final_auxiliary_cosine": -0.25,
+            "aux_gradient_discarded_experiment": 99.0,
+            "parameter_trunk_update_to_parameter": 1.0e-4,
         }
     )
     run.write({"event": "publish", "training_step": 10, "model_version": "ab"})
@@ -525,9 +1079,22 @@ def test_wandb_run_maps_step_records_to_grouped_keys() -> None:
         "train/policy_loss": 4.5,
         "selfplay/terminal_cost_ema": 62.5,
         "selfplay/terminal_cost_best": 51.0,
+        "selfplay/value_sign_accuracy_early_ema": 0.6,
+        "selfplay/value_sign_accuracy_late_ema": 0.8,
+        "symmetric/games_completed": 123,
+        "symmetric/p1_win_rate_ema": 0.45,
+        "symmetric/draw_rate_ema": 0.2,
+        "symmetric/mean_terminal_cost_ema": 62.0,
+        "symmetric/best_of_two_terminal_cost_ema": 60.0,
         "admission/waiting_workers": 17,
         "perf/rows_per_s": 200.0,
         "perf/produced_rows": 4096,
+        "perf/produced_policy_rows": 2048,
+        "perf/produced_value_rows": 1024,
+        "perf/policy_reuse": 2.0,
+        "perf/value_reuse": 0.25,
+        "auxiliary/readout_gradient/final_auxiliary_cosine": -0.25,
+        "optimizer/parameter/trunk_update_to_parameter": 1.0e-4,
     }
     assert "timestamp" not in payload
     publish_payload, publish_step = run.run.logged[1]
@@ -692,7 +1259,11 @@ def test_generated_v2_base_bounds_actor_checkpoint_retention() -> None:
         root / "configs/bases/whittle-generated-exphormer-v2-sampled-tree.toml"
     )
 
-    assert (config.trainer.publish_interval, config.trainer.checkpoint_retain) == (8, 16)
+    assert (
+        config.trainer.publish_interval,
+        config.trainer.checkpoint_retain,
+        config.trainer.permanent_checkpoint_interval,
+    ) == (8, 16, 1000)
     assert config.selfplay.reference_arena_interval == 128
     assert config.selfplay.challenger_max_batch == 128
 
@@ -742,7 +1313,9 @@ run_dir = "run"
         load_config(config_path)
 
 
-def test_remaining_budget_requires_exported_position_features(tmp_path: Path) -> None:
+def test_v2_remaining_budget_projection_can_be_blinded_without_changing_architecture(
+    tmp_path: Path,
+) -> None:
     config_path = tmp_path / "run.toml"
     config_path.write_text(
         """
@@ -761,8 +1334,11 @@ run_dir = "run"
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="remaining_budget"):
-        load_config(config_path)
+    config = load_config(config_path)
+
+    assert config.arch.name == "gz-graph-v2"
+    assert config.arch.position_encoding == "remaining_budget"
+    assert config.selfplay.position_features is False
 
 
 def test_load_config_accepts_blind_pair_value_with_admission_stagger(tmp_path: Path) -> None:
@@ -1120,13 +1696,13 @@ def test_sample_training_batches_uses_independent_value_stream_and_window() -> N
 
 
 def test_sampled_tree_requests_policy_and_value_streams() -> None:
-    calls: list[tuple[int, str]] = []
+    calls: list[tuple[int, int, str]] = []
 
     class Sampler:
         def sample(
-            self, batch: int, _window: int, _seed: int, *, kind: str = "any"
-        ) -> tuple[int, str]:
-            calls.append((batch, kind))
+            self, batch: int, window: int, _seed: int, *, kind: str = "any"
+        ) -> tuple[int, int, str]:
+            calls.append((batch, window, kind))
             return calls[-1]
 
     _sample_training_batches(
@@ -1138,10 +1714,27 @@ def test_sampled_tree_requests_policy_and_value_streams() -> None:
         run_seed=5,
         step=0,
         produced_rows=10000,
+        produced_policy_rows=100,
+        produced_value_rows=40,
         sampled_tree=True,
     )
 
-    assert calls == [(512, "policy"), (256, "value")]
+    assert calls == [(512, 100, "policy"), (256, 40, "value")]
+
+
+def test_sampled_tree_rejects_missing_eligible_stream_counters() -> None:
+    with pytest.raises(ValueError, match="policy and value row counters"):
+        _sample_training_batches(
+            object(),
+            policy_batch=512,
+            policy_window_rows=10000,
+            value_batch=256,
+            value_window_rows=10000,
+            run_seed=5,
+            step=0,
+            produced_rows=10000,
+            sampled_tree=True,
+        )
 
 
 def test_canonical_muon_ab_changes_only_optimizer_and_run_identity() -> None:
@@ -1364,19 +1957,57 @@ def test_prefetcher_does_not_sample_a_block_before_its_reuse_gate() -> None:
         prefetcher.stop()
 
 
+def test_prefetcher_resets_reuse_gate_at_episode_length_stage_origin() -> None:
+    class Sampler:
+        def __init__(self) -> None:
+            self.sampled = threading.Event()
+
+        def refresh(self):
+            return SimpleNamespace(produced_rows=5, episodes=0)
+
+        def sample(self, batch: int, window: int, seed: int):
+            self.sampled.set()
+            return (batch, window, seed)
+
+    sampler = Sampler()
+    prefetcher = SamplePrefetcher(
+        sampler,
+        10,
+        100,
+        0,
+        100,
+        5,
+        101,
+        2.0,
+        1,
+        0,
+        start_step=100,
+        gate_step_origin=100,
+    )
+    prefetcher.start()
+    try:
+        assert sampler.sampled.wait(1.0)
+        assert prefetcher.next().policy[0] == 10
+    finally:
+        prefetcher.stop()
+        prefetcher.join()
+
+
 def test_sampled_tree_reuse_gate_uses_policy_rows_not_total_rows() -> None:
     class Sampler:
         def __init__(self) -> None:
             self.produced_rows = 0
             self.produced_policy_rows = 0
+            self.produced_value_rows = 0
             self.episodes = 0
             self.sampled = threading.Event()
 
         def refresh(self):
             return SimpleNamespace(
-                produced_rows=self.produced_rows,
-                produced_policy_rows=self.produced_policy_rows,
-                episodes=self.episodes,
+                    produced_rows=self.produced_rows,
+                    produced_policy_rows=self.produced_policy_rows,
+                    produced_value_rows=self.produced_value_rows,
+                    episodes=self.episodes,
             )
 
         def sample(self, batch: int, window: int, seed: int, *, kind: str):
@@ -1401,6 +2032,7 @@ def test_sampled_tree_reuse_gate_uses_policy_rows_not_total_rows() -> None:
     try:
         sampler.produced_rows = 5000
         sampler.produced_policy_rows = 3000
+        sampler.produced_value_rows = 5000
         sampler.episodes = 32
         assert not sampler.sampled.wait(0.05)
         sampler.produced_policy_rows = 3328

@@ -2,6 +2,8 @@
 
 //! Durable replay storage for GraphZero selfplay rows.
 
+mod append;
+mod database;
 mod error;
 mod keys;
 mod records;
@@ -14,4 +16,4 @@ pub use records::{
     ReplayRootInfo, ReplayRow,
 };
 pub use sample::{SampleConfig, SampleKind};
-pub use store::{ReplayCounters, ReplayDataMode, ReplayStore};
+pub use store::{ReplayCounters, ReplayDataMode, ReplayStore, SymmetricSelfplayMetrics};

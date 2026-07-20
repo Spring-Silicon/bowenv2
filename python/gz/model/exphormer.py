@@ -24,6 +24,7 @@ class ArchConfig:
     activation: str = "gelu"
     aggregation: str = "attention"
     global_tokens: int = 1
+    state_input: str = "single-graph"
     value_input: str = "single"
     policy_head: str = "mlp"
     trunk: str = "exphormer"
@@ -39,6 +40,7 @@ class ArchConfig:
     value_min: float = -1.0
     value_max: float = 1.0
     value_sigma_ratio: float = 0.75
+    auxiliary_heads: str = "none"
 
     def __post_init__(self) -> None:
         if self.name not in {"gz-graph-v1", "gz-graph-v2"}:
@@ -55,8 +57,14 @@ class ArchConfig:
             raise ValueError("unsupported aggregation")
         if self.global_tokens <= 0:
             raise ValueError("global_tokens must be positive")
+        if self.state_input not in {"single-graph", "joint-board"}:
+            raise ValueError("unsupported state_input")
         if self.value_input not in {"single", "scalar", "pair"}:
             raise ValueError("unsupported value_input")
+        if self.state_input == "joint-board" and self.value_input != "single":
+            raise ValueError("joint-board state_input requires value_input = 'single'")
+        if self.state_input == "joint-board" and self.position_encoding == "policy_budget":
+            raise ValueError("joint-board state_input does not support policy_budget encoding")
         if self.policy_head not in {"mlp", "pointer"}:
             raise ValueError("unsupported policy_head")
         if self.trunk not in {"exphormer", "sage"}:
@@ -85,6 +93,17 @@ class ArchConfig:
             raise ValueError("value_max must be greater than value_min")
         if not math.isfinite(self.value_sigma_ratio) or self.value_sigma_ratio <= 0.0:
             raise ValueError("value_sigma_ratio must be finite and positive")
+        if self.auxiliary_heads not in {"none", "v8-v32-score"}:
+            raise ValueError("unsupported auxiliary_heads")
+        if self.auxiliary_heads == "v8-v32-score" and (
+            self.state_input != "joint-board"
+            or self.value_input != "single"
+            or self.value_head != "scalar"
+            or self.value_activation != "tanh"
+        ):
+            raise ValueError(
+                "v8-v32-score auxiliary heads require joint-board scalar/tanh values"
+            )
         if self.position_encoding == "remaining_budget" and self.name != "gz-graph-v2":
             raise ValueError("remaining_budget position encoding requires gz-graph-v2")
         if self.name == "gz-graph-v2" and (
@@ -116,6 +135,7 @@ class ArchConfig:
             "activation": self.activation,
             "aggregation": self.aggregation,
             "global_tokens": self.global_tokens,
+            "state_input": self.state_input,
             "value_input": self.value_input,
             "policy_head": self.policy_head,
             "trunk": self.trunk,
@@ -131,6 +151,7 @@ class ArchConfig:
             "value_min": self.value_min,
             "value_max": self.value_max,
             "value_sigma_ratio": self.value_sigma_ratio,
+            "auxiliary_heads": self.auxiliary_heads,
         }
 
     def encode(self) -> bytes:
@@ -154,6 +175,7 @@ class ArchConfig:
             "activation",
             "aggregation",
             "global_tokens",
+            "state_input",
             "value_input",
             "policy_head",
             "trunk",
@@ -169,9 +191,11 @@ class ArchConfig:
             "value_min",
             "value_max",
             "value_sigma_ratio",
+            "auxiliary_heads",
         }
         optional = {
             "value_input",
+            "state_input",
             "policy_head",
             "trunk",
             "sage_layers",
@@ -186,6 +210,7 @@ class ArchConfig:
             "value_min",
             "value_max",
             "value_sigma_ratio",
+            "auxiliary_heads",
         }
         keys = set(value)
         if not (fields - optional <= keys <= fields):
@@ -200,6 +225,7 @@ class ArchConfig:
             activation=_str(value, "activation"),
             aggregation=_str(value, "aggregation"),
             global_tokens=_int(value, "global_tokens"),
+            state_input=_str(value, "state_input", "single-graph"),
             value_input=_str(value, "value_input", "single"),
             policy_head=_str(value, "policy_head", "mlp"),
             trunk=_str(value, "trunk", "exphormer"),
@@ -215,6 +241,7 @@ class ArchConfig:
             value_min=_float(value, "value_min", -1.0),
             value_max=_float(value, "value_max", 1.0),
             value_sigma_ratio=_float(value, "value_sigma_ratio", 0.75),
+            auxiliary_heads=_str(value, "auxiliary_heads", "none"),
         )
 
 
@@ -561,6 +588,8 @@ def _model_class():
                 position_dim = 2
             else:
                 position_dim = 4
+            if arch.state_input == "joint-board":
+                position_dim *= 2
             if arch.profile == "whittlezero":
                 if schema.name != "whittle-v2" or schema.node_attr_dim != 3:
                     raise ValueError("whittlezero profile requires the whittle-v2 feature schema")
@@ -575,6 +604,9 @@ def _model_class():
                 self.attr_proj = nn.Linear(schema.node_attr_dim, arch.dim, bias=False) if schema.node_attr_dim else None
                 self.position_proj = nn.Linear(position_dim, arch.dim)
                 self.node_proj = None
+            self.board_role_embedding = (
+                nn.Embedding(2, arch.dim) if arch.state_input == "joint-board" else None
+            )
             if arch.trunk == "sage":
                 self.sage = nn.ModuleList([DirectionalSageLayer(arch) for _ in range(arch.sage_layers)])
                 self.global_tokens = nn.Parameter(torch.zeros(arch.global_tokens, arch.dim))
@@ -649,6 +681,27 @@ def _model_class():
                     arch.activation,
                     arch.dropout,
                 )
+            if arch.auxiliary_heads == "v8-v32-score":
+                auxiliary_hidden = arch.value_hidden or arch.ffn_dim
+                self.horizon_value = _mlp(
+                    nn,
+                    value_dim,
+                    auxiliary_hidden,
+                    2,
+                    arch.activation,
+                    arch.dropout,
+                )
+                self.terminal_score = _mlp(
+                    nn,
+                    value_dim,
+                    auxiliary_hidden,
+                    1,
+                    arch.activation,
+                    arch.dropout,
+                )
+            else:
+                self.horizon_value = None
+                self.terminal_score = None
             if arch.value_head == "hl_gauss":
                 edges = torch.linspace(
                     arch.value_min,
@@ -663,9 +716,15 @@ def _model_class():
                 self.register_buffer("value_bin_edges", torch.empty(0), persistent=False)
                 self.register_buffer("value_bin_centers", torch.empty(0), persistent=False)
 
-        def forward(self, batch: GraphBatchTensors, value_flip: object = None, value_mirror: bool = False):
-            graph = _self_graph(batch)
-            h, g_readout, node_mask = self._encode_graph(graph)
+        def forward(
+            self,
+            batch: GraphBatchTensors,
+            value_flip: object = None,
+            value_mirror: bool = False,
+            value_trunk_grad_scale: float = 1.0,
+        ):
+            graph, node_roles = self._model_graph(batch)
+            h, g_readout, node_mask = self._encode_graph(graph, node_roles)
             opponent_readout = None
             if self.arch.value_input == "pair":
                 opponent_readout = self.opponent_readout(batch)
@@ -677,16 +736,44 @@ def _model_class():
                 opponent_readout,
                 value_flip,
                 value_mirror,
+                value_trunk_grad_scale,
             )
 
         def policy_logits(self, batch: GraphBatchTensors):
-            h, g_readout, node_mask = self._encode_graph(_self_graph(batch))
+            graph, node_roles = self._model_graph(batch)
+            h, g_readout, node_mask = self._encode_graph(graph, node_roles)
             return self._policy_logits(batch, h, g_readout, node_mask)
 
-        def value_only(self, batch: GraphBatchTensors, value_flip: object = None):
+        def value_only(
+            self,
+            batch: GraphBatchTensors,
+            value_flip: object = None,
+            value_mirror: bool = False,
+            value_trunk_grad_scale: float = 1.0,
+        ):
+            if self.arch.state_input == "joint-board":
+                if value_flip is not None or value_mirror:
+                    raise ValueError("joint-board value does not support pair flipping or mirroring")
+                graph, node_roles = self._model_graph(batch)
+                _, g_readout, _ = self._encode_graph(graph, node_roles)
+                return self._value_output(
+                    batch,
+                    g_readout,
+                    None,
+                    None,
+                    False,
+                    value_trunk_grad_scale,
+                )
             if self.arch.value_input != "pair":
                 _, g_readout, _ = self._encode_graph(_self_graph(batch))
-                return self._value_output(batch, g_readout, None, None, False)
+                return self._value_output(
+                    batch,
+                    g_readout,
+                    None,
+                    None,
+                    False,
+                    value_trunk_grad_scale,
+                )
 
             own = _self_graph(batch)
             opponent = _opponent_graph(batch)
@@ -699,10 +786,39 @@ def _model_class():
                 pair_readout[:pair_capacity],
                 pair_readout[pair_capacity:],
                 None,
-                False,
+                value_mirror,
+                value_trunk_grad_scale,
+            )
+
+        def training_forward(
+            self,
+            batch: GraphBatchTensors,
+            value_trunk_grad_scale: float = 1.0,
+        ):
+            graph, node_roles = self._model_graph(batch)
+            h, g_readout, node_mask = self._encode_graph(graph, node_roles)
+            value_raw, horizon_raw, score_raw = self._training_value_outputs(
+                g_readout,
+                value_trunk_grad_scale,
+            )
+            logits = self._policy_logits(batch, h, g_readout, node_mask)
+            return value_raw, horizon_raw, score_raw, logits, g_readout
+
+        def training_values(
+            self,
+            batch: GraphBatchTensors,
+            value_trunk_grad_scale: float = 1.0,
+        ):
+            graph, node_roles = self._model_graph(batch)
+            _, g_readout, _ = self._encode_graph(graph, node_roles)
+            return (
+                *self._training_value_outputs(g_readout, value_trunk_grad_scale),
+                g_readout,
             )
 
         def forward_with_opponent(self, batch: GraphBatchTensors, opponent_readout: object):
+            if self.arch.state_input == "joint-board":
+                raise ValueError("joint-board serving requires raw opponent tensors")
             graph = _self_graph(batch)
             h, g_readout, node_mask = self._encode_graph(graph)
             return self._forward_heads(
@@ -713,11 +829,19 @@ def _model_class():
                 opponent_readout,
                 None,
                 False,
+                1.0,
             )
 
         def opponent_readout(self, batch: GraphBatchTensors):
+            if self.arch.state_input == "joint-board":
+                raise ValueError("joint-board models do not expose a separate opponent readout")
             _, readout, _ = self._encode_graph(_opponent_graph(batch))
             return readout
+
+        def _model_graph(self, batch: GraphBatchTensors):
+            if self.arch.state_input == "joint-board":
+                return _joint_board_graph(torch, batch)
+            return _self_graph(batch), None
 
         def _forward_heads(
             self,
@@ -728,6 +852,7 @@ def _model_class():
             opponent_readout: object,
             value_flip: object,
             value_mirror: bool,
+            value_trunk_grad_scale: float,
         ):
             logits = self._policy_logits(batch, h, g_readout, node_mask)
             value_raw = self._value_output(
@@ -736,6 +861,7 @@ def _model_class():
                 opponent_readout,
                 value_flip,
                 value_mirror,
+                value_trunk_grad_scale,
             )
             return value_raw, logits
 
@@ -774,13 +900,19 @@ def _model_class():
             opponent_readout,
             value_flip,
             value_mirror,
+            value_trunk_grad_scale,
         ):
+            g_readout = _scale_gradient(g_readout, value_trunk_grad_scale)
             value_input = g_readout
             mirrored_input = None
             if self.arch.value_input == "scalar":
                 opponent = torch.stack((batch.opponent_reward, batch.opponent_present), dim=-1).to(g_readout.dtype)
                 value_input = torch.cat((g_readout, opponent), dim=-1)
             elif self.arch.value_input == "pair":
+                opponent_readout = _scale_gradient(
+                    opponent_readout,
+                    value_trunk_grad_scale,
+                )
                 present = (batch.opponent_state_present > 0).unsqueeze(-1)
                 opponent_readout = torch.where(present, opponent_readout, torch.zeros_like(opponent_readout))
                 if value_flip is not None:
@@ -813,6 +945,15 @@ def _model_class():
                 value_raw = torch.tanh(value_raw)
             return value_raw
 
+        def _training_value_outputs(self, g_readout, value_trunk_grad_scale):
+            if self.horizon_value is None or self.terminal_score is None:
+                raise ValueError("training auxiliary outputs require v8-v32-score heads")
+            value_input = _scale_gradient(g_readout, value_trunk_grad_scale)
+            value_raw = self._value_head_output(value_input)
+            horizon_raw = torch.tanh(self.horizon_value(value_input))
+            score_raw = self.terminal_score(value_input).squeeze(-1)
+            return value_raw, horizon_raw, score_raw
+
         def decode_value(self, value_raw):
             if self.arch.value_head != "hl_gauss":
                 return value_raw
@@ -823,7 +964,7 @@ def _model_class():
             )
             return (probabilities * centers).sum(dim=-1)
 
-        def _encode_graph(self, graph: GraphStateTensors):
+        def _encode_graph(self, graph: GraphStateTensors, node_roles: object = None):
             b, n = graph.node_tokens.shape
             device = graph.node_tokens.device
             node_index = torch.arange(n, device=device)
@@ -834,13 +975,22 @@ def _model_class():
                 h = self.node_embedding(graph.node_tokens.clamp(0, self.schema.node_vocab_size - 1))
                 if self.attr_proj is not None:
                     h = h + self.attr_proj(graph.node_attrs)
-                h = h * node_mask.unsqueeze(-1)
+            if self.board_role_embedding is not None:
+                if node_roles is None:
+                    raise ValueError("joint-board graph is missing node roles")
+                h = h + self.board_role_embedding(node_roles)
+            h = h * node_mask.unsqueeze(-1)
 
             g = self.global_tokens.unsqueeze(0).expand(b, -1, -1)
             if self.arch.position_encoding == "shared":
                 g = g + self.position_proj(graph.position).unsqueeze(1)
             elif self.arch.position_encoding == "remaining_budget":
-                g = g + self.position_proj(_remaining_budget_position(torch, graph.position)).unsqueeze(1)
+                position = (
+                    _joint_remaining_budget_position(torch, graph.position)
+                    if self.arch.state_input == "joint-board"
+                    else _remaining_budget_position(torch, graph.position)
+                )
+                g = g + self.position_proj(position).unsqueeze(1)
             if self.sage is not None:
                 for layer in self.sage:
                     h = layer(h, graph, node_mask)
@@ -1175,6 +1325,90 @@ def _pair_serving_model_classes():
 def _remaining_budget_position(torch: object, position: object):
     remaining = (position[..., 2] - position[..., 1] * position[..., 3]).clamp(0.0, 1.0)
     return torch.stack((remaining, position[..., 3]), dim=-1)
+
+
+def _joint_remaining_budget_position(torch: object, position: object):
+    own = _remaining_budget_position(torch, position[..., :4])
+    opponent = _remaining_budget_position(torch, position[..., 4:])
+    return torch.cat((own, opponent), dim=-1)
+
+
+def _scale_gradient(tensor: object, scale: float):
+    if scale == 1.0:
+        return tensor
+    detached = tensor.detach()
+    return detached + (tensor - detached) * scale
+
+
+def _joint_board_graph(torch: object, batch: GraphBatchTensors):
+    batch_size, node_capacity = batch.node_tokens.shape
+    node_index = torch.arange(node_capacity * 2, device=batch.node_tokens.device).unsqueeze(0)
+    node_index = node_index.expand(batch_size, -1)
+    own_node_count = batch.node_count.unsqueeze(1)
+    opponent_present = batch.opponent_state_present > 0
+    opponent_node_count = batch.opponent_node_count * opponent_present.to(batch.opponent_node_count.dtype)
+    opponent_node_count_2d = opponent_node_count.unsqueeze(1)
+    own_node = node_index < own_node_count
+    opponent_node_index = node_index - own_node_count
+    node_valid = own_node | ((opponent_node_index >= 0) & (opponent_node_index < opponent_node_count_2d))
+    own_gather = node_index.clamp(0, node_capacity - 1)
+    opponent_gather = opponent_node_index.clamp(0, node_capacity - 1)
+
+    node_tokens = torch.where(
+        own_node,
+        batch.node_tokens.gather(1, own_gather),
+        batch.opponent_node_tokens.gather(1, opponent_gather),
+    )
+    attr_dim = batch.node_attrs.shape[-1]
+    own_attr_gather = own_gather.unsqueeze(-1).expand(-1, -1, attr_dim)
+    opponent_attr_gather = opponent_gather.unsqueeze(-1).expand(-1, -1, attr_dim)
+    node_attrs = torch.where(
+        own_node.unsqueeze(-1),
+        batch.node_attrs.gather(1, own_attr_gather),
+        batch.opponent_node_attrs.gather(1, opponent_attr_gather),
+    )
+    node_tokens = node_tokens * node_valid.to(node_tokens.dtype)
+    node_attrs = node_attrs * node_valid.unsqueeze(-1).to(node_attrs.dtype)
+    node_roles = (~own_node).to(torch.long) * node_valid.to(torch.long)
+
+    _, edge_capacity = batch.edge_src.shape
+    edge_index = torch.arange(edge_capacity * 2, device=batch.edge_src.device).unsqueeze(0)
+    edge_index = edge_index.expand(batch_size, -1)
+    own_edge_count = batch.edge_count.unsqueeze(1)
+    opponent_edge_count = batch.opponent_edge_count * opponent_present.to(batch.opponent_edge_count.dtype)
+    opponent_edge_count_2d = opponent_edge_count.unsqueeze(1)
+    own_edge = edge_index < own_edge_count
+    opponent_edge_index = edge_index - own_edge_count
+    edge_valid = own_edge | ((opponent_edge_index >= 0) & (opponent_edge_index < opponent_edge_count_2d))
+    own_edge_gather = edge_index.clamp(0, edge_capacity - 1)
+    opponent_edge_gather = opponent_edge_index.clamp(0, edge_capacity - 1)
+
+    own_src = batch.edge_src.gather(1, own_edge_gather)
+    own_dst = batch.edge_dst.gather(1, own_edge_gather)
+    opponent_src = batch.opponent_edge_src.gather(1, opponent_edge_gather) + own_node_count
+    opponent_dst = batch.opponent_edge_dst.gather(1, opponent_edge_gather) + own_node_count
+    edge_src = torch.where(own_edge, own_src, opponent_src)
+    edge_dst = torch.where(own_edge, own_dst, opponent_dst)
+    edge_type = torch.where(
+        own_edge,
+        batch.edge_type.gather(1, own_edge_gather),
+        batch.opponent_edge_type.gather(1, opponent_edge_gather),
+    )
+    edge_src = edge_src * edge_valid.to(edge_src.dtype)
+    edge_dst = edge_dst * edge_valid.to(edge_dst.dtype)
+    edge_type = edge_type * edge_valid.to(edge_type.dtype)
+
+    graph = GraphStateTensors(
+        node_count=batch.node_count + opponent_node_count,
+        node_tokens=node_tokens,
+        node_attrs=node_attrs,
+        edge_count=batch.edge_count + opponent_edge_count,
+        edge_src=edge_src,
+        edge_dst=edge_dst,
+        edge_type=edge_type,
+        position=torch.cat((batch.position, batch.opponent_position), dim=-1),
+    )
+    return graph, node_roles
 
 
 def _self_graph(batch: GraphBatchTensors) -> GraphStateTensors:

@@ -77,8 +77,9 @@ no gating/arena, no resume, fresh runs only.
    model_version it builds + loads + warms the new model off to the side,
    then hands it over; the serving loop swaps between batches. A
    checkpoint with mismatched tags is refused loudly and the old model
-   keeps serving. model_version already rides every EVAL_RESULT, so
-   replay rows record exactly which weights produced them.
+   keeps serving. Each episode leases an exact ModelVersion; EVAL_RESULT also
+   advertises the generation active for later admissions, so replay rows record
+   exactly which pinned weights produced them.
 2. The model exposes its pre-tanh value scalar for training (serving
    still returns tanh(v)).
 ```
@@ -107,13 +108,17 @@ loop.py     continuous, no phases:
               AdamW + grad clip; cosine schedule over total_steps with
               warmup; update weight EMA
               every publish_interval steps: publish EMA checkpoint
+              every permanent_checkpoint_interval steps: also write a
+                step_N.json pointer that exempts that exact version from
+                rolling checkpoint pruning
 publish.py  gz/checkpoints publish; manifest binds the ack's schema config
             + ArchConfig; training_step recorded; model_version derived
 ```
 
 Config: one TOML. `[trainer]` lr 3e-4, warmup_steps 200, batch 256,
-window_rows 200_000, total_steps, publish_interval 500, value_weight 1.0,
-ema_decay 0.999, grad_clip 1.0, min_startup_rows, seed, device "cuda:1".
+window_rows 200_000, total_steps, publish_interval 500,
+permanent_checkpoint_interval 1000, value_weight 1.0, ema_decay 0.999,
+grad_clip 1.0, min_startup_rows, seed, device "cuda:1".
 `[selfplay]` lanes/workers/simulations/max_steps/reference passthrough,
 max_row_backlog (default = window_rows), eval device "cuda:0".
 `[paths]` replay dir, checkpoint dir, run dir. Defaults are starting

@@ -1,11 +1,12 @@
-// v6: rows persist as StoredReplayRow (deduplicated legal-action
-// contexts, bf16 policy targets) with v2 feature-row bytes.
-pub(crate) const SCHEMA_VERSION: u32 = 6;
+// v8: replay rows may carry fixed V8/V32 horizon-value targets.
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 pub(crate) const CF_META: &str = "meta";
 pub(crate) const CF_EPISODES: &str = "episodes";
 pub(crate) const CF_ROWS: &str = "rows";
 pub(crate) const CF_ROW_INDEX: &str = "row_index";
+pub(crate) const CF_POLICY_ROW_INDEX: &str = "policy_row_index";
+pub(crate) const CF_VALUE_ROW_INDEX: &str = "value_row_index";
 
 pub(crate) const META_SCHEMA_VERSION: &[u8] = b"schema_version";
 pub(crate) const META_EPISODES_STOPPED: &[u8] = b"episodes_stopped";
@@ -13,14 +14,30 @@ pub(crate) const META_COMPLETED_GAMES: &[u8] = b"completed_games";
 pub(crate) const META_NEXT_EPISODE_SEQ: &[u8] = b"next_episode_seq";
 pub(crate) const META_PRODUCED_ROWS: &[u8] = b"produced_rows";
 pub(crate) const META_PRODUCED_POLICY_ROWS: &[u8] = b"produced_policy_rows";
+pub(crate) const META_PRODUCED_VALUE_ROWS: &[u8] = b"produced_value_rows";
 pub(crate) const META_CONSUMED_ROWS: &[u8] = b"consumed_rows";
 pub(crate) const META_RETAINED_FLOOR: &[u8] = b"retained_floor";
 pub(crate) const META_DELETED_FLOOR: &[u8] = b"deleted_floor";
+pub(crate) const META_RETAINED_POLICY_FLOOR: &[u8] = b"retained_policy_floor";
+pub(crate) const META_DELETED_POLICY_FLOOR: &[u8] = b"deleted_policy_floor";
+pub(crate) const META_RETAINED_VALUE_FLOOR: &[u8] = b"retained_value_floor";
+pub(crate) const META_DELETED_VALUE_FLOOR: &[u8] = b"deleted_value_floor";
 pub(crate) const META_FEATURE_SCHEMA: &[u8] = b"feature_schema";
 pub(crate) const META_DATA_MODE: &[u8] = b"data_mode";
 pub(crate) const META_ROOT_INFO: &[u8] = b"root_info";
 pub(crate) const META_TERMINAL_COST_EMA: &[u8] = b"terminal_cost_ema";
 pub(crate) const META_TERMINAL_COST_BEST: &[u8] = b"terminal_cost_best";
+pub(crate) const META_SYMMETRIC_GAMES: &[u8] = b"symmetric_games";
+pub(crate) const META_SYMMETRIC_P1_WIN_EMA: &[u8] = b"symmetric_p1_win_ema";
+pub(crate) const META_SYMMETRIC_P2_WIN_EMA: &[u8] = b"symmetric_p2_win_ema";
+pub(crate) const META_SYMMETRIC_DRAW_EMA: &[u8] = b"symmetric_draw_ema";
+pub(crate) const META_SYMMETRIC_P1_COST_EMA: &[u8] = b"symmetric_p1_cost_ema";
+pub(crate) const META_SYMMETRIC_P2_COST_EMA: &[u8] = b"symmetric_p2_cost_ema";
+pub(crate) const META_SYMMETRIC_COST_MARGIN_EMA: &[u8] = b"symmetric_cost_margin_ema";
+pub(crate) const META_SYMMETRIC_P1_LEN_EMA: &[u8] = b"symmetric_p1_len_ema";
+pub(crate) const META_SYMMETRIC_P2_LEN_EMA: &[u8] = b"symmetric_p2_len_ema";
+pub(crate) const META_SYMMETRIC_LEN_MARGIN_EMA: &[u8] = b"symmetric_len_margin_ema";
+pub(crate) const META_SYMMETRIC_BEST_COST: &[u8] = b"symmetric_best_cost";
 
 pub(crate) const EPISODE_KEY_LEN: usize = 8;
 pub(crate) const ROW_KEY_LEN: usize = 12;

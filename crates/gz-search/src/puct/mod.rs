@@ -93,9 +93,9 @@ impl PuctMcts {
             self.search_config_hash,
             EngineIdentity::from_engine(engine),
             root,
-            task::common_episode_context(context),
+            context,
         );
-        run_episode(engine, evaluator, task).map(task::puct_episode)
+        run_episode(engine, evaluator, task)
     }
 
     pub fn search_root<E, V>(
@@ -114,7 +114,7 @@ impl PuctMcts {
             strategy::PuctStrategy::new(self.config),
             EngineIdentity::from_engine(engine),
             root,
-            task::common_search_context(context),
+            context,
         );
         run_root(engine, evaluator, task)
     }

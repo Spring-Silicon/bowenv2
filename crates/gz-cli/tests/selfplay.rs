@@ -1,9 +1,10 @@
 use gz_cli::selfplay::{
     EvaluatorMode, PolicyOpponentMode, ReferenceMode, ReplayInitConfig, RootMode, SelfplayConfig,
-    ValueReward, init_replay, run,
+    TrainingMode, ValueReward, init_replay, run,
 };
 use gz_features::FeatureSchema;
-use gz_replay::ReplayStore;
+use gz_replay::{ReplayStore, SampleConfig};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +39,239 @@ impl Drop for TestDir {
 #[test]
 fn selfplay_config_defaults_tree_reuse_on() {
     assert!(SelfplayConfig::default().tree_reuse);
+}
+
+#[test]
+fn single_vanilla_selfplay_stores_raw_terminal_reward_without_reference() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 1,
+        lanes: 1,
+        workers_per_lane: 1,
+        training_mode: TrainingMode::SingleVanilla,
+        reference: ReferenceMode::None,
+        reference_ema_decay: 0.0,
+        tree_reuse: false,
+        max_steps: 2,
+        simulations: 2,
+        max_considered: 2,
+        max_batch: 1,
+        ..SelfplayConfig::default()
+    })
+    .unwrap();
+
+    assert_eq!(summary.episodes_appended, 1);
+    assert_eq!((summary.wins, summary.losses, summary.ties), (0, 0, 0));
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(
+        store.data_mode().unwrap(),
+        gz_replay::ReplayDataMode::SingleVanilla
+    );
+    let record = store
+        .episode(gz_replay::ReplayEpisodeId::new(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.outcome.value_target,
+        Some(record.outcome.learner_reward)
+    );
+    assert!(record.outcome.reference.is_none());
+}
+
+#[test]
+fn single_vanilla_rejects_reuse_and_reference_settings() {
+    let base = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        training_mode: TrainingMode::SingleVanilla,
+        reference: ReferenceMode::None,
+        reference_ema_decay: 0.0,
+        tree_reuse: false,
+        ..SelfplayConfig::default()
+    };
+    assert!(base.validate().is_ok());
+    assert!(
+        SelfplayConfig {
+            tree_reuse: true,
+            ..base.clone()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("--tree-reuse false")
+    );
+    assert!(
+        SelfplayConfig {
+            reference: ReferenceMode::Root,
+            ..base
+        }
+        .validate()
+        .unwrap_err()
+        .contains("reference and arena settings disabled")
+    );
+}
+
+#[test]
+fn wave_batching_requires_symmetric_selfplay() {
+    let config = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        wave_batching: true,
+        ..SelfplayConfig::default()
+    };
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .contains("--training-mode symmetric-selfplay")
+    );
+}
+
+#[test]
+fn symmetric_selfplay_allows_stop_with_position_features_and_no_reference() {
+    let base = SelfplayConfig {
+        replay_dir: Some(PathBuf::from("/tmp/unused")),
+        training_mode: TrainingMode::SymmetricSelfplay,
+        reference: ReferenceMode::None,
+        reference_ema_decay: 0.0,
+        tree_reuse: false,
+        mask_stop: true,
+        length_tiebreak: true,
+        evaluator: EvaluatorMode::Stub,
+        ..SelfplayConfig::default()
+    };
+    assert!(base.validate().is_ok());
+    assert!(
+        SelfplayConfig {
+            wave_batching: true,
+            ..base.clone()
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        SelfplayConfig {
+            tree_reuse: true,
+            ..base.clone()
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        SelfplayConfig {
+            mask_stop: false,
+            ..base.clone()
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        SelfplayConfig {
+            mask_stop: false,
+            position_features: false,
+            ..base.clone()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("--position-features true")
+    );
+    assert!(
+        SelfplayConfig {
+            reference: ReferenceMode::Root,
+            ..base
+        }
+        .validate()
+        .unwrap_err()
+        .contains("reference and arena settings disabled")
+    );
+}
+
+#[test]
+fn symmetric_selfplay_stub_run_appends_both_player_rows() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 1,
+        lanes: 1,
+        workers_per_lane: 1,
+        training_mode: TrainingMode::SymmetricSelfplay,
+        reference: ReferenceMode::None,
+        reference_ema_decay: 0.0,
+        tree_reuse: false,
+        mask_stop: true,
+        length_tiebreak: true,
+        evaluator: EvaluatorMode::Stub,
+        max_steps: 1,
+        simulations: 2,
+        max_considered: 2,
+        max_batch: 1,
+        ..SelfplayConfig::default()
+    })
+    .unwrap();
+
+    assert_eq!(summary.episodes_appended, 1);
+    assert_eq!(summary.wins + summary.losses + summary.ties, 2);
+    assert_eq!(summary.measure_ledger.finals, 2);
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(
+        store.data_mode().unwrap(),
+        gz_replay::ReplayDataMode::SymmetricSelfplay
+    );
+    assert_eq!(store.counters().produced_rows, 2);
+    for episode in [0, 1] {
+        let record = store
+            .episode(gz_replay::ReplayEpisodeId::new(episode))
+            .unwrap()
+            .unwrap();
+        assert!(record.outcome.reference.is_none());
+        assert!(!record.outcome.stopped);
+        assert!(
+            record.steps.iter().all(|step| !matches!(
+                step.action,
+                gz_engine::PortableSearchActionRef::Stop { .. }
+            ))
+        );
+    }
+}
+
+#[test]
+fn symmetric_selfplay_stub_run_retains_stop_targets_in_v2_replay() {
+    let dir = TestDir::new();
+    let summary = run(SelfplayConfig {
+        replay_dir: Some(dir.path().to_path_buf()),
+        episodes: 1,
+        lanes: 1,
+        workers_per_lane: 1,
+        training_mode: TrainingMode::SymmetricSelfplay,
+        reference: ReferenceMode::None,
+        reference_ema_decay: 0.0,
+        tree_reuse: true,
+        mask_stop: false,
+        length_tiebreak: true,
+        evaluator: EvaluatorMode::Stub,
+        max_steps: 1,
+        simulations: 2,
+        max_considered: 2,
+        max_batch: 1,
+        ..SelfplayConfig::default()
+    })
+    .unwrap();
+
+    assert_eq!(summary.episodes_appended, 1);
+    let store = ReplayStore::open(dir.path()).unwrap();
+    assert_eq!(
+        store.data_mode().unwrap(),
+        gz_replay::ReplayDataMode::SymmetricSelfplayStop
+    );
+    let rows = store
+        .sample_rows(SampleConfig {
+            batch: NonZeroUsize::new(2).unwrap(),
+            window_rows: NonZeroU64::new(2).unwrap(),
+            seed: 7,
+        })
+        .unwrap();
+    assert!(rows.iter().all(|(_, row)| matches!(
+        row.legal_actions.last(),
+        Some(gz_engine::PortableSearchActionRef::Stop { .. })
+    )));
 }
 
 #[test]
@@ -166,6 +400,7 @@ fn selfplay_run_writes_replay_rows() {
         episodes: 4,
         lanes: 2,
         workers_per_lane: 2,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
@@ -208,6 +443,7 @@ fn selfplay_run_writes_replay_rows() {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     })
     .unwrap();
     let store = ReplayStore::open(dir.path()).unwrap();
@@ -227,6 +463,7 @@ fn selfplay_run_supports_stub_evaluator() {
         episodes: 2,
         lanes: 1,
         workers_per_lane: 2,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
@@ -269,6 +506,7 @@ fn selfplay_run_supports_stub_evaluator() {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     })
     .unwrap();
 
@@ -285,6 +523,7 @@ fn selfplay_run_supports_self_average_reference() {
         episodes: 4,
         lanes: 1,
         workers_per_lane: 1,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::SelfAverage,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.9,
@@ -327,6 +566,7 @@ fn selfplay_run_supports_self_average_reference() {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     })
     .unwrap();
 
@@ -346,6 +586,7 @@ fn selfplay_run_supports_policy_reference() {
         episodes: 4,
         lanes: 1,
         workers_per_lane: 1,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::Policy,
         root_mode: RootMode::Fixed,
         reference_ema_decay: 0.0,
@@ -388,6 +629,7 @@ fn selfplay_run_supports_policy_reference() {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     })
     .unwrap();
 
@@ -409,6 +651,7 @@ fn selfplay_run_supports_sampled_trajectory_policy_reference() {
         episodes: 4,
         lanes: 2,
         workers_per_lane: 1,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::Policy,
         root_mode: RootMode::Fixed,
         policy_opponent_mode: Some(PolicyOpponentMode::SampledTrajectory),
@@ -456,6 +699,7 @@ fn gated_policy_trajectory_pool_fills_across_cold_lanes_before_admission() {
         episodes: 16,
         lanes: 2,
         workers_per_lane: 1,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::GatedPolicy,
         root_mode: RootMode::Fixed,
         reference_ema_decay: 0.0,
@@ -817,6 +1061,7 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         episodes: 0,
         lanes: 1,
         workers_per_lane: 1,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::Root,
         root_mode: RootMode::Generated,
         reference_ema_decay: 0.99,
@@ -859,6 +1104,7 @@ fn serving_config(dir: &TestDir) -> SelfplayConfig {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     }
 }
 
@@ -939,6 +1185,30 @@ fn torch_evaluator_builds_the_child_command_line() {
 
     config.eval_device = Some("cuda:1".to_owned());
     assert_eq!(config.evaluator_extra_args()[5], "cuda:1");
+}
+
+#[test]
+fn symmetric_torch_evaluator_requires_joint_board_checkpoint() {
+    let dir = TestDir::new();
+    let mut config = serving_config(&dir);
+    config.evaluator = EvaluatorMode::Torch;
+    config.checkpoint_dir = Some(PathBuf::from("/ckpt"));
+    config.training_mode = TrainingMode::SymmetricSelfplay;
+    config.reference = ReferenceMode::None;
+    config.reference_ema_decay = 0.0;
+    config.length_tiebreak = true;
+    config.validate().unwrap();
+
+    let args = config.evaluator_extra_args();
+    assert_eq!(
+        &args[6..],
+        [
+            "--require-state-input",
+            "joint-board",
+            "--require-value-input",
+            "single"
+        ]
+    );
 }
 
 #[test]
@@ -1050,6 +1320,7 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         episodes: 6,
         lanes: 2,
         workers_per_lane: 2,
+        training_mode: gz_cli::selfplay::TrainingMode::Competitive,
         reference: ReferenceMode::SelfAverage,
         root_mode: RootMode::Fixed,
         reference_ema_decay: 0.9,
@@ -1092,6 +1363,7 @@ fn fixed_root_mode_shares_one_graph_with_distinct_episodes() {
         eval_processes: 1,
         admission_stagger_ms: 0,
         admission_smoothing: false,
+        wave_batching: false,
     })
     .unwrap();
     // Admissions that precede a lane's first completed episode have no

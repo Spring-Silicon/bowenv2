@@ -38,10 +38,10 @@ pub trait ReferenceProvider<E: GraphEngine> {
 
     /// Rollout-driven providers (the policy opponent) answer true when
     /// the lane should play one opponent episode from the fixed root:
-    /// `latest` is the newest model version seen on this lane's eval
+    /// `latest` is the active model version advertised on this lane's eval
     /// replies, and a rollout is due whenever it differs from the version
     /// the current reference was played under. `latest` None means no
-    /// eval reply has named a version yet; providers that seed their
+    /// eval reply has advertised a version yet; providers that seed their
     /// reference with a cold-start rollout answer true exactly once
     /// there. Default: never.
     fn rollout_due(&self, latest: Option<ModelVersion>) -> bool {

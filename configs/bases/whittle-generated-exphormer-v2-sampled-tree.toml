@@ -1,6 +1,6 @@
 # Generated-root Whittle sampled-tree baseline for gz-graph-v2. Leaves set
 # only run identity and persistent/ephemeral paths. Sampled-tree labels require
-# gamma zero, an explicit value batch, and no value mirroring.
+# gamma zero, an explicit value batch, and paired value mirroring.
 
 [arch]
 name = "gz-graph-v2"
@@ -59,7 +59,7 @@ matmul_precision = "high"
 max_reuse = 8.0
 reuse_gate_interval = 1
 reuse_gate_episodes = 0
-value_mirror = false
+value_mirror = true
 parallel_value_sampling = true
 resume = false
 init_checkpoint = "runs/distill-generated-reducing-uniform-v2-s5-1k-1/checkpoints"

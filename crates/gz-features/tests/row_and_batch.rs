@@ -7,7 +7,7 @@ use gz_features::{
 use std::num::NonZeroUsize;
 
 const HAND_BUILT_BATCH_FINGERPRINT: &str =
-    "759801a825bede65f27c0c9c9c22471aeb6342d71aa62279fe7c2008c5b48501";
+    "4bcc190edb765f12849989dacb0c12958de16bda3a58366b8c336b84757d9ae6";
 
 fn schema() -> FeatureSchema {
     FeatureSchema::new(FeatureSchemaConfig {
@@ -303,11 +303,13 @@ fn training_targets_codec_writes_padded_sections() {
         RowTargets {
             policy: vec![1.0, 2.0, 3.0],
             value: Some(1.0),
+            horizon_value: Some([0.5, 0.25]),
             reward: 0.25,
         },
         RowTargets {
             policy: vec![-1.0],
             value: None,
+            horizon_value: None,
             reward: -0.5,
         },
     ];
@@ -322,10 +324,12 @@ fn training_targets_codec_writes_padded_sections() {
     assert_eq!(view.policy, vec![1.0, 2.0, 3.0, -1.0, 0.0, 0.0]);
     assert_eq!(view.value, vec![1.0, 0.0]);
     assert_eq!(view.value_valid, vec![1, 0]);
+    assert_eq!(view.horizon_value, vec![0.5, 0.25, 0.0, 0.0]);
+    assert_eq!(view.horizon_value_valid, vec![1, 0]);
     assert_eq!(view.reward, vec![0.25, -0.5]);
     assert_eq!(
         fingerprint(&bytes),
-        "bbe4a7663fd71400abf5b8ab6608068be9014cf8ff1af18e4844024d3d39aec1"
+        "f5d19d99f1f60a430a2637bbdac958b1c0589d8297464aae66323452f9851287"
     );
 }
 
@@ -334,6 +338,7 @@ fn training_targets_codec_accepts_graded_value() {
     let targets = [RowTargets {
         policy: vec![1.0],
         value: Some(0.25),
+        horizon_value: None,
         reward: 0.0,
     }];
     let mut bytes = Vec::new();
@@ -346,14 +351,32 @@ fn training_targets_codec_accepts_graded_value() {
 }
 
 #[test]
-fn training_targets_codec_rejects_invalid_graded_value() {
-    for value in [f32::NAN, -1.001, 1.001] {
+fn training_targets_codec_accepts_unbounded_finite_value() {
+    let targets = [RowTargets {
+        policy: vec![1.0],
+        value: Some(-42.0),
+        horizon_value: None,
+        reward: 0.0,
+    }];
+    let mut bytes = Vec::new();
+
+    encode_training_targets(&targets, 1, 1, &mut bytes).unwrap();
+
+    let view = TrainingTargetsView::parse(&bytes).unwrap();
+    assert_eq!(view.value, vec![-42.0]);
+    assert_eq!(view.value_valid, vec![1]);
+}
+
+#[test]
+fn training_targets_codec_rejects_non_finite_value() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         let mut bytes = Vec::new();
         assert!(matches!(
             encode_training_targets(
                 &[RowTargets {
                     policy: vec![1.0],
                     value: Some(value),
+                    horizon_value: None,
                     reward: 0.0,
                 }],
                 1,
@@ -374,6 +397,7 @@ fn training_targets_codec_rejects_bad_policy_width() {
             &[RowTargets {
                 policy: vec![1.0, 2.0],
                 value: Some(1.0),
+                horizon_value: None,
                 reward: 0.0,
             }],
             1,

@@ -28,6 +28,7 @@ def publish_checkpoint(
     action_set_hash: ActionSetHash,
     training_step: int,
     run_id: str,
+    checkpoint_pointers: Iterable[str] = (),
 ) -> CheckpointManifest:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -70,15 +71,22 @@ def publish_checkpoint(
     os.replace(tmp, final)
     _fsync_dir(root)
 
-    latest = {
-        "version_dir": version_dir,
-        "model_version": manifest.model_version.hex(),
-    }
-    latest_tmp = root / "latest.json.tmp"
-    latest_tmp.write_text(json.dumps(latest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-    _fsync_file(latest_tmp)
-    os.replace(latest_tmp, root / "latest.json")
-    _fsync_dir(root)
+    # Write archival aliases before advancing latest. If publication is
+    # interrupted between them, resume still starts from the older checkpoint
+    # while the completed milestone remains pinned.
+    for pointer_name in checkpoint_pointers:
+        _write_checkpoint_pointer(
+            root,
+            pointer_name,
+            version_dir,
+            manifest.model_version.hex(),
+        )
+    _write_checkpoint_pointer(
+        root,
+        "latest.json",
+        version_dir,
+        manifest.model_version.hex(),
+    )
     return manifest
 
 
@@ -98,8 +106,6 @@ def promote_checkpoint_pointer(
     model_version_hex: str,
 ) -> None:
     root = Path(root)
-    if Path(pointer_name).name != pointer_name:
-        raise ValueError("checkpoint pointer must be a file name")
     version_dir = None
     for child in root.iterdir():
         if not child.is_dir() or not child.name.startswith("version_"):
@@ -113,10 +119,18 @@ def promote_checkpoint_pointer(
             break
     if version_dir is None:
         raise ValueError(f"checkpoint version not found: {model_version_hex}")
-    pointer = {
-        "version_dir": version_dir,
-        "model_version": model_version_hex,
-    }
+    _write_checkpoint_pointer(root, pointer_name, version_dir, model_version_hex)
+
+
+def _write_checkpoint_pointer(
+    root: Path,
+    pointer_name: str,
+    version_dir: str,
+    model_version_hex: str,
+) -> None:
+    if Path(pointer_name).name != pointer_name:
+        raise ValueError("checkpoint pointer must be a file name")
+    pointer = {"version_dir": version_dir, "model_version": model_version_hex}
     pointer_path = root / pointer_name
     pointer_tmp = root / f"{pointer_name}.tmp"
     pointer_tmp.write_text(
@@ -163,7 +177,15 @@ def prune_checkpoints(
 
     by_dir = {path.name: manifest for _, path, manifest in versions}
     protected_dirs = {path.name for _, path, _ in versions[-retain:]}
-    for pointer_name in ("latest.json", "best.json", "arena.json"):
+    pointer_names = ["latest.json", "best.json", "arena.json"]
+    pointer_names.extend(
+        sorted(
+            child.name
+            for child in root.iterdir()
+            if child.is_file() and _is_permanent_checkpoint_pointer(child.name)
+        )
+    )
+    for pointer_name in pointer_names:
         target = _checkpoint_pointer_target(root, pointer_name, by_dir)
         if target is not None:
             protected_dirs.add(target)
@@ -246,6 +268,12 @@ def _remove_prune_tombstones(root: Path) -> None:
         removed = True
     if removed:
         _fsync_dir(root)
+
+
+def _is_permanent_checkpoint_pointer(name: str) -> bool:
+    if not name.startswith("step_") or not name.endswith(".json"):
+        return False
+    return name.removeprefix("step_").removesuffix(".json").isdigit()
 
 
 def _next_version_dir(root: Path) -> str:

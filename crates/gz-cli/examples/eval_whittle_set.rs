@@ -132,6 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         export_position: true,
         mask_stop: false,
         no_backtrack: true,
+        value_mode: gz_search::GumbelValueMode::Competitive,
         candidate_options: CandidateOptions {
             max_candidates: Some(MAX_CANDIDATES),
             deterministic_order: true,
