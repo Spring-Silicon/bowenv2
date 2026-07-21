@@ -6,12 +6,19 @@ import pytest
 
 from gz.checkpoints import DirectorySource
 from gz.codec import FeatureSchemaConfig
-from gz.common import FeatureSchemaHash
+from gz.common import ActionSetHash, EngineIdentity, EngineId, EngineVersion, FeatureSchemaHash
 from gz.model.exphormer import ArchConfig, build_model
 from gz.trainer.publish import EmaWeights, publish_ema
 from python.tests.test_checkpoints import schema_config
 
 torch = pytest.importorskip("torch")
+
+
+ENGINE_IDENTITY = EngineIdentity.from_parts(
+    EngineId.from_bytes(b"e" * 16),
+    EngineVersion.from_bytes(b"v" * 16),
+    ActionSetHash.from_bytes(b"a" * 32),
+)
 
 
 def test_ema_weights_update_with_literal_arithmetic() -> None:
@@ -40,6 +47,7 @@ def test_publish_ema_roundtrips_and_version_changes(tmp_path: Path) -> None:
         arch=arch,
         training_step=0,
         run_id="run",
+        engine_identity=ENGINE_IDENTITY,
     )
     for tensor in model.state_dict().values():
         if tensor.is_floating_point():
@@ -54,6 +62,7 @@ def test_publish_ema_roundtrips_and_version_changes(tmp_path: Path) -> None:
         arch=arch,
         training_step=1,
         run_id="run",
+        engine_identity=ENGINE_IDENTITY,
     )
 
     assert DirectorySource(tmp_path).resolve_latest().manifest == second
@@ -100,6 +109,7 @@ def test_publish_ema_rejects_nonfinite_weights_before_writing(tmp_path: Path) ->
             arch=arch,
             training_step=1,
             run_id="run",
+            engine_identity=ENGINE_IDENTITY,
         )
 
     assert not (tmp_path / "latest.json").exists()

@@ -6,7 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from gz.codec import FeatureSchemaConfig, SchemaConfigError
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash, ModelVersion
+from gz.common import (
+    ActionSetHash,
+    EngineIdentity,
+    EngineId,
+    EngineVersion,
+    FeatureSchemaHash,
+    ModelVersion,
+)
 
 MANIFEST_VERSION = 1
 
@@ -57,13 +64,23 @@ class CheckpointManifest:
     arch_config_hash: str
     feature_schema: FeatureSchemaConfig
     feature_schema_hash: FeatureSchemaHash
-    engine_id: EngineId
-    engine_version: EngineVersion
-    action_set_hash: ActionSetHash
+    engine_identity: EngineIdentity
     training_step: int
     run_id: str
     weights: WeightsInfo
     manifest_version: int = MANIFEST_VERSION
+
+    @property
+    def engine_id(self) -> EngineId:
+        return self.engine_identity.engine_id
+
+    @property
+    def engine_version(self) -> EngineVersion:
+        return self.engine_identity.engine_version
+
+    @property
+    def action_set_hash(self) -> ActionSetHash:
+        return self.engine_identity.action_set_hash
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -124,6 +141,14 @@ class CheckpointManifest:
         run_id = _str(value, "run_id")
         if not run_id:
             raise ManifestError("run_id must be non-empty")
+        try:
+            engine_identity = EngineIdentity.from_parts(
+                EngineId.from_hex(_hex(value, "engine_id", 16)),
+                EngineVersion.from_hex(_hex(value, "engine_version", 16)),
+                ActionSetHash.from_hex(_hex(value, "action_set_hash", 32)),
+            )
+        except ValueError as error:
+            raise ManifestError(str(error)) from error
         return cls(
             manifest_version=MANIFEST_VERSION,
             model_version=ModelVersion.from_hex(_hex(value, "model_version", 16)),
@@ -132,9 +157,7 @@ class CheckpointManifest:
             arch_config_hash=_hex(arch, "arch_config_hash", 32),
             feature_schema=feature_schema,
             feature_schema_hash=FeatureSchemaHash.from_hex(_hex(value, "feature_schema_hash", 32)),
-            engine_id=EngineId.from_hex(_hex(value, "engine_id", 16)),
-            engine_version=EngineVersion.from_hex(_hex(value, "engine_version", 16)),
-            action_set_hash=ActionSetHash.from_hex(_hex(value, "action_set_hash", 32)),
+            engine_identity=engine_identity,
             training_step=step,
             run_id=run_id,
             weights=WeightsInfo.from_dict(value["weights"]),

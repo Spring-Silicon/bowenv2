@@ -33,7 +33,7 @@ def main() -> int:
 
     resolved = DirectorySource(args.checkpoint_dir).resolve_latest()
     schema = resolved.manifest.feature_schema
-    arch = ArchConfig.from_dict(resolved.manifest.arch_config)
+    arch = ArchConfig.from_manifest_dict(resolved.manifest.arch_config)
     model = build_model(schema, arch).to(device)
     model.load_state_dict(load_state_dict(resolved.weights_path))
 

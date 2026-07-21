@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import subprocess
 import threading
 from pathlib import Path
 
@@ -67,6 +68,71 @@ def test_sample_client_startup_wait_reconnects_until_enough_rows(tmp_path: Path)
     finally:
         client.close()
         thread.join(timeout=1)
+
+
+def test_sample_client_handshakes_with_rust_replay_server(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    subprocess.run(
+        ["cargo", "build", "-q", "-p", "gz-cli", "--bin", "graphzero"],
+        cwd=root,
+        check=True,
+    )
+    binary = root / "target/debug/graphzero"
+    replay = tmp_path / "replay"
+    socket_path = tmp_path / "sample.sock"
+    subprocess.run(
+        [
+            binary,
+            "replay-init",
+            "--replay-dir",
+            replay,
+            "--max-candidates",
+            "15",
+            "--mask-stop",
+            "false",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    server = subprocess.Popen(
+        [
+            binary,
+            "replay-serve",
+            "--replay-dir",
+            replay,
+            "--socket",
+            socket_path,
+            "--max-batch",
+            "4",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    client = SampleClient(socket_path, startup_timeout=5.0, backoff=0.01)
+    try:
+        ack = client.wait_until_ready(0, alive_check=lambda: _check_process(server))
+        assert ack.max_batch == 4
+        assert ack.produced_rows == 0
+        assert ack.feature_schema.max_actions == 16
+        assert ack.symmetric_selfplay is None
+        assert any(bytes(ack.engine_id))
+        assert any(bytes(ack.engine_version))
+        assert any(bytes(ack.action_set_hash))
+    finally:
+        client.close()
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)
+
+
+def _check_process(process: subprocess.Popen[bytes]) -> None:
+    status = process.poll()
+    if status is not None:
+        stderr = process.stderr.read().decode() if process.stderr is not None else ""
+        raise RuntimeError(f"replay server exited with status {status}: {stderr}")
 
 
 def test_step_seed_is_deterministic_and_step_sensitive() -> None:

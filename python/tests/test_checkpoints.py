@@ -14,7 +14,7 @@ from gz.checkpoints import (
 from gz.checkpoints.manifest import CheckpointManifest
 from gz.checkpoints.publish import ensure_checkpoint_pointer, promote_checkpoint_pointer
 from gz.codec import FeatureSchemaConfig
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
+from gz.common import ActionSetHash, EngineIdentity, EngineId, EngineVersion, FeatureSchemaHash
 from gz.model.exphormer import ArchConfig, build_model
 
 torch = pytest.importorskip("torch")
@@ -29,13 +29,11 @@ def test_publish_and_resolve_roundtrip(tmp_path: Path) -> None:
         tmp_path,
         model.state_dict(),
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_hash(),
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=engine_identity(),
         training_step=7,
         run_id="run",
     )
@@ -55,13 +53,11 @@ def test_weights_tampering_is_detected(tmp_path: Path) -> None:
         tmp_path,
         model.state_dict(),
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_hash(),
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=engine_identity(),
         training_step=0,
         run_id="run",
     )
@@ -88,13 +84,11 @@ def test_latest_replace_preserves_old_version_and_model_version_is_stable(tmp_pa
     model = build_model(schema, arch)
     kwargs = dict(
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_hash(),
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=engine_identity(),
         run_id="run",
     )
     first = publish_checkpoint(tmp_path, model.state_dict(), training_step=0, **kwargs)
@@ -117,13 +111,11 @@ def test_named_checkpoint_pointer_stays_frozen_until_exact_promotion(tmp_path: P
     model = build_model(schema, arch)
     kwargs = dict(
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_hash(),
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=engine_identity(),
         run_id="run",
     )
     first = publish_checkpoint(tmp_path, model.state_dict(), training_step=0, **kwargs)
@@ -149,13 +141,11 @@ def test_prune_checkpoints_keeps_newest_named_and_in_flight_versions(
     model = build_model(schema, arch)
     kwargs = dict(
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_hash(),
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=engine_identity(),
         run_id="run",
     )
     base_state = model.state_dict()
@@ -213,13 +203,11 @@ def test_permanent_step_pointer_survives_rolling_prune(tmp_path: Path) -> None:
     model = build_model(schema, arch)
     kwargs = dict(
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_hash(),
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=engine_identity(),
         run_id="run",
     )
     base_state = model.state_dict()
@@ -257,13 +245,11 @@ def test_prune_checkpoints_validates_pointers_before_deleting(tmp_path: Path) ->
     model = build_model(schema, arch)
     kwargs = dict(
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_hash(),
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=engine_identity(),
         run_id="run",
     )
     base_state = model.state_dict()
@@ -308,6 +294,14 @@ def schema_config() -> FeatureSchemaConfig:
         max_subjects=2,
         expander_degree=2,
         expander_seed=0,
+    )
+
+
+def engine_identity() -> EngineIdentity:
+    return EngineIdentity.from_parts(
+        EngineId.from_bytes(b"e" * 16),
+        EngineVersion.from_bytes(b"v" * 16),
+        ActionSetHash.from_bytes(b"a" * 32),
     )
 
 

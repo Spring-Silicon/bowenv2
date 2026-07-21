@@ -5,7 +5,14 @@ import struct
 
 import pytest
 
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash, ModelVersion
+from gz.common import (
+    ActionSetHash,
+    EngineIdentity,
+    EngineId,
+    EngineVersion,
+    FeatureSchemaHash,
+    ModelVersion,
+)
 from gz.proto import (
     ERROR_MALFORMED,
     FRAME_HELLO,
@@ -52,9 +59,11 @@ def test_hello_roundtrip() -> None:
         encoding_version=1,
         feature_schema_hash=FeatureSchemaHash.from_bytes(b"f" * 32),
         batch_capacity=4,
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=EngineIdentity.from_parts(
+            EngineId.from_bytes(b"e" * 16),
+            EngineVersion.from_bytes(b"v" * 16),
+            ActionSetHash.from_bytes(b"a" * 32),
+        ),
     )
     ack = HelloAck(1, ModelVersion.from_bytes(b"m" * 16), 7)
 

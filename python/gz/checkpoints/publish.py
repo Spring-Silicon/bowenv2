@@ -11,7 +11,7 @@ from gz.checkpoints.manifest import CheckpointManifest, ManifestError, WeightsIn
 from gz.checkpoints.source import DirectorySource
 from gz.checkpoints.weights import save_state_dict
 from gz.codec import FeatureSchemaConfig
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash, file_blake2b, model_version
+from gz.common import EngineIdentity, FeatureSchemaHash, file_blake2b, model_version
 
 
 def publish_checkpoint(
@@ -23,13 +23,12 @@ def publish_checkpoint(
     arch_config_hash: bytes,
     feature_schema: FeatureSchemaConfig,
     feature_schema_hash: FeatureSchemaHash,
-    engine_id: EngineId,
-    engine_version: EngineVersion,
-    action_set_hash: ActionSetHash,
+    engine_identity: EngineIdentity,
     training_step: int,
     run_id: str,
     checkpoint_pointers: Iterable[str] = (),
 ) -> CheckpointManifest:
+    engine_identity.require_specified()
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
 
@@ -53,9 +52,7 @@ def publish_checkpoint(
         arch_config_hash=arch_config_hash.hex(),
         feature_schema=feature_schema,
         feature_schema_hash=feature_schema_hash,
-        engine_id=engine_id,
-        engine_version=engine_version,
-        action_set_hash=action_set_hash,
+        engine_identity=engine_identity,
         training_step=training_step,
         run_id=run_id,
         weights=WeightsInfo(

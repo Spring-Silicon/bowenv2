@@ -3,7 +3,14 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from gz.common.tags import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash, ModelVersion
+from gz.common.tags import (
+    ActionSetHash,
+    EngineIdentity,
+    EngineId,
+    EngineVersion,
+    FeatureSchemaHash,
+    ModelVersion,
+)
 from gz.proto.errors import ERROR_MALFORMED, ProtocolError
 
 HELLO_LEN = 108
@@ -16,9 +23,19 @@ class Hello:
     encoding_version: int
     feature_schema_hash: FeatureSchemaHash
     batch_capacity: int
-    engine_id: EngineId
-    engine_version: EngineVersion
-    action_set_hash: ActionSetHash
+    engine_identity: EngineIdentity
+
+    @property
+    def engine_id(self) -> EngineId:
+        return self.engine_identity.engine_id
+
+    @property
+    def engine_version(self) -> EngineVersion:
+        return self.engine_identity.engine_version
+
+    @property
+    def action_set_hash(self) -> ActionSetHash:
+        return self.engine_identity.action_set_hash
 
     def encode(self) -> bytes:
         return (
@@ -35,14 +52,20 @@ class Hello:
         if len(buf) != HELLO_LEN:
             raise ProtocolError(ERROR_MALFORMED, "bad hello length")
         protocol_version, encoding_version = struct.unpack_from("<II", buf, 0)
+        try:
+            engine_identity = EngineIdentity.from_parts(
+                EngineId.from_bytes(buf[44:60]),
+                EngineVersion.from_bytes(buf[60:76]),
+                ActionSetHash.from_bytes(buf[76:108]),
+            )
+        except ValueError as error:
+            raise ProtocolError(ERROR_MALFORMED, str(error)) from error
         return cls(
             protocol_version=protocol_version,
             encoding_version=encoding_version,
             feature_schema_hash=FeatureSchemaHash.from_bytes(buf[8:40]),
             batch_capacity=struct.unpack_from("<I", buf, 40)[0],
-            engine_id=EngineId.from_bytes(buf[44:60]),
-            engine_version=EngineVersion.from_bytes(buf[60:76]),
-            action_set_hash=ActionSetHash.from_bytes(buf[76:108]),
+            engine_identity=engine_identity,
         )
 
 

@@ -2,34 +2,32 @@ from __future__ import annotations
 
 import hashlib
 import socket
-import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from gz.codec import BatchView, FeatureSchemaConfig, TargetsView
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
+from gz.common import ActionSetHash, EngineIdentity, EngineId, EngineVersion, FeatureSchemaHash
 from gz.proto import (
-    ENCODING_VERSION,
     ProtocolError,
     decode_error,
     read_frame,
     write_frame,
 )
-
-SAMPLE_PROTOCOL_VERSION = 12
-
-HELLO_ACK_FIXED_LEN = 224
-
-FRAME_HELLO = 1
-FRAME_HELLO_ACK = 2
-FRAME_SAMPLE = 3
-FRAME_SAMPLE_RESULT = 4
-FRAME_ERROR = 5
-
-
-class SampleError(RuntimeError):
-    pass
+from gz.trainer.sample_protocol import (
+    FRAME_ERROR,
+    FRAME_HELLO,
+    FRAME_HELLO_ACK,
+    FRAME_SAMPLE,
+    FRAME_SAMPLE_RESULT,
+    SAMPLE_PROTOCOL_VERSION,
+    SampleAck,
+    SampleError,
+    decode_ack,
+    encode_hello,
+    encode_sample_request,
+    split_sample_result,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,45 +35,6 @@ class SampleResult:
     batch: BatchView
     targets: TargetsView
     produced_rows: int
-
-
-@dataclass(frozen=True, slots=True)
-class SymmetricSelfplayMetrics:
-    p1_win_rate_ema: float
-    p2_win_rate_ema: float
-    draw_rate_ema: float
-    seat_advantage_ema: float
-    p1_terminal_cost_ema: float
-    p2_terminal_cost_ema: float
-    mean_terminal_cost_ema: float
-    terminal_cost_margin_ema: float
-    terminal_cost_best: float
-    p1_episode_len_ema: float
-    p2_episode_len_ema: float
-    game_len_ema: float
-    episode_len_margin_ema: float
-
-
-@dataclass(frozen=True, slots=True)
-class SampleAck:
-    feature_schema_hash: FeatureSchemaHash
-    engine_id: EngineId
-    engine_version: EngineVersion
-    action_set_hash: ActionSetHash
-    max_batch: int
-    produced_rows: int
-    episodes: int
-    episodes_stopped: int
-    episode_cost_ema: float
-    episode_len_ema: float
-    stop_rate_ema: float
-    learner_win_rate_ema: float
-    value_sign_accuracy_early_ema: float
-    value_sign_accuracy_late_ema: float
-    episode_latency_ema: float
-    best_cost: float
-    symmetric_selfplay: SymmetricSelfplayMetrics | None
-    feature_schema: FeatureSchemaConfig
 
 
 class SampleClient:
@@ -116,6 +75,10 @@ class SampleClient:
         return self._ack().action_set_hash
 
     @property
+    def engine_identity(self) -> EngineIdentity:
+        return self._ack().engine_identity
+
+    @property
     def max_batch(self) -> int:
         return self._ack().max_batch
 
@@ -142,7 +105,7 @@ class SampleClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(str(self.socket_path))
         self.sock = sock
-        write_frame(sock, FRAME_HELLO, struct.pack("<II", SAMPLE_PROTOCOL_VERSION, ENCODING_VERSION))
+        write_frame(sock, FRAME_HELLO, encode_hello())
         frame_type, payload = read_frame(sock, self.read_buf)
         if frame_type == FRAME_ERROR:
             code, message = decode_error(payload)
@@ -194,7 +157,7 @@ class SampleClient:
     def _refresh_connected(self) -> SampleAck:
         if self.sock is None:
             return self.connect()
-        write_frame(self.sock, FRAME_HELLO, struct.pack("<II", SAMPLE_PROTOCOL_VERSION, ENCODING_VERSION))
+        write_frame(self.sock, FRAME_HELLO, encode_hello())
         frame_type, payload = read_frame(self.sock, self.read_buf)
         if frame_type == FRAME_ERROR:
             code, message = decode_error(payload)
@@ -207,13 +170,11 @@ class SampleClient:
     def _sample_connected(self, batch: int, window: int, seed: int) -> SampleResult:
         if self.sock is None:
             self.connect()
-        if batch <= 0 or window <= 0:
-            raise ValueError("batch and window must be positive")
         assert self.sock is not None
         write_frame(
             self.sock,
             FRAME_SAMPLE,
-            struct.pack("<IQQ", batch, window, seed),
+            encode_sample_request(batch, window, seed),
         )
         frame_type, payload = read_frame(self.sock, self.read_buf)
         if frame_type == FRAME_ERROR:
@@ -221,15 +182,9 @@ class SampleClient:
             raise SampleError(f"sample failed: {code} {message}")
         if frame_type != FRAME_SAMPLE_RESULT:
             raise SampleError("expected SAMPLE_RESULT")
-        if len(payload) < 4:
-            raise SampleError("sample result truncated")
-        gzfb_len = struct.unpack_from("<I", payload, 0)[0]
-        start = 4
-        end = start + gzfb_len
-        if len(payload) < end:
-            raise SampleError("sample gzfb truncated")
-        batch_view = BatchView.parse(payload[start:end])
-        targets = TargetsView.parse(payload[end:])
+        batch_payload, targets_payload = split_sample_result(payload)
+        batch_view = BatchView.parse(batch_payload)
+        targets = TargetsView.parse(targets_payload)
         if batch_view.batch_capacity != targets.capacity:
             raise SampleError("sample batch/target capacity mismatch")
         if batch_view.row_count != targets.row_count:
@@ -247,82 +202,6 @@ class SampleClient:
         if self.ack is None:
             raise RuntimeError("sample client is not connected")
         return self.ack
-
-
-def decode_ack(payload: memoryview) -> SampleAck:
-    if len(payload) < HELLO_ACK_FIXED_LEN:
-        raise SampleError("sample HELLO_ACK truncated")
-    protocol_version = struct.unpack_from("<I", payload, 0)[0]
-    if protocol_version != SAMPLE_PROTOCOL_VERSION:
-        raise SampleError("sample protocol version mismatch")
-    max_batch = struct.unpack_from("<I", payload, 36)[0]
-    produced_rows = struct.unpack_from("<Q", payload, 40)[0]
-    episodes = struct.unpack_from("<Q", payload, 48)[0]
-    episodes_stopped = struct.unpack_from("<Q", payload, 56)[0]
-    cost_ema, len_ema, stop_ema, win_ema, latency_ema = struct.unpack_from(
-        "<fffff", payload, 64
-    )
-    best_cost = struct.unpack_from("<f", payload, 84)[0]
-    if any(payload[88:108]):
-        raise SampleError("sample HELLO_ACK uses retired fixed-root telemetry")
-    value_sign_early_ema, value_sign_late_ema = struct.unpack_from("<ff", payload, 108)
-    symmetric_present = struct.unpack_from("<I", payload, 116)[0]
-    if symmetric_present not in (0, 1):
-        raise SampleError("sample HELLO_ACK has invalid symmetric metrics flag")
-    symmetric_values = struct.unpack_from("<10f", payload, 120)
-    symmetric = None
-    if symmetric_present:
-        (
-            p1_win_rate_ema,
-            p2_win_rate_ema,
-            draw_rate_ema,
-            p1_terminal_cost_ema,
-            p2_terminal_cost_ema,
-            terminal_cost_margin_ema,
-            terminal_cost_best,
-            p1_episode_len_ema,
-            p2_episode_len_ema,
-            episode_len_margin_ema,
-        ) = symmetric_values
-        symmetric = SymmetricSelfplayMetrics(
-            p1_win_rate_ema=p1_win_rate_ema,
-            p2_win_rate_ema=p2_win_rate_ema,
-            draw_rate_ema=draw_rate_ema,
-            seat_advantage_ema=p1_win_rate_ema - p2_win_rate_ema,
-            p1_terminal_cost_ema=p1_terminal_cost_ema,
-            p2_terminal_cost_ema=p2_terminal_cost_ema,
-            mean_terminal_cost_ema=0.5
-            * (p1_terminal_cost_ema + p2_terminal_cost_ema),
-            terminal_cost_margin_ema=terminal_cost_margin_ema,
-            terminal_cost_best=terminal_cost_best,
-            p1_episode_len_ema=p1_episode_len_ema,
-            p2_episode_len_ema=p2_episode_len_ema,
-            game_len_ema=p1_episode_len_ema + p2_episode_len_ema,
-            episode_len_margin_ema=episode_len_margin_ema,
-        )
-    return SampleAck(
-        feature_schema_hash=FeatureSchemaHash.from_bytes(payload[4:36]),
-        engine_id=EngineId.from_bytes(payload[160:176]),
-        engine_version=EngineVersion.from_bytes(payload[176:192]),
-        action_set_hash=ActionSetHash.from_bytes(payload[192:224]),
-        max_batch=max_batch,
-        produced_rows=produced_rows,
-        episodes=episodes,
-        episodes_stopped=episodes_stopped,
-        episode_cost_ema=cost_ema,
-        episode_len_ema=len_ema,
-        stop_rate_ema=stop_ema,
-        # -1.0 = unseeded (no labeled episode yet); 0.0 is a real rate.
-        learner_win_rate_ema=win_ema,
-        value_sign_accuracy_early_ema=value_sign_early_ema,
-        value_sign_accuracy_late_ema=value_sign_late_ema,
-        # -1.0 = unseeded (no completion observed by this process yet).
-        episode_latency_ema=latency_ema,
-        best_cost=best_cost,
-        symmetric_selfplay=symmetric,
-        feature_schema=FeatureSchemaConfig.decode(payload[HELLO_ACK_FIXED_LEN:]),
-    )
-
 
 def step_seed(run_seed: int, step: int, stream: str = "") -> int:
     hasher = hashlib.blake2b(digest_size=8)

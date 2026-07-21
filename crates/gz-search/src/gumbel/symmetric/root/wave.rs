@@ -1,4 +1,20 @@
-use super::*;
+use super::super::super::GumbelPlayer;
+use super::super::super::schedule::softmax;
+use super::{
+    ActionEdge, Attach, AttachSlot, Board, Branch, BranchTarget, CandidateEntry, Descent,
+    Expansion, Node, PathStep, RootApplyReady, RootCandidate, Run, State, SymmetricRootResult,
+    SymmetricSelfplayRootTask, WaveAdvance, WaveRun, WaveSimulation, WaveSimulationState,
+    wave_target_state,
+};
+use crate::SearchCandidateSummary;
+use crate::support::internal;
+use crate::work::{
+    ApplyWork, EvalOpponentWork, EvalWork, ExpandResult, ExpandWork, SearchPoll, SearchWork,
+    SearchWorkResult, WorkToken,
+};
+use gz_engine::{ApplyResult, EngineResult, PortableCandidateRef};
+use gz_eval::{EvalAction, EvalOutput, EvalRequest, eval_error_to_engine_error};
+use std::hash::Hash;
 
 impl<G, C> SymmetricSelfplayRootTask<G, C>
 where

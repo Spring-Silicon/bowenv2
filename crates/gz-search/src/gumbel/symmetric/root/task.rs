@@ -1,4 +1,27 @@
-use super::*;
+use super::super::super::schedule::{
+    GumbelRng, budget_fraction, considered_actions, considered_visit_sequence, overlap_noise_scale,
+    root_seed, sample_root_gumbels, softmax,
+};
+use super::super::super::{
+    GumbelHandleBatch, GumbelMcts, GumbelPlayer, GumbelRootStats, GumbelStep, GumbelValueMode,
+};
+use super::{
+    ActionEdge, Board, CandidateEntry, Expansion, Node, PLAYER_SALT, Pending, RootCandidate, Run,
+    State, SymmetricRootAction, SymmetricRootResult, SymmetricSelfplayRootTask, WaveRun,
+    candidate_ref,
+};
+use crate::support::{internal, step_ref};
+use crate::work::{
+    EngineIdentity, EvalOpponentWork, EvalWork, ExpandResult, ExpandWork, SearchPoll, SearchWork,
+    SearchWorkResult, WorkToken,
+};
+use crate::{SearchAction, SearchCandidateSummary};
+use gz_engine::{EngineResult, PortableCandidateRef, PortableSearchActionRef, ReplayGraphContext};
+use gz_eval::{
+    EvalAction, EvalOutput, EvalPositionContext, EvalRequest, eval_error_to_engine_error,
+};
+use std::collections::HashSet;
+use std::hash::Hash;
 
 impl<G, C> SymmetricSelfplayRootTask<G, C>
 where

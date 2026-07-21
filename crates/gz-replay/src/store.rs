@@ -1,20 +1,18 @@
 use crate::append::{AppendSequences, EpisodeAppend, stage_episodes};
 use crate::database::{
     ensure_schema, open_db, read_data_mode, read_engine_identity, read_feature_schema,
-    read_meta_u64, recover_next_episode_seq, recover_next_row_seq, stored_engine_identity,
-    stored_feature_schema, write_meta_u64,
+    read_meta_u64, recover_next_episode_seq, recover_next_row_seq, write_meta_u64,
 };
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::{
     CF_EPISODES, CF_META, CF_ROW_INDEX, CF_ROWS, META_COMPLETED_GAMES, META_CONSUMED_ROWS,
-    META_DATA_MODE, META_DELETED_FLOOR, META_ENGINE_IDENTITY, META_EPISODES_STOPPED,
-    META_FEATURE_SCHEMA, META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_RETAINED_FLOOR,
-    META_SYMMETRIC_BEST_COST, META_SYMMETRIC_COST_MARGIN_EMA, META_SYMMETRIC_DRAW_EMA,
-    META_SYMMETRIC_GAMES, META_SYMMETRIC_LEN_MARGIN_EMA, META_SYMMETRIC_P1_COST_EMA,
-    META_SYMMETRIC_P1_LEN_EMA, META_SYMMETRIC_P1_WIN_EMA, META_SYMMETRIC_P2_COST_EMA,
-    META_SYMMETRIC_P2_LEN_EMA, META_SYMMETRIC_P2_WIN_EMA, META_TERMINAL_COST_BEST,
-    META_TERMINAL_COST_EMA, decode_episode_from_row_key, decode_step_from_row_key, encode_u64,
-    episode_key, row_index_key, row_key,
+    META_DELETED_FLOOR, META_EPISODES_STOPPED, META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS,
+    META_RETAINED_FLOOR, META_SYMMETRIC_BEST_COST, META_SYMMETRIC_COST_MARGIN_EMA,
+    META_SYMMETRIC_DRAW_EMA, META_SYMMETRIC_GAMES, META_SYMMETRIC_LEN_MARGIN_EMA,
+    META_SYMMETRIC_P1_COST_EMA, META_SYMMETRIC_P1_LEN_EMA, META_SYMMETRIC_P1_WIN_EMA,
+    META_SYMMETRIC_P2_COST_EMA, META_SYMMETRIC_P2_LEN_EMA, META_SYMMETRIC_P2_WIN_EMA,
+    META_TERMINAL_COST_BEST, META_TERMINAL_COST_EMA, decode_episode_from_row_key,
+    decode_step_from_row_key, encode_u64, episode_key, row_index_key, row_key,
 };
 use crate::records::{
     ReplayEpisodeId, ReplayEpisodeRecord, ReplayRow, StoredReplayRow, validate_episode,
@@ -23,10 +21,14 @@ use crate::records::{
 use crate::sample::{ReplayRng, SampleConfig};
 use gz_engine::EngineIdentity;
 use gz_features::{FeatureSchema, FeatureSchemaConfig};
-use rocksdb::{DB, IteratorMode, WriteBatch};
+use rocksdb::{DB, WriteBatch};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod contract;
+
+pub use contract::ReplayContract;
 
 pub struct ReplayStore {
     db: Arc<DB>,
@@ -698,77 +700,6 @@ impl ReplayStore {
         self.db.write(batch)?;
         self.retained_floor.store(new_floor, Ordering::Release);
 
-        Ok(())
-    }
-
-    pub fn ensure_feature_schema(&self, config: &FeatureSchemaConfig) -> ReplayResult<()> {
-        FeatureSchema::new(config.clone()).map_err(|_| ReplayError::InvalidRecord)?;
-
-        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
-        let Some(stored) = read_feature_schema(&self.db)? else {
-            let meta = self.cf(CF_META)?;
-            self.db
-                .put_cf(&meta, META_FEATURE_SCHEMA, stored_feature_schema(config)?)
-                .map_err(ReplayError::from)?;
-            return Ok(());
-        };
-
-        if &stored == config {
-            Ok(())
-        } else {
-            Err(ReplayError::InvalidRecord)
-        }
-    }
-
-    /// Binds the store to one engine implementation and legal action domain.
-    /// Legacy stores are migrated only after every retained episode is checked.
-    pub fn ensure_engine_identity(&self, identity: EngineIdentity) -> ReplayResult<()> {
-        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
-        let mut stored = self.engine_identity.lock().map_err(ReplayError::storage)?;
-        if let Some(current) = *stored {
-            return if current == identity {
-                Ok(())
-            } else {
-                Err(ReplayError::EngineIdentityMismatch)
-            };
-        }
-
-        let episodes = self.cf(CF_EPISODES)?;
-        for item in self.db.iterator_cf(&episodes, IteratorMode::Start) {
-            let (_, bytes) = item?;
-            let record: ReplayEpisodeRecord = postcard::from_bytes(&bytes)?;
-            validate_episode_engine_identity(&record, identity)?;
-        }
-
-        let meta = self.cf(CF_META)?;
-        self.db.put_cf(
-            &meta,
-            META_ENGINE_IDENTITY,
-            stored_engine_identity(identity),
-        )?;
-        *stored = Some(identity);
-        Ok(())
-    }
-
-    pub fn ensure_data_mode(&self, mode: ReplayDataMode) -> ReplayResult<()> {
-        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
-        let meta = self.cf(CF_META)?;
-        let encoded = mode.bytes();
-        match self.db.get_cf(&meta, META_DATA_MODE)? {
-            Some(stored) if stored.as_slice() == encoded => {}
-            Some(_) => return Err(ReplayError::DataModeMismatch),
-            None => {
-                if self.next_episode_seq.load(Ordering::Acquire) > 0
-                    && mode != ReplayDataMode::Standard
-                {
-                    return Err(ReplayError::DataModeMismatch);
-                }
-                self.db
-                    .put_cf(&meta, META_DATA_MODE, encoded)
-                    .map_err(ReplayError::from)?;
-            }
-        }
-        *self.data_mode.lock().map_err(ReplayError::storage)? = Some(mode);
         Ok(())
     }
 

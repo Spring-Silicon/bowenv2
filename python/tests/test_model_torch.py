@@ -20,7 +20,7 @@ torch = pytest.importorskip("torch")
 
 def test_arch_round_trip_and_fixed_runtime_contract() -> None:
     arch = ArchConfig(dim=16, layers=2, heads=4, ffn_dim=32, dropout=0.0)
-    assert ArchConfig.from_dict(arch.to_dict()) == arch
+    assert ArchConfig.from_manifest_dict(arch.to_manifest_dict()) == arch
     soft_policy_arch = ArchConfig(
         dim=16,
         layers=2,
@@ -29,7 +29,7 @@ def test_arch_round_trip_and_fixed_runtime_contract() -> None:
         dropout=0.0,
         auxiliary_heads="v8-v32-score-soft-policy-v2",
     )
-    assert ArchConfig.from_dict(soft_policy_arch.to_dict()) == soft_policy_arch
+    assert ArchConfig.from_manifest_dict(soft_policy_arch.to_manifest_dict()) == soft_policy_arch
     legacy_soft_policy_arch = replace(
         soft_policy_arch,
         auxiliary_heads="v8-v32-score-soft-policy",
@@ -50,10 +50,10 @@ def test_arch_round_trip_and_fixed_runtime_contract() -> None:
         ("profile", "whittlezero"),
         ("value_head", "hl-gauss"),
     ):
-        values = arch.to_dict()
+        values = arch.to_manifest_dict()
         values[field] = value
         with pytest.raises(ValueError, match=field):
-            ArchConfig.from_dict(values)
+            ArchConfig.from_manifest_dict(values)
 
 
 def test_forward_is_finite_bounded_and_split_entrypoints_match() -> None:

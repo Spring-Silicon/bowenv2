@@ -7,6 +7,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from gz.model.exphormer import build_model, initialize_policy, initialize_value
+from gz.trainer.checkpointing import (
+    checkpoint_due as _checkpoint_due,
+    permanent_checkpoint_pointers as _permanent_checkpoint_pointers,
+)
 from gz.trainer.config import (
     RunConfig,
     dataclass_from_dict,
@@ -15,20 +19,17 @@ from gz.trainer.config import (
     resolved_trainer_seeds,
 )
 from gz.trainer.data import TrainingStager
-from gz.trainer.driver import (
-    SamplePrefetcher,
-    _checkpoint_due,
-    _permanent_checkpoint_pointers,
-    _seed_model,
+from gz.trainer.processes import (
     check_child,
     check_memory,
     spawn_replay_serve,
     stop_child,
-    trainer_loop_config,
 )
 from gz.trainer.loop import TrainerLoop
-from gz.trainer.publish import EmaWeights, PublishTags, publish_ema
+from gz.trainer.publish import EmaWeights, publish_ema
+from gz.trainer.runtime import seed_model as _seed_model, trainer_loop_config
 from gz.trainer.sampler import SampleClient, step_seed
+from gz.trainer.sampling import SamplePrefetcher
 from gz.trainer.telemetry import MetricsWriter, PerfWindow, WandbRun
 
 
@@ -46,7 +47,7 @@ class DistillConfig:
 def load_distill_config(path: str | Path) -> tuple[RunConfig, DistillConfig]:
     path = Path(path)
     data = load_config_table(path)
-    run_config = load_config(path)
+    run_config = load_config(path, extension_sections=frozenset({"distill"}))
     distill = dataclass_from_dict(DistillConfig, data.get("distill", {}))
     if distill.states < 1:
         raise ValueError("distill.states must be positive")
@@ -137,11 +138,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
         initialize_value(model, "zero")
         model = model.to(config.trainer.device)
         ema = EmaWeights(model, config.trainer.ema_decay)
-        publish_tags = PublishTags(
-            engine_id=sampler.engine_id,
-            engine_version=sampler.engine_version,
-            action_set_hash=sampler.action_set_hash,
-        )
+        engine_identity = sampler.engine_identity
         first = publish_ema(
             config.paths.checkpoint_dir,
             ema,
@@ -150,7 +147,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
             arch=config.arch,
             training_step=0,
             run_id=config.paths.run_dir.name,
-            tags=publish_tags,
+            engine_identity=engine_identity,
         )
         param_norm, _ = ema.norms(None)
         published_snapshot = ema.state_dict()
@@ -196,7 +193,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
                 arch=config.arch,
                 training_step=training_step,
                 run_id=config.paths.run_dir.name,
-                tags=publish_tags,
+                engine_identity=engine_identity,
                 checkpoint_pointers=_permanent_checkpoint_pointers(
                     config.trainer,
                     training_step,

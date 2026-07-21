@@ -7,7 +7,9 @@ use gz_engine_whittle::{
     WhittleGraphGenerator, WhittleGraphGeneratorConfig, WhittleRoot,
 };
 use gz_features::{FeatureExtractor, PositionFeatures, encode_feature_row};
-use gz_replay::{ReplayDataMode, ReplayEpisodeRecord, ReplayOutcome, ReplayRow, ReplayStore};
+use gz_replay::{
+    ReplayContract, ReplayDataMode, ReplayEpisodeRecord, ReplayOutcome, ReplayRow, ReplayStore,
+};
 use gz_search::reducing_uniform_distill_config_hash;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -159,16 +161,14 @@ pub fn generate(config: DistillGenerateConfig) -> Result<DistillGenerateSummary,
     if store.counters().produced_rows != 0 || store.episode_counters().0 != 0 {
         return Err("distillation replay directory is not empty".to_owned());
     }
-    store
-        .ensure_data_mode(ReplayDataMode::Standard)
-        .map_err(|error| error.to_string())?;
     let initial = worker_state(&config)?;
     let schema = initial.extractor.schema().config().clone();
     store
-        .ensure_feature_schema(&schema)
-        .map_err(|error| error.to_string())?;
-    store
-        .ensure_engine_identity(EngineIdentity::from_engine(&initial.engine))
+        .ensure_contract(&ReplayContract::featurized(
+            ReplayDataMode::Standard,
+            schema,
+            EngineIdentity::from_engine(&initial.engine),
+        ))
         .map_err(|error| error.to_string())?;
 
     let started = Instant::now();

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 from gz.checkpoints import CheckpointManifest, publish_checkpoint
 from gz.codec import FeatureSchemaConfig
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
+from gz.common import EngineIdentity, FeatureSchemaHash
 from gz.model.exphormer import ArchConfig
 
 
@@ -64,21 +63,6 @@ class EmaWeights:
             return param_sq**0.5, delta_sq**0.5
 
 
-@dataclass(frozen=True, slots=True)
-class PublishTags:
-    engine_id: EngineId
-    engine_version: EngineVersion
-    action_set_hash: ActionSetHash
-
-    @classmethod
-    def zeros(cls) -> PublishTags:
-        return cls(
-            engine_id=EngineId.from_bytes(b"\x00" * 16),
-            engine_version=EngineVersion.from_bytes(b"\x00" * 16),
-            action_set_hash=ActionSetHash.from_bytes(b"\x00" * 32),
-        )
-
-
 def publish_ema(
     checkpoint_dir: str | Path,
     ema: EmaWeights,
@@ -88,22 +72,19 @@ def publish_ema(
     arch: ArchConfig,
     training_step: int,
     run_id: str,
-    tags: PublishTags | None = None,
+    engine_identity: EngineIdentity,
     checkpoint_pointers: tuple[str, ...] = (),
 ) -> CheckpointManifest:
     ema.assert_finite()
-    tags = tags or PublishTags.zeros()
     return publish_checkpoint(
         checkpoint_dir,
         ema.state_dict(),
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=schema_hash,
-        engine_id=tags.engine_id,
-        engine_version=tags.engine_version,
-        action_set_hash=tags.action_set_hash,
+        engine_identity=engine_identity,
         training_step=training_step,
         run_id=run_id,
         checkpoint_pointers=checkpoint_pointers,

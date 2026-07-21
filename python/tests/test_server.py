@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
+from gz.common import ActionSetHash, EngineIdentity, EngineId, EngineVersion, FeatureSchemaHash
 from gz.codec import BatchView
 from gz.evaluator import StubBackend, serve
 from gz.model.stub import STUB_MODEL_VERSION, stub
@@ -189,9 +189,11 @@ def make_hello(
         encoding_version=encoding_version,
         feature_schema_hash=FeatureSchemaHash.from_bytes(schema_hash),
         batch_capacity=batch_capacity,
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=EngineIdentity.from_parts(
+            EngineId.from_bytes(b"e" * 16),
+            EngineVersion.from_bytes(b"v" * 16),
+            ActionSetHash.from_bytes(b"a" * 32),
+        ),
     )
 
 

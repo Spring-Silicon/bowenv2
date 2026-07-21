@@ -8,7 +8,7 @@ import pytest
 
 from gz.checkpoints import DirectorySource, publish_checkpoint
 from gz.codec import BatchView, FeatureSchemaConfig
-from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
+from gz.common import ActionSetHash, EngineIdentity, EngineId, EngineVersion, FeatureSchemaHash
 from gz.evaluator import TorchBackend
 from gz.evaluator.backends import PIPELINE_DEPTH
 from gz.model.exphormer import ArchConfig, build_model
@@ -54,9 +54,11 @@ def test_backend_rejects_wrong_engine_identity(tmp_path: Path) -> None:
         encoding_version=hello.encoding_version,
         feature_schema_hash=hello.feature_schema_hash,
         batch_capacity=hello.batch_capacity,
-        engine_id=EngineId.from_bytes(b"x" * 16),
-        engine_version=hello.engine_version,
-        action_set_hash=hello.action_set_hash,
+        engine_identity=EngineIdentity.from_parts(
+            EngineId.from_bytes(b"x" * 16),
+            hello.engine_version,
+            hello.action_set_hash,
+        ),
     )
 
     with pytest.raises(ProtocolError, match="engine identity mismatch"):
@@ -230,13 +232,15 @@ def publish_random_checkpoint(
         root,
         model.state_dict(),
         arch_name=arch.name,
-        arch_config=arch.to_dict(),
+        arch_config=arch.to_manifest_dict(),
         arch_config_hash=arch.hash(),
         feature_schema=schema,
         feature_schema_hash=feature_schema_hash or view.feature_schema_hash,
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=action_set_hash or ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=EngineIdentity.from_parts(
+            EngineId.from_bytes(b"e" * 16),
+            EngineVersion.from_bytes(b"v" * 16),
+            action_set_hash or ActionSetHash.from_bytes(b"a" * 32),
+        ),
         training_step=0,
         run_id="run",
     )
@@ -248,9 +252,11 @@ def make_hello(view: BatchView, schema_hash: FeatureSchemaHash) -> Hello:
         encoding_version=BATCH_ENCODING_VERSION,
         feature_schema_hash=schema_hash,
         batch_capacity=view.batch_capacity,
-        engine_id=EngineId.from_bytes(b"e" * 16),
-        engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        engine_identity=EngineIdentity.from_parts(
+            EngineId.from_bytes(b"e" * 16),
+            EngineVersion.from_bytes(b"v" * 16),
+            ActionSetHash.from_bytes(b"a" * 32),
+        ),
     )
 
 

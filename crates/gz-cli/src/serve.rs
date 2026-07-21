@@ -1,31 +1,19 @@
+use crate::sample_protocol::{
+    ERROR_BAD_REQUEST, ERROR_EMPTY_STORE, ERROR_ENCODING, ERROR_MISSING_FEATURES, ERROR_PROTOCOL,
+    FRAME_HELLO, FRAME_SAMPLE, FRAME_SAMPLE_RESULT, HelloAck, SampleRequest, read_frame,
+    send_error, validate_hello, write_frame,
+};
+pub use crate::sample_protocol::{HELLO_ACK_FIXED_LEN, SAMPLE_PROTOCOL_VERSION};
 use gz_engine::EngineIdentity;
 use gz_features::{
-    ENCODING_VERSION, FeatureCollator, FeatureRow, FeatureSchema, RowTargets, decode_feature_row,
+    FeatureCollator, FeatureRow, FeatureSchema, RowTargets, decode_feature_row,
     encode_feature_schema_config, encode_training_targets, validate_feature_row_header,
 };
 use gz_replay::{ReplayError, ReplayStore, SampleConfig};
-use std::io::{ErrorKind, Read, Write};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
-
-pub const SAMPLE_PROTOCOL_VERSION: u32 = 12;
-
-const HELLO_ACK_FIXED_LEN: usize = 224;
-
-const MAX_FRAME: usize = 256 * 1024 * 1024;
-const FRAME_HELLO: u8 = 1;
-const FRAME_HELLO_ACK: u8 = 2;
-const FRAME_SAMPLE: u8 = 3;
-const FRAME_SAMPLE_RESULT: u8 = 4;
-const FRAME_ERROR: u8 = 5;
-
-const ERROR_PROTOCOL: u32 = 1;
-const ERROR_ENCODING: u32 = 2;
-const ERROR_EMPTY_STORE: u32 = 3;
-const ERROR_BAD_REQUEST: u32 = 4;
-const ERROR_MISSING_FEATURES: u32 = 5;
 
 #[derive(Clone, Debug)]
 pub struct ReplayServeConfig {
@@ -238,17 +226,7 @@ impl ReplaySampleSession {
         stream: &mut UnixStream,
         write_buf: &mut Vec<u8>,
     ) -> Result<(), (u32, &'static str)> {
-        if payload.len() != 8 {
-            return Err((ERROR_PROTOCOL, "bad HELLO length"));
-        }
-        let protocol_version = u32::from_le_bytes(payload[0..4].try_into().expect("len checked"));
-        let encoding_version = u32::from_le_bytes(payload[4..8].try_into().expect("len checked"));
-        if protocol_version != SAMPLE_PROTOCOL_VERSION {
-            return Err((ERROR_PROTOCOL, "protocol version mismatch"));
-        }
-        if encoding_version != ENCODING_VERSION {
-            return Err((ERROR_ENCODING, "encoding version mismatch"));
-        }
+        validate_hello(payload)?;
 
         let mut schema_config = Vec::new();
         encode_feature_schema_config(self.collator.schema().config(), &mut schema_config)
@@ -265,52 +243,44 @@ impl ReplaySampleSession {
         let best_cost = self.store.best_cost().unwrap_or(0.0);
         let symmetric = self.store.symmetric_selfplay_metrics();
         let counters = self.store.counters();
-        let mut payload = Vec::with_capacity(HELLO_ACK_FIXED_LEN + schema_config.len());
-        payload.extend_from_slice(&SAMPLE_PROTOCOL_VERSION.to_le_bytes());
-        payload.extend_from_slice(self.collator.schema().hash().as_bytes());
-        payload.extend_from_slice(&(self.max_batch.get() as u32).to_le_bytes());
-        payload.extend_from_slice(&counters.produced_rows.to_le_bytes());
-        payload.extend_from_slice(&episodes.to_le_bytes());
-        payload.extend_from_slice(&episodes_stopped.to_le_bytes());
-        payload.extend_from_slice(&(cost_ema as f32).to_le_bytes());
-        payload.extend_from_slice(&(len_ema as f32).to_le_bytes());
-        payload.extend_from_slice(&(stop_ema as f32).to_le_bytes());
-        payload.extend_from_slice(&(win_ema as f32).to_le_bytes());
-        payload.extend_from_slice(&(latency_ema as f32).to_le_bytes());
-        payload.extend_from_slice(&(best_cost as f32).to_le_bytes());
-        // Reserved fixed-root telemetry slots. Generated-root training always
-        // reports absent while preserving the sample-protocol layout.
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&0_f32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&(value_sign_early_ema as f32).to_le_bytes());
-        payload.extend_from_slice(&(value_sign_late_ema as f32).to_le_bytes());
-        payload.extend_from_slice(&u32::from(symmetric.is_some()).to_le_bytes());
-        let symmetric = symmetric.map_or([0.0; 10], |metrics| {
+        let symmetric_metrics = symmetric.map(|metrics| {
             [
-                metrics.p1_win_rate_ema,
-                metrics.p2_win_rate_ema,
-                metrics.draw_rate_ema,
-                metrics.p1_terminal_cost_ema,
-                metrics.p2_terminal_cost_ema,
-                metrics.terminal_cost_margin_ema,
-                metrics.terminal_cost_best,
-                metrics.p1_episode_len_ema,
-                metrics.p2_episode_len_ema,
-                metrics.episode_len_margin_ema,
+                metrics.p1_win_rate_ema as f32,
+                metrics.p2_win_rate_ema as f32,
+                metrics.draw_rate_ema as f32,
+                metrics.p1_terminal_cost_ema as f32,
+                metrics.p2_terminal_cost_ema as f32,
+                metrics.terminal_cost_margin_ema as f32,
+                metrics.terminal_cost_best as f32,
+                metrics.p1_episode_len_ema as f32,
+                metrics.p2_episode_len_ema as f32,
+                metrics.episode_len_margin_ema as f32,
             ]
         });
-        for value in symmetric {
-            payload.extend_from_slice(&(value as f32).to_le_bytes());
-        }
-        payload.extend_from_slice(self.engine_identity.engine_id.as_bytes());
-        payload.extend_from_slice(self.engine_identity.engine_version.as_bytes());
-        payload.extend_from_slice(self.engine_identity.action_set_hash.as_bytes());
-        payload.extend_from_slice(&schema_config);
-        write_frame(stream, write_buf, FRAME_HELLO_ACK, &[&payload])
-            .map_err(|_| (ERROR_PROTOCOL, "failed to write HELLO_ACK"))
+        let ack = HelloAck {
+            feature_schema_hash: self.collator.schema().hash(),
+            max_batch: self.max_batch,
+            produced_rows: counters.produced_rows,
+            episodes,
+            episodes_stopped,
+            outcome_emas: [cost_ema as f32, len_ema as f32, stop_ema as f32],
+            learner_win_rate_ema: win_ema as f32,
+            episode_latency_ema: latency_ema as f32,
+            best_cost: best_cost as f32,
+            value_sign_accuracy_emas: [value_sign_early_ema as f32, value_sign_late_ema as f32],
+            symmetric_metrics,
+            engine_identity: self.engine_identity,
+            feature_schema: &schema_config,
+        };
+        let mut ack_payload = Vec::new();
+        ack.encode_into(&mut ack_payload);
+        write_frame(
+            stream,
+            write_buf,
+            crate::sample_protocol::FRAME_HELLO_ACK,
+            &[&ack_payload],
+        )
+        .map_err(|_| (ERROR_PROTOCOL, "failed to write HELLO_ACK"))
     }
 
     fn handle_sample(
@@ -319,22 +289,14 @@ impl ReplaySampleSession {
         batch_buf: &mut Vec<u8>,
         target_buf: &mut Vec<u8>,
     ) -> Result<(), (u32, &'static str)> {
-        if payload.len() != 20 {
-            return Err((ERROR_PROTOCOL, "bad SAMPLE length"));
-        }
-        let batch = u32::from_le_bytes(payload[0..4].try_into().expect("len checked")) as usize;
-        let window = u64::from_le_bytes(payload[4..12].try_into().expect("len checked"));
-        let seed = u64::from_le_bytes(payload[12..20].try_into().expect("len checked"));
-        if batch == 0 || batch > self.max_batch.get() || window == 0 {
-            return Err((ERROR_BAD_REQUEST, "invalid SAMPLE request"));
-        }
+        let request = SampleRequest::decode(payload, self.max_batch)?;
 
         let rows = self
             .store
             .sample_rows(SampleConfig {
-                batch: NonZeroUsize::new(batch).expect("batch checked"),
-                window_rows: NonZeroU64::new(window).expect("window checked"),
-                seed,
+                batch: request.batch,
+                window_rows: request.window_rows,
+                seed: request.seed,
             })
             .map_err(sample_error)?;
         let mut feature_rows = Vec::<FeatureRow>::with_capacity(rows.len());
@@ -381,84 +343,5 @@ fn sample_error(error: ReplayError) -> (u32, &'static str) {
         ReplayError::Empty => (ERROR_EMPTY_STORE, "replay store is empty"),
         ReplayError::DataModeMismatch => (ERROR_BAD_REQUEST, "replay data mode mismatch"),
         _ => (ERROR_BAD_REQUEST, "sampling failed"),
-    }
-}
-
-fn read_frame<'a>(
-    stream: &mut UnixStream,
-    buf: &'a mut Vec<u8>,
-) -> std::io::Result<Option<(u8, &'a [u8])>> {
-    let mut len = [0u8; 4];
-    match stream.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    let body_len = u32::from_le_bytes(len) as usize;
-    if body_len == 0 || body_len > MAX_FRAME {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "bad frame size",
-        ));
-    }
-
-    if buf.len() < body_len {
-        buf.resize(body_len, 0);
-    }
-    stream.read_exact(&mut buf[..body_len])?;
-    Ok(Some((buf[0], &buf[1..body_len])))
-}
-
-fn write_frame(
-    stream: &mut UnixStream,
-    buf: &mut Vec<u8>,
-    frame_type: u8,
-    parts: &[&[u8]],
-) -> std::io::Result<()> {
-    let body_len = parts
-        .iter()
-        .try_fold(1usize, |total, part| total.checked_add(part.len()))
-        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "frame length overflow"))?;
-    if body_len > MAX_FRAME {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "frame exceeds maximum size",
-        ));
-    }
-    let frame_len = 4 + body_len;
-    if buf.len() < frame_len {
-        buf.resize(frame_len, 0);
-    }
-    buf[0..4].copy_from_slice(&(body_len as u32).to_le_bytes());
-    buf[4] = frame_type;
-    let mut cursor = 5;
-    for part in parts {
-        let end = cursor + part.len();
-        buf[cursor..end].copy_from_slice(part);
-        cursor = end;
-    }
-    stream.write_all(&buf[..frame_len])
-}
-
-fn send_error(
-    stream: &mut UnixStream,
-    write_buf: &mut Vec<u8>,
-    code: u32,
-    message: &'static str,
-) -> Result<(), String> {
-    let message = truncate_message(message);
-    let mut payload = Vec::with_capacity(6 + message.len());
-    payload.extend_from_slice(&code.to_le_bytes());
-    payload.extend_from_slice(&(message.len() as u16).to_le_bytes());
-    payload.extend_from_slice(message.as_bytes());
-    write_frame(stream, write_buf, FRAME_ERROR, &[&payload]).map_err(|error| error.to_string())
-}
-
-fn truncate_message(message: &'static str) -> &'static str {
-    const MAX: usize = 512;
-    if message.len() <= MAX {
-        message
-    } else {
-        &message[..MAX]
     }
 }

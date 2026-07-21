@@ -1,26 +1,15 @@
-use super::super::schedule::{
-    GumbelRng, budget_fraction, considered_actions, considered_visit_sequence, overlap_noise_scale,
-    root_seed, sample_root_gumbels, softmax,
-};
 use super::super::{
-    GumbelHandleBatch, GumbelMcts, GumbelMctsConfig, GumbelPlayer, GumbelRootStats, GumbelStep,
-    GumbelValueMode,
+    GumbelHandleBatch, GumbelMctsConfig, GumbelPlayer, GumbelRootStats, GumbelStep,
 };
-use crate::support::{internal, step_ref};
-use crate::work::{
-    ApplyWork, EngineIdentity, EvalOpponentWork, EvalWork, ExpandResult, ExpandWork, SearchPoll,
-    SearchWork, SearchWorkResult, WorkToken,
-};
-use crate::{SearchAction, SearchCandidateSummary};
+use crate::SearchCandidateSummary;
+use crate::support::internal;
+use crate::work::{EngineIdentity, SearchWork, WorkToken};
 use gz_engine::{
     ApplyResult, CandidateHash, EngineResult, PortableCandidateRef, PortableSearchActionRef,
     ReplayGraphContext,
 };
-use gz_eval::{
-    EvalAction, EvalOutput, EvalPositionContext, EvalRequest, eval_error_to_engine_error,
-};
+use gz_eval::{EvalAction, EvalOutput, EvalRequest};
 use std::collections::HashSet;
-use std::hash::Hash;
 
 mod reuse;
 mod task;

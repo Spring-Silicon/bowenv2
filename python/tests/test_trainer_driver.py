@@ -7,20 +7,21 @@ from types import SimpleNamespace
 import pytest
 
 from gz.common import FeatureSchemaHash
+from gz.trainer.checkpointing import (
+    checkpoint_due as _checkpoint_due,
+    permanent_checkpoint_pointers as _permanent_checkpoint_pointers,
+    resolve_actor_checkpoint as _resolve_actor_checkpoint,
+)
 from gz.trainer.config import TrainerConfig, load_config, resolved_trainer_seeds
-from gz.trainer.driver import (
+from gz.trainer.processes import init_replay, spawn_torch_selfplay
+from gz.trainer.runtime import trainer_loop_config
+from gz.trainer.sampling import (
     SamplePrefetcher,
-    _checkpoint_due,
-    _cumulative_reuse,
-    _permanent_checkpoint_pointers,
-    _required_episodes,
-    _required_produced_rows,
-    _resolve_actor_checkpoint,
-    _sample_training_batches,
-    _sample_window_rows,
-    init_replay,
-    spawn_torch_selfplay,
-    trainer_loop_config,
+    cumulative_reuse as _cumulative_reuse,
+    required_episodes as _required_episodes,
+    required_produced_rows as _required_produced_rows,
+    sample_training_batches as _sample_training_batches,
+    sample_window_rows as _sample_window_rows,
 )
 from gz.trainer.telemetry import WandbRun, symmetric_step_fields
 
@@ -76,7 +77,7 @@ def test_actor_checkpoint_must_match_learner_schema(
         def resolve_latest(self) -> object:
             return resolved
 
-    monkeypatch.setattr("gz.trainer.driver.DirectorySource", FakeSource)
+    monkeypatch.setattr("gz.trainer.checkpointing.DirectorySource", FakeSource)
     config = SimpleNamespace(
         paths=SimpleNamespace(actor_checkpoint_dir=tmp_path),
         selfplay=SimpleNamespace(actor_checkpoint_pointer="step_50000.json"),
@@ -194,6 +195,22 @@ graphzero_bin = "graphzero"
     )
     with pytest.raises(ValueError, match="unknown config fields"):
         load_config(unknown)
+
+    unknown_section = write_config(
+        tmp_path,
+        '[trainre]\nbatch = 999\n',
+        name="unknown-section.toml",
+    )
+    with pytest.raises(ValueError, match="unknown config sections.*trainre"):
+        load_config(unknown_section)
+
+    unknown_path = write_config(
+        tmp_path,
+        '[paths]\nreplay_dri = "misspelled"\n',
+        name="unknown-path.toml",
+    )
+    with pytest.raises(ValueError, match="unknown config fields for PathsConfig"):
+        load_config(unknown_path)
 
     unsupported = unknown.read_text(encoding="utf-8").replace(
         "[trainer]\nnot_a_setting = 1", '[arch]\ntrunk = "sage"'
@@ -389,8 +406,8 @@ graphzero_bin = "graphzero-test"
         calls.append((command, kwargs))
         return SimpleNamespace()
 
-    monkeypatch.setattr("gz.trainer.driver.subprocess.run", run)
-    monkeypatch.setattr("gz.trainer.driver.subprocess.Popen", run)
+    monkeypatch.setattr("gz.trainer.processes.subprocess.run", run)
+    monkeypatch.setattr("gz.trainer.processes.subprocess.Popen", run)
     init_replay(config)
     spawn_torch_selfplay(config)
 

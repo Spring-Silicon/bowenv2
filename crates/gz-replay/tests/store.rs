@@ -4,7 +4,9 @@ use common::{
     engine_identity, episode_with_feature_rows, episode_with_rows, feature_schema_config, measure,
 };
 use gz_engine::{ActionSetHash, EngineIdentity};
-use gz_replay::{ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig};
+use gz_replay::{
+    ReplayContract, ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig,
+};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 
 #[test]
@@ -14,7 +16,12 @@ fn engine_identity_persists_and_rejects_mismatches() {
     let identity = engine_identity();
 
     assert_eq!(store.engine_identity().unwrap(), None);
-    store.ensure_engine_identity(identity).unwrap();
+    store
+        .ensure_contract(&ReplayContract::unfeaturized(
+            ReplayDataMode::Standard,
+            identity,
+        ))
+        .unwrap();
     assert_eq!(store.engine_identity().unwrap(), Some(identity));
 
     let mismatched = EngineIdentity {
@@ -22,7 +29,12 @@ fn engine_identity_persists_and_rejects_mismatches() {
         ..identity
     };
     assert_eq!(
-        store.ensure_engine_identity(mismatched).unwrap_err(),
+        store
+            .ensure_contract(&ReplayContract::unfeaturized(
+                ReplayDataMode::Standard,
+                mismatched,
+            ))
+            .unwrap_err(),
         ReplayError::EngineIdentityMismatch
     );
 
@@ -48,12 +60,41 @@ fn engine_identity_migration_checks_existing_episodes() {
         ..engine_identity()
     };
     assert_eq!(
-        store.ensure_engine_identity(mismatched).unwrap_err(),
+        store
+            .ensure_contract(&ReplayContract::unfeaturized(
+                ReplayDataMode::Standard,
+                mismatched,
+            ))
+            .unwrap_err(),
         ReplayError::EngineIdentityMismatch
     );
     assert_eq!(store.engine_identity().unwrap(), None);
 
-    store.ensure_engine_identity(engine_identity()).unwrap();
+    bind_unfeaturized(&store, ReplayDataMode::Standard);
+    assert_eq!(store.engine_identity().unwrap(), Some(engine_identity()));
+}
+
+#[test]
+fn replay_contract_failure_does_not_partially_bind_metadata() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    bind_unfeaturized(&store, ReplayDataMode::Standard);
+    let mismatched = EngineIdentity {
+        action_set_hash: ActionSetHash::from_bytes([99; 32]),
+        ..engine_identity()
+    };
+
+    assert_eq!(
+        store
+            .ensure_contract(&ReplayContract::featurized(
+                ReplayDataMode::Standard,
+                feature_schema_config(),
+                mismatched,
+            ))
+            .unwrap_err(),
+        ReplayError::EngineIdentityMismatch
+    );
+    assert_eq!(store.feature_schema().unwrap(), None);
     assert_eq!(store.engine_identity().unwrap(), Some(engine_identity()));
 }
 
@@ -100,9 +141,7 @@ fn episode_pair_is_atomic_and_counts_as_one_game() {
 fn symmetric_metrics_track_both_seats_and_survive_reopen() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
-        .unwrap();
+    bind_unfeaturized(&store, ReplayDataMode::SymmetricSelfplay);
     assert_eq!(store.symmetric_selfplay_metrics(), None);
 
     let p1_win = symmetric_episode(2, -4.0, 1.0);
@@ -200,20 +239,24 @@ fn replay_data_mode_prevents_standard_and_symmetric_mixing() {
     legacy.append_episode(&record, &rows).unwrap();
     assert_eq!(
         legacy
-            .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
+            .ensure_contract(&ReplayContract::unfeaturized(
+                ReplayDataMode::SymmetricSelfplay,
+                engine_identity(),
+            ))
             .unwrap_err(),
         ReplayError::DataModeMismatch
     );
-    legacy.ensure_data_mode(ReplayDataMode::Standard).unwrap();
+    bind_unfeaturized(&legacy, ReplayDataMode::Standard);
 
     let symmetric_dir = common::temp_dir();
     let symmetric = ReplayStore::open(symmetric_dir.path()).unwrap();
-    symmetric
-        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
-        .unwrap();
+    bind_unfeaturized(&symmetric, ReplayDataMode::SymmetricSelfplay);
     assert_eq!(
         symmetric
-            .ensure_data_mode(ReplayDataMode::SymmetricSelfplayStop)
+            .ensure_contract(&ReplayContract::unfeaturized(
+                ReplayDataMode::SymmetricSelfplayStop,
+                engine_identity(),
+            ))
             .unwrap_err(),
         ReplayError::DataModeMismatch
     );
@@ -293,9 +336,7 @@ fn admission_rejects_invalid_row_shapes() {
 fn symmetric_value_target_validation_accepts_only_minus_one_zero_or_one() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
-        .unwrap();
+    bind_unfeaturized(&store, ReplayDataMode::SymmetricSelfplay);
     let draw = symmetric_episode(1, -5.0, 0.0);
     store
         .append_episode_pair((&draw.0, &draw.1), (&draw.0, &draw.1))
@@ -382,8 +423,8 @@ fn feature_schema_is_idempotent_and_survives_reopen() {
     {
         let store = ReplayStore::open(dir.path()).unwrap();
         assert_eq!(store.feature_schema().unwrap(), None);
-        store.ensure_feature_schema(&config).unwrap();
-        store.ensure_feature_schema(&config).unwrap();
+        bind_featurized(&store, &config);
+        bind_featurized(&store, &config);
         assert_eq!(store.feature_schema().unwrap(), Some(config.clone()));
     }
 
@@ -396,19 +437,31 @@ fn feature_schema_mismatch_is_rejected() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
     let config = feature_schema_config();
-    store.ensure_feature_schema(&config).unwrap();
+    bind_featurized(&store, &config);
 
     let mut other = config;
     other.max_nodes += 1;
     assert_eq!(
-        store.ensure_feature_schema(&other).unwrap_err(),
+        store
+            .ensure_contract(&ReplayContract::featurized(
+                ReplayDataMode::Standard,
+                other,
+                engine_identity(),
+            ))
+            .unwrap_err(),
         ReplayError::InvalidRecord
     );
 
     let mut other = feature_schema_config();
     other.expander_seed = 9;
     assert_eq!(
-        store.ensure_feature_schema(&other).unwrap_err(),
+        store
+            .ensure_contract(&ReplayContract::featurized(
+                ReplayDataMode::Standard,
+                other,
+                engine_identity(),
+            ))
+            .unwrap_err(),
         ReplayError::InvalidRecord
     );
 }
@@ -417,9 +470,7 @@ fn feature_schema_mismatch_is_rejected() {
 fn append_roundtrips_rows_with_feature_payloads() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_feature_schema(&feature_schema_config())
-        .unwrap();
+    bind_featurized(&store, &feature_schema_config());
     let (record, rows) = episode_with_feature_rows(2);
 
     let id = store.append_episode(&record, &rows).unwrap();
@@ -446,9 +497,7 @@ fn featured_rows_require_configured_schema_and_matching_header() {
         ReplayError::InvalidRecord
     );
 
-    store
-        .ensure_feature_schema(&feature_schema_config())
-        .unwrap();
+    bind_featurized(&store, &feature_schema_config());
     let (record, mut rows) = episode_with_feature_rows(1);
     rows[0].feature_row.as_mut().unwrap()[8] ^= 0xff;
 
@@ -462,9 +511,7 @@ fn featured_rows_require_configured_schema_and_matching_header() {
 fn mixed_feature_and_featureless_rows_are_rejected() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_feature_schema(&feature_schema_config())
-        .unwrap();
+    bind_featurized(&store, &feature_schema_config());
     let (record, mut rows) = episode_with_feature_rows(2);
     rows[1].feature_row = None;
 
@@ -532,9 +579,7 @@ fn raw_db(path: &std::path::Path) -> DB {
 fn retention_deletes_old_episodes_and_clamps_sampling() {
     let dir = common::temp_dir();
     let store = ReplayStore::open_with_retention(dir.path(), Some(20)).unwrap();
-    store
-        .ensure_feature_schema(&feature_schema_config())
-        .unwrap();
+    bind_featurized(&store, &feature_schema_config());
 
     // 4-row episodes; retention 20 rows triggers past 25 produced.
     for episode in 0..20 {
@@ -583,9 +628,7 @@ fn retention_deletes_old_episodes_and_clamps_sampling() {
 fn outcome_emas_track_recent_episodes() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_feature_schema(&feature_schema_config())
-        .unwrap();
+    bind_featurized(&store, &feature_schema_config());
     assert!(store.outcome_emas().is_none());
 
     let (record, rows) = episode_with_feature_rows(2);
@@ -660,9 +703,7 @@ fn win_rate_ema_distinguishes_all_loss_from_unseeded() {
     let dir = common::temp_dir();
     let store = ReplayStore::open(dir.path()).unwrap();
     assert!(store.win_rate_ema().is_none());
-    store
-        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
-        .unwrap();
+    bind_unfeaturized(&store, ReplayDataMode::SymmetricSelfplay);
 
     // A labeled loss seeds an honest 0.0 rate, distinct from unseeded.
     let loss = symmetric_episode(1, -6.0, -1.0);
@@ -692,6 +733,22 @@ fn value_sign_accuracy_ema_distinguishes_zero_from_unseeded() {
     let (early, late) = store.value_sign_accuracy_emas();
     assert!((early.unwrap() - 0.01).abs() < 1e-9);
     assert!((late.unwrap() - 0.5).abs() < 1e-9);
+}
+
+fn bind_unfeaturized(store: &ReplayStore, mode: ReplayDataMode) {
+    store
+        .ensure_contract(&ReplayContract::unfeaturized(mode, engine_identity()))
+        .unwrap();
+}
+
+fn bind_featurized(store: &ReplayStore, schema: &gz_features::FeatureSchemaConfig) {
+    store
+        .ensure_contract(&ReplayContract::featurized(
+            ReplayDataMode::Standard,
+            schema.clone(),
+            engine_identity(),
+        ))
+        .unwrap();
 }
 
 fn symmetric_episode(

@@ -11,7 +11,7 @@ from threading import Event
 
 from gz.codec import BatchView
 from gz.codec.batch import EncodingError
-from gz.common.tags import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash, ModelVersion
+from gz.common.tags import FeatureSchemaHash, ModelVersion
 from gz.evaluator.backends import StubBackend
 from gz.proto import (
     BATCH_ENCODING_VERSION,
@@ -42,9 +42,6 @@ from gz.proto import (
 class _ConnectionState:
     feature_schema_hash: FeatureSchemaHash
     batch_capacity: int
-    engine_id: EngineId
-    engine_version: EngineVersion
-    action_set_hash: ActionSetHash
 
 
 PIPELINE_DEPTH = 3
@@ -151,9 +148,6 @@ def _handshake(
     return _ConnectionState(
         feature_schema_hash=hello.feature_schema_hash,
         batch_capacity=hello.batch_capacity,
-        engine_id=hello.engine_id,
-        engine_version=hello.engine_version,
-        action_set_hash=hello.action_set_hash,
     )
 
 

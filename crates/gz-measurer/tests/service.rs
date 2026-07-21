@@ -1,13 +1,13 @@
 use gz_engine::{
-    ActionSetHash, CandidateHash, EngineId, EngineVersion, GraphHash, MeasureConfigHash,
-    MeasureSummary, ModelVersion, PortableCandidateRef, PortableGraphId, PortableSearchActionRef,
-    ReplayGraphContext, SearchConfigHash,
+    ActionSetHash, CandidateHash, EngineId, EngineIdentity, EngineVersion, GraphHash,
+    MeasureConfigHash, MeasureSummary, ModelVersion, PortableCandidateRef, PortableGraphId,
+    PortableSearchActionRef, ReplayGraphContext, SearchConfigHash,
 };
 use gz_measurer::{
     CompletedEpisodeArtifact, CompletedEpisodeStep, MeasuredSymmetricGame, MeasurerAdmissionStatus,
     MeasurerError, ReplayMeasurer, horizon_value_targets, project_episode,
 };
-use gz_replay::{ReplayDataMode, ReplayEpisodeId, ReplayStore};
+use gz_replay::{ReplayContract, ReplayDataMode, ReplayEpisodeId, ReplayStore};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,9 +41,7 @@ impl Drop for TestDir {
 fn symmetric_game_uses_reward_then_length_and_preserves_draws() {
     let dir = TestDir::new();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
-        .unwrap();
+    bind_store(&store, ReplayDataMode::SymmetricSelfplay);
     let mut measurer = ReplayMeasurer::new(&store);
 
     let admission = measurer
@@ -82,9 +80,7 @@ fn symmetric_game_uses_reward_then_length_and_preserves_draws() {
 fn unmeasured_game_is_dropped_without_replay_rows() {
     let dir = TestDir::new();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_data_mode(ReplayDataMode::SymmetricSelfplay)
-        .unwrap();
+    bind_store(&store, ReplayDataMode::SymmetricSelfplay);
     let mut p1 = artifact(1, -4.0, 1, false, version(1));
     p1.final_measure.measured = false;
     p1.final_measure.scalar_reward = None;
@@ -112,9 +108,7 @@ fn unmeasured_game_is_dropped_without_replay_rows() {
 fn stop_is_not_counted_as_a_length_tiebreak_rewrite() {
     let dir = TestDir::new();
     let store = ReplayStore::open(dir.path()).unwrap();
-    store
-        .ensure_data_mode(ReplayDataMode::SymmetricSelfplayStop)
-        .unwrap();
+    bind_store(&store, ReplayDataMode::SymmetricSelfplayStop);
     let mut measurer = ReplayMeasurer::new(&store);
     let mut p2 = artifact(2, -4.0, 2, false, version(2));
     add_stop_options(&mut p2);
@@ -254,6 +248,15 @@ fn artifact(
 
 fn version(seed: u8) -> ModelVersion {
     ModelVersion::from_bytes([seed; 16])
+}
+
+fn bind_store(store: &ReplayStore, mode: ReplayDataMode) {
+    store
+        .ensure_contract(&ReplayContract::unfeaturized(
+            mode,
+            EngineIdentity::from_context(context(0)),
+        ))
+        .unwrap();
 }
 
 fn context(seed: u8) -> ReplayGraphContext {

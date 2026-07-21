@@ -1,33 +1,21 @@
-use crate::EpisodeId;
-use crate::admission::{
-    AdmissionPacer, AdmissionSmoothingConfig, EVAL_PIPELINE_DEPTH, EvalPressure,
-    SharedAdmissionShaper, build_admission_shaper,
-};
+use crate::admission::{AdmissionSmoothingConfig, EvalPressure, build_admission_shaper};
 use crate::internal;
-use crate::leases::{EpisodeModelLeases, ModelLeaseRegistry};
-use crate::pool::{Admission, AdmissionResult, CompletedTask, WorkerPool};
+use crate::leases::ModelLeaseRegistry;
 use crate::root::RootSource;
 use gz_engine::{EngineError, EngineIdentity, EngineResult, ErrorCode, ErrorMessage, GraphEngine};
 use gz_eval::EvalOutput;
-use gz_eval_service::{BackendOutputs, FeatureEvalBackend, ModelGeneration};
+use gz_eval_service::{FeatureEvalBackend, ModelGeneration};
 use gz_features::{
     FeatureCollator, FeatureExtractor, FeatureRow, FeatureSchema, FeatureSchemaHash,
-    OpponentStateFeatures, PositionFeatures, encode_feature_row,
 };
-use gz_measurer::{
-    CompletedEpisodeArtifact, CompletedEpisodeStep, MeasureLedgerSnapshot, MeasuredSymmetricGame,
-    MeasurerAdmission, MeasurerRunSummary, ReplayMeasurer,
-};
-use gz_replay::{ReplayError, ReplayStore};
-use gz_search::{
-    GumbelMcts, GumbelValueMode, SearchAction, SymmetricActorTrace, SymmetricEpisode, WorkToken,
-};
-use std::collections::{HashMap, VecDeque};
+use gz_measurer::{MeasureLedgerSnapshot, MeasuredSymmetricGame, MeasurerAdmission};
+use gz_replay::{ReplayContract, ReplayError, ReplayStore};
+use gz_search::{GumbelMcts, GumbelValueMode, WorkToken};
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::time::Duration;
 
 mod batcher;
 mod lane;
@@ -157,10 +145,6 @@ where
             return Err(internal("lane count mismatch"));
         }
         let engine_identity = validate_engine_identities(&self.engines)?;
-        replay
-            .store
-            .ensure_engine_identity(engine_identity)
-            .map_err(map_replay_error)?;
         let schema_hash = validate_feature_schemas::<E, X>(&featurized.extractors)?;
         validate_backend_count(featurized.backends.len(), lanes)?;
         let data_mode = if self.search.config().mask_stop {
@@ -168,9 +152,14 @@ where
         } else {
             gz_replay::ReplayDataMode::SymmetricSelfplayStop
         };
+        let feature_schema = first_schema::<E, X>(&featurized.extractors, schema_hash)?;
         replay
             .store
-            .ensure_data_mode(data_mode)
+            .ensure_contract(&ReplayContract::featurized(
+                data_mode,
+                feature_schema.config().clone(),
+                engine_identity,
+            ))
             .map_err(map_replay_error)?;
 
         let workers_per_lane = self.config.workers_per_lane.get();
@@ -227,10 +216,6 @@ where
         let engines = self.engines;
         let store = replay.store;
         let backpressure = replay.backpressure;
-        let feature_schema = first_schema::<E, X>(&extractors, schema_hash)?;
-        store
-            .ensure_feature_schema(feature_schema.config())
-            .map_err(map_replay_error)?;
         validate_collator_capacity(
             &FeatureCollator::new(feature_schema.clone(), config.max_batch),
             config,

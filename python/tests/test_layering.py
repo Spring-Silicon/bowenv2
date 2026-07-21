@@ -17,14 +17,18 @@ LAYERS = {
 
 TORCH_ALLOWED = {
     PACKAGE_ROOT / "model" / "exphormer.py",
+    PACKAGE_ROOT / "model" / "network.py",
     PACKAGE_ROOT / "checkpoints" / "weights.py",
     PACKAGE_ROOT / "evaluator" / "backends.py",
     PACKAGE_ROOT / "trainer" / "data.py",
     PACKAGE_ROOT / "trainer" / "diagnostics.py",
     PACKAGE_ROOT / "trainer" / "driver.py",
     PACKAGE_ROOT / "trainer" / "loop.py",
+    PACKAGE_ROOT / "trainer" / "losses.py",
     PACKAGE_ROOT / "trainer" / "optim.py",
     PACKAGE_ROOT / "trainer" / "publish.py",
+    PACKAGE_ROOT / "trainer" / "runtime.py",
+    PACKAGE_ROOT / "trainer" / "step.py",
 }
 
 

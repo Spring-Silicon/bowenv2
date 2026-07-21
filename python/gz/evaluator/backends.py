@@ -9,7 +9,7 @@ from pathlib import Path
 
 from gz.codec import BatchView, OutputEncoder
 from gz.checkpoints import CheckpointSource, DirectorySource, ResolvedCheckpoint
-from gz.common.tags import ModelVersion
+from gz.common.tags import EngineIdentity, ModelVersion
 from gz.model.exphormer import ArchConfig, BatchStager, build_model
 from gz.model.stub import STUB_MODEL_VERSION, stub
 from gz.proto import ERROR_CAPACITY, ERROR_PROTOCOL, ERROR_SCHEMA, Hello, ProtocolError
@@ -17,20 +17,6 @@ from gz.proto import ERROR_CAPACITY, ERROR_PROTOCOL, ERROR_SCHEMA, Hello, Protoc
 WARMUP_RUNS = 3
 INITIAL_MODEL_GENERATION = 1
 MAX_RESIDENT_MODEL_GENERATIONS = 2
-
-
-def _manifest_accepts_engine_identity(
-    manifest: object,
-    expected: tuple[object, object, object],
-) -> bool:
-    actual = (
-        bytes(manifest.engine_id),
-        bytes(manifest.engine_version),
-        bytes(manifest.action_set_hash),
-    )
-    if actual == (bytes(16), bytes(16), bytes(32)):
-        return True
-    return actual == tuple(bytes(value) for value in expected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,15 +233,15 @@ class TorchBackend:
         self._loader_started = False
         self._stop_polling = threading.Event()
         self._timings = EvalTimingStats()
-        self._engine_identity: tuple[object, object, object] | None = None
+        self._engine_identity: EngineIdentity | None = None
 
     def handshake(self, hello: Hello) -> ModelVersion:
         if hello.feature_schema_hash != self._active.manifest.feature_schema_hash:
             raise ProtocolError(ERROR_SCHEMA, "feature schema hash mismatch")
-        engine_identity = (hello.engine_id, hello.engine_version, hello.action_set_hash)
+        engine_identity = hello.engine_identity
         if self._engine_identity is not None and engine_identity != self._engine_identity:
             raise ProtocolError(ERROR_SCHEMA, "engine identity changed across handshakes")
-        if not _manifest_accepts_engine_identity(self._active.manifest, engine_identity):
+        if self._active.manifest.engine_identity != engine_identity:
             raise ProtocolError(ERROR_SCHEMA, "engine identity mismatch")
         if hello.batch_capacity > self.max_batch:
             raise ProtocolError(ERROR_CAPACITY, "batch capacity exceeds backend maximum")
@@ -542,8 +528,9 @@ class TorchBackend:
                 self._loading_version = None
             self._log_rejection(version.hex(), version, "feature schema hash mismatch")
             return
-        if self._engine_identity is not None and not _manifest_accepts_engine_identity(
-            resolved.manifest, self._engine_identity
+        if (
+            self._engine_identity is not None
+            and resolved.manifest.engine_identity != self._engine_identity
         ):
             with self._pending_lock:
                 self._loading_version = None
@@ -561,7 +548,7 @@ class TorchBackend:
             self._pending = slot
 
     def _build_slot(self, resolved: ResolvedCheckpoint) -> _ServingSlot:
-        arch = ArchConfig.from_dict(resolved.manifest.arch_config)
+        arch = ArchConfig.from_manifest_dict(resolved.manifest.arch_config)
         if arch.name != resolved.manifest.arch_name:
             raise ValueError("manifest arch name mismatch")
         model = build_model(resolved.manifest.feature_schema, arch)

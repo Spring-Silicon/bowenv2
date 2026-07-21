@@ -351,8 +351,19 @@ def _validate(config: RunConfig) -> RunConfig:
     return config
 
 
-def load_config(path: str | Path) -> RunConfig:
+def load_config(
+    path: str | Path,
+    *,
+    extension_sections: frozenset[str] = frozenset(),
+) -> RunConfig:
     data = load_config_table(Path(path))
+    unknown_sections = (
+        set(data)
+        - {"trainer", "selfplay", "wandb", "arch", "paths"}
+        - extension_sections
+    )
+    if unknown_sections:
+        raise ValueError(f"unknown config sections: {sorted(unknown_sections)}")
     trainer = dataclass_from_dict(
         TrainerConfig,
         data.get("trainer", {}),
@@ -362,10 +373,21 @@ def load_config(path: str | Path) -> RunConfig:
         data.get("selfplay", {}),
     )
     wandb = dataclass_from_dict(WandbConfig, data.get("wandb", {}))
-    arch = dataclass_from_dict(ArchConfig, data.get("arch", {}))
+    arch = ArchConfig.from_config_dict(data.get("arch", {}))
     raw_paths = data.get("paths", {})
     if not isinstance(raw_paths, dict):
         raise ValueError("[paths] must be a table")
+    known_paths = {
+        "replay_dir",
+        "checkpoint_dir",
+        "actor_checkpoint_dir",
+        "run_dir",
+        "sample_socket",
+        "graphzero_bin",
+    }
+    unknown_paths = set(raw_paths) - known_paths
+    if unknown_paths:
+        raise ValueError(f"unknown config fields for PathsConfig: {sorted(unknown_paths)}")
     run_dir = Path(str(raw_paths.get("run_dir", "runs/train-whittle")))
     replay_dir = Path(str(raw_paths.get("replay_dir", run_dir / "replay")))
     checkpoint_dir = Path(str(raw_paths.get("checkpoint_dir", run_dir / "checkpoints")))

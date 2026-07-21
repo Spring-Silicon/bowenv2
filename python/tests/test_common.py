@@ -4,7 +4,15 @@ import hashlib
 
 import pytest
 
-from gz.common import EngineId, FeatureSchemaHash, file_blake2b, model_version
+from gz.common import (
+    ActionSetHash,
+    EngineIdentity,
+    EngineId,
+    EngineVersion,
+    FeatureSchemaHash,
+    file_blake2b,
+    model_version,
+)
 
 
 def test_fixed_tags_hex_roundtrip_and_length_validation() -> None:
@@ -25,6 +33,15 @@ def test_model_version_is_deterministic_and_sensitive() -> None:
 
     assert first == again
     assert first != changed
+
+
+def test_engine_identity_rejects_unspecified_all_zero_value() -> None:
+    with pytest.raises(ValueError, match="must not be all zero"):
+        EngineIdentity(
+            EngineId.from_bytes(bytes(16)),
+            EngineVersion.from_bytes(bytes(16)),
+            ActionSetHash.from_bytes(bytes(32)),
+        )
 
 
 def test_file_blake2b_matches_hashlib(tmp_path) -> None:

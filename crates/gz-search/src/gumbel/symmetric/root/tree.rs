@@ -1,4 +1,6 @@
-use super::*;
+use super::super::super::schedule::softmax;
+use super::{Descent, PathStep, SymmetricSelfplayRootTask};
+use std::hash::Hash;
 
 impl<G, C> SymmetricSelfplayRootTask<G, C>
 where

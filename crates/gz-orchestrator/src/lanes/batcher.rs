@@ -1,4 +1,15 @@
-use super::*;
+use super::{EvalReply, FeaturizedBatcherContext, FeaturizedEvalJob, ThreadedOrchestratorConfig};
+use crate::admission::{EVAL_PIPELINE_DEPTH, EvalPressure};
+use crate::internal;
+use crate::leases::ModelLeaseRegistry;
+use gz_engine::EngineResult;
+use gz_eval::EvalOutput;
+use gz_eval_service::{BackendOutputs, FeatureEvalBackend, ModelGeneration};
+use gz_features::FeatureCollator;
+use gz_search::WorkToken;
+use std::collections::VecDeque;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::time::{Duration, Instant};
 
 /// Batches eval jobs and keeps one submitted batch in flight: while batch
 /// N runs on the backend, batch N+1 is collected and submitted before N's

@@ -33,6 +33,7 @@ fn replay_init_persists_the_feature_schema() {
     let summary = init_replay(ReplayInitConfig {
         replay_dir: Some(dir.path().to_path_buf()),
         max_candidates: 255,
+        mask_stop: false,
     })
     .unwrap();
 

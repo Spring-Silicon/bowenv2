@@ -12,7 +12,7 @@ use gz_orchestrator::{
     AdmissionSmoothingConfig, FeaturizedRuntime, ReplayBackpressure, ReplayRuntime, RootSource,
     ThreadedGumbelOrchestrator, ThreadedOrchestratorConfig,
 };
-use gz_replay::{ReplayCounters, ReplayDataMode, ReplayEpisodeId, ReplayStore};
+use gz_replay::{ReplayContract, ReplayCounters, ReplayDataMode, ReplayEpisodeId, ReplayStore};
 use gz_search::{GumbelMcts, GumbelMctsConfig, GumbelValueMode};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
@@ -61,6 +61,7 @@ pub struct SelfplayConfig {
 pub struct ReplayInitConfig {
     pub replay_dir: Option<PathBuf>,
     pub max_candidates: usize,
+    pub mask_stop: bool,
 }
 
 impl Default for ReplayInitConfig {
@@ -68,6 +69,7 @@ impl Default for ReplayInitConfig {
         Self {
             replay_dir: None,
             max_candidates: WHITTLE_FEATURE_MAX_ENGINE_CANDIDATES,
+            mask_stop: false,
         }
     }
 }
@@ -330,10 +332,11 @@ pub fn init_replay(config: ReplayInitConfig) -> Result<ReplayInitSummary, String
     );
     let schema = extractor.schema();
     store
-        .ensure_feature_schema(schema.config())
-        .map_err(|error| error.to_string())?;
-    store
-        .ensure_engine_identity(EngineIdentity::from_engine(&engine))
+        .ensure_contract(&ReplayContract::featurized(
+            replay_data_mode(config.mask_stop),
+            schema.config().clone(),
+            EngineIdentity::from_engine(&engine),
+        ))
         .map_err(|error| error.to_string())?;
 
     Ok(ReplayInitSummary {
@@ -353,14 +356,6 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         ReplayStore::open_with_retention(replay_dir, config.replay_retain)
             .map_err(|error| error.to_string())?,
     );
-    store
-        .ensure_data_mode(if config.mask_stop {
-            ReplayDataMode::SymmetricSelfplay
-        } else {
-            ReplayDataMode::SymmetricSelfplayStop
-        })
-        .map_err(|error| error.to_string())?;
-
     let engines = (0..config.lanes)
         .map(|_| WhittleEngine::new(whittle_engine_config()).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
@@ -371,10 +366,11 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         .config()
         .clone();
     store
-        .ensure_feature_schema(&schema)
-        .map_err(|error| error.to_string())?;
-    store
-        .ensure_engine_identity(EngineIdentity::from_engine(&engines[0]))
+        .ensure_contract(&ReplayContract::featurized(
+            replay_data_mode(config.mask_stop),
+            schema,
+            EngineIdentity::from_engine(&engines[0]),
+        ))
         .map_err(|error| error.to_string())?;
 
     if let Some(socket) = config.serve_socket.clone() {
@@ -393,6 +389,14 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         EvaluatorMode::ProcessStub | EvaluatorMode::Torch => {
             run_process(config, store, engines, search, roots)
         }
+    }
+}
+
+const fn replay_data_mode(mask_stop: bool) -> ReplayDataMode {
+    if mask_stop {
+        ReplayDataMode::SymmetricSelfplay
+    } else {
+        ReplayDataMode::SymmetricSelfplayStop
     }
 }
 

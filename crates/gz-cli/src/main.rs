@@ -117,6 +117,7 @@ fn parse_replay_init(args: Vec<String>) -> Result<ReplayInitConfig, String> {
         match flag.as_str() {
             "--replay-dir" => config.replay_dir = Some(PathBuf::from(value)),
             "--max-candidates" => config.max_candidates = parse_usize(flag, value)?,
+            "--mask-stop" => config.mask_stop = parse_bool(flag, value)?,
             _ => return Err(format!("unknown flag: {flag}\n{}", usage())),
         }
     }

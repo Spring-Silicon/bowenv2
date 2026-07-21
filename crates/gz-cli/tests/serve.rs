@@ -1,5 +1,5 @@
 use gz_cli::selfplay::{EvaluatorMode, ReplayInitConfig, SelfplayConfig, init_replay, run};
-use gz_cli::serve::{ReplayServeConfig, SAMPLE_PROTOCOL_VERSION, run_one};
+use gz_cli::serve::{HELLO_ACK_FIXED_LEN, ReplayServeConfig, SAMPLE_PROTOCOL_VERSION, run_one};
 use gz_features::{
     ENCODING_VERSION, FeatureBatchView, TrainingTargetsView, decode_feature_schema_config,
 };
@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const HELLO_ACK_FIXED_LEN: usize = 224;
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct TestDir(PathBuf);
@@ -102,6 +101,7 @@ fn replay_serve_acks_an_initialized_empty_store() {
     init_replay(ReplayInitConfig {
         replay_dir: Some(dir.path().to_path_buf()),
         max_candidates: 15,
+        mask_stop: false,
     })
     .unwrap();
     let socket = dir.path().join("empty.sock");
