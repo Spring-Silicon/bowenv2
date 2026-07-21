@@ -23,7 +23,7 @@ from gz.trainer.config import (
 )
 from gz.trainer.data import TrainingStager
 from gz.trainer.loop import LoopConfig, TrainerLoop
-from gz.trainer.publish import EmaWeights, publish_ema
+from gz.trainer.publish import EmaWeights, PublishTags, publish_ema
 from gz.trainer.sampler import SampleAck, SampleClient, step_seed
 from gz.trainer.telemetry import (
     MetricsWriter,
@@ -68,6 +68,27 @@ def _required_episodes(step: int, gate_interval: int, episodes_per_gate: int) ->
 class SampledBatches:
     policy: object
     value: object | None
+
+
+def _publish_tags(sampler: SampleClient) -> PublishTags:
+    return PublishTags(
+        engine_id=sampler.engine_id,
+        engine_version=sampler.engine_version,
+        action_set_hash=sampler.action_set_hash,
+    )
+
+
+def _validate_checkpoint_engine_identity(manifest: object, tags: PublishTags) -> None:
+    stored = (
+        bytes(manifest.engine_id),
+        bytes(manifest.engine_version),
+        bytes(manifest.action_set_hash),
+    )
+    if stored == (bytes(16), bytes(16), bytes(32)):
+        return
+    expected = (bytes(tags.engine_id), bytes(tags.engine_version), bytes(tags.action_set_hash))
+    if stored != expected:
+        raise RuntimeError("checkpoint engine identity does not match the replay store")
 
 
 def _sample_training_batches(
@@ -153,6 +174,7 @@ def run(config_path: str | Path) -> None:
                     arch,
                     scope=config.trainer.init_checkpoint_scope,
                 )
+                _validate_checkpoint_engine_identity(resolved.manifest, _publish_tags(sampler))
                 metrics.write(
                     {
                         "event": "init_checkpoint",
@@ -173,6 +195,7 @@ def run(config_path: str | Path) -> None:
                 arch=arch,
                 training_step=0,
                 run_id=config.paths.run_dir.name,
+                tags=_publish_tags(sampler),
             )
             learner_manifest = first
             param_norm, _ = ema.norms(None)
@@ -253,6 +276,7 @@ def run(config_path: str | Path) -> None:
     ) = start_stage(config)
     prefetcher = None
     try:
+        publish_tags = _publish_tags(sampler)
         if config.trainer.resume:
             from gz.checkpoints.weights import load_state_dict
 
@@ -260,6 +284,7 @@ def run(config_path: str | Path) -> None:
             resolved = resume_resolved
             if resolved.manifest.feature_schema_hash != sampler.feature_schema_hash:
                 raise RuntimeError("resume checkpoint feature schema does not match the store")
+            _validate_checkpoint_engine_identity(resolved.manifest, publish_tags)
             if ArchConfig.from_dict(resolved.manifest.arch_config) != arch:
                 raise RuntimeError("resume checkpoint arch does not match [arch] config")
             model = build_model(sampler.feature_schema, arch).to(config.trainer.device)
@@ -363,6 +388,7 @@ def run(config_path: str | Path) -> None:
                 arch=arch,
                 training_step=training_step,
                 run_id=config.paths.run_dir.name,
+                tags=publish_tags,
                 checkpoint_pointers=_permanent_checkpoint_pointers(
                     config.trainer,
                     training_step,

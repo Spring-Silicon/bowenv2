@@ -8,4 +8,5 @@ __pycache__/
 /package.json
 /package-lock.json
 /runs/
+/specs/
 /wandb/

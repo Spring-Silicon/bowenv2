@@ -146,7 +146,13 @@ where
 
             let episode_id = EpisodeId::new(*admission.next_episode_id);
             *admission.next_episode_id += 1;
-            episode_context(engine, episode_id, root)?;
+            let root_is_owned = roots.episode_roots_are_owned();
+            if let Err(error) = episode_context(engine, episode_id, root) {
+                if root_is_owned {
+                    engine.release(&[root], &[])?;
+                }
+                return Err(error);
+            }
             let context = gz_search::GumbelEpisodeContext {
                 noise_seed: crate::root::episode_noise_seed(episode_id.value()),
             };
@@ -156,7 +162,7 @@ where
                 root,
                 context,
             );
-            if roots.episode_roots_are_owned() {
+            if root_is_owned {
                 task.track_owned_root();
             }
             slot.state = SlotState::Running(ActiveEpisode {

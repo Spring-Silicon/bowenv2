@@ -1,8 +1,8 @@
 use crate::ReplayDataMode;
 use crate::{ReplayError, ReplayResult};
 use gz_engine::{
-    CandidateHash, MeasureSummary, ModelVersion, PortableCandidateRef, PortableSearchActionRef,
-    ReplayGraphContext, SearchConfigHash, SearchStepRef,
+    CandidateHash, EngineIdentity, MeasureSummary, ModelVersion, PortableCandidateRef,
+    PortableSearchActionRef, ReplayGraphContext, SearchConfigHash, SearchStepRef,
 };
 use gz_features::{
     FeatureSchemaHash, bf16_bits_to_f32, f32_to_bf16_bits, validate_feature_row_header,
@@ -220,6 +220,7 @@ pub(crate) fn validate_episode(
     feature_schema_hash: Option<FeatureSchemaHash>,
     data_mode: ReplayDataMode,
 ) -> ReplayResult<()> {
+    validate_episode_engine_identity(record, EngineIdentity::from_context(record.root))?;
     validate_admission(record)?;
     validate_outcome(record, data_mode)?;
 
@@ -254,6 +255,22 @@ pub(crate) fn validate_episode(
         expected_history.push(record.steps[index].action);
     }
 
+    Ok(())
+}
+
+pub(crate) fn validate_episode_engine_identity(
+    record: &ReplayEpisodeRecord,
+    identity: EngineIdentity,
+) -> ReplayResult<()> {
+    let matches = |context: ReplayGraphContext| EngineIdentity::from_context(context) == identity;
+    if !matches(record.root)
+        || !matches(record.final_graph)
+        || record.steps.iter().any(|step| {
+            !matches(step.before) || !matches(step.action.context()) || !matches(step.after)
+        })
+    {
+        return Err(ReplayError::EngineIdentityMismatch);
+    }
     Ok(())
 }
 

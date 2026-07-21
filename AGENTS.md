@@ -225,7 +225,6 @@ crates/
   gz-engine-whittle/
   gz-eval/
   gz-eval-service/
-  gz-eval-whittle/
   gz-features/
   gz-measurer/
   gz-replay/
@@ -282,3 +281,5 @@ new rule. Write one concrete rule per line.
   learner episode step.
 - Keep Rust tests out of `src/` files; put tests in each crate's `tests/`
   directory instead.
+- Evaluate every simulated MCTS leaf, including terminal leaves, with the neural
+  evaluator; call `GraphEngine::measure` only for selected episode-final graphs.

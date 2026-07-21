@@ -1,0 +1,16 @@
+extends = "01-full-c4s48-1m-neural-terminal.toml"
+
+[trainer]
+total_steps = 60000
+resume = true
+lr = 0.000002
+adamw_lr = 0.000002
+
+[selfplay]
+python_dir = "/opt/dlami/nvme/graphzero-runs/sym1m-s42m5-l96w4-r1-vw300k-vtg0p1-c4s48-aux-v8v32score-neuralterminal-clip10-20k-1/queued-runtime-2026-07-21/python"
+
+[wandb]
+run_id = "m7hddyfs"
+
+[paths]
+graphzero_bin = "/opt/dlami/nvme/graphzero-runs/sym1m-s42m5-l96w4-r1-vw300k-vtg0p1-c4s48-aux-v8v32score-neuralterminal-clip10-20k-1/queued-runtime-2026-07-21/graphzero"

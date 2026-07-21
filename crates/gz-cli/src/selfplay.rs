@@ -1,4 +1,4 @@
-use gz_engine::{CandidateOptions, EngineResult, GraphEngine, ModelVersion};
+use gz_engine::{CandidateOptions, EngineIdentity, EngineResult, GraphEngine, ModelVersion};
 use gz_engine_whittle::{
     WhittleEngine, WhittleEngineConfig, WhittleFeatureExtractor, WhittleFeatureExtractorConfig,
     WhittleGraphGenerator, WhittleGraphGeneratorConfig, WhittleGraphId, WhittleRoot,
@@ -332,6 +332,9 @@ pub fn init_replay(config: ReplayInitConfig) -> Result<ReplayInitSummary, String
     store
         .ensure_feature_schema(schema.config())
         .map_err(|error| error.to_string())?;
+    store
+        .ensure_engine_identity(EngineIdentity::from_engine(&engine))
+        .map_err(|error| error.to_string())?;
 
     Ok(ReplayInitSummary {
         feature_schema_hash: schema.hash(),
@@ -369,6 +372,9 @@ pub fn run(config: SelfplayConfig) -> Result<SelfplaySummary, String> {
         .clone();
     store
         .ensure_feature_schema(&schema)
+        .map_err(|error| error.to_string())?;
+    store
+        .ensure_engine_identity(EngineIdentity::from_engine(&engines[0]))
         .map_err(|error| error.to_string())?;
 
     if let Some(socket) = config.serve_socket.clone() {

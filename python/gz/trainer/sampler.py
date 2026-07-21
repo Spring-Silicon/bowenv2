@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gz.codec import BatchView, FeatureSchemaConfig, TargetsView
-from gz.common import FeatureSchemaHash
+from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
 from gz.proto import (
     ENCODING_VERSION,
     ProtocolError,
@@ -17,9 +17,9 @@ from gz.proto import (
     write_frame,
 )
 
-SAMPLE_PROTOCOL_VERSION = 11
+SAMPLE_PROTOCOL_VERSION = 12
 
-HELLO_ACK_FIXED_LEN = 160
+HELLO_ACK_FIXED_LEN = 224
 
 FRAME_HELLO = 1
 FRAME_HELLO_ACK = 2
@@ -59,6 +59,9 @@ class SymmetricSelfplayMetrics:
 @dataclass(frozen=True, slots=True)
 class SampleAck:
     feature_schema_hash: FeatureSchemaHash
+    engine_id: EngineId
+    engine_version: EngineVersion
+    action_set_hash: ActionSetHash
     max_batch: int
     produced_rows: int
     episodes: int
@@ -99,6 +102,18 @@ class SampleClient:
     @property
     def feature_schema_hash(self) -> FeatureSchemaHash:
         return self._ack().feature_schema_hash
+
+    @property
+    def engine_id(self) -> EngineId:
+        return self._ack().engine_id
+
+    @property
+    def engine_version(self) -> EngineVersion:
+        return self._ack().engine_version
+
+    @property
+    def action_set_hash(self) -> ActionSetHash:
+        return self._ack().action_set_hash
 
     @property
     def max_batch(self) -> int:
@@ -287,6 +302,9 @@ def decode_ack(payload: memoryview) -> SampleAck:
         )
     return SampleAck(
         feature_schema_hash=FeatureSchemaHash.from_bytes(payload[4:36]),
+        engine_id=EngineId.from_bytes(payload[160:176]),
+        engine_version=EngineVersion.from_bytes(payload[176:192]),
+        action_set_hash=ActionSetHash.from_bytes(payload[192:224]),
         max_batch=max_batch,
         produced_rows=produced_rows,
         episodes=episodes,

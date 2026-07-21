@@ -2,6 +2,8 @@
 
 //! Search kernels and search result records for GraphZero.
 
+pub use gz_engine::EngineIdentity;
+
 mod beam;
 mod episode;
 mod greedy;
@@ -39,6 +41,6 @@ pub use puct::{
     PuctRootResult, PuctRootStats, PuctRootTask, PuctSearchContext, PuctStep, PuctStopReason,
 };
 pub use work::{
-    ApplyWork, EngineIdentity, EvalOpponentWork, EvalWork, ExpandResult, ExpandWork,
-    ExpandedCandidate, MeasureWork, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
+    ApplyWork, EvalOpponentWork, EvalWork, ExpandResult, ExpandWork, ExpandedCandidate,
+    MeasureWork, SearchPoll, SearchWork, SearchWorkResult, WorkToken,
 };

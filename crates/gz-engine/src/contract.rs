@@ -103,17 +103,35 @@ fn check_determinism<F: EngineContractFixture>(fixture: &F) -> Result<(), Contra
     let action_set_hash = left.action_set_hash();
     let mut scratch = Vec::new();
     left.candidates(left_root, default_options, &mut scratch)?;
+    let first_left_hashes = candidate_hashes_from(&left, left_root, &scratch)?;
     left.candidates(left_root, limited_options, &mut scratch)?;
+    ensure(
+        scratch.len() <= 1,
+        "candidates must clear the output buffer before writing",
+    )?;
     ensure(
         left.action_set_hash() == action_set_hash,
         "action_set_hash must be stable across CandidateOptions changes",
     )?;
 
     let left_candidates = candidate_hashes(&mut left, left_root, default_options)?;
+    ensure(
+        left_candidates == first_left_hashes,
+        "candidate hashes must preserve order across repeated enumeration",
+    )?;
     let right_candidates = candidate_hashes(&mut right, right_root, default_options)?;
     ensure(
         left_candidates == right_candidates,
         "candidate hashes must match across engine instances",
+    )?;
+
+    let mut limited_first = fixture.make_engine();
+    let limited_root = limited_first.root();
+    limited_first.candidates(limited_root, limited_options, &mut Vec::new())?;
+    let after_limited = candidate_hashes(&mut limited_first, limited_root, default_options)?;
+    ensure(
+        after_limited == right_candidates,
+        "a limited request must not truncate later candidate enumeration",
     )?;
 
     if let Some(candidate) = fixture.known_path().first().copied() {

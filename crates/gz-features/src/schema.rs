@@ -128,8 +128,18 @@ fn validate_config(config: &FeatureSchemaConfig) -> FeatureResult<()> {
             "action_kind_vocab_size must be >= 3",
         ));
     }
+    if config.action_kind_vocab_size > u32::from(u16::MAX) + 1 {
+        return Err(FeatureError::InvalidSchema(
+            "action_kind_vocab_size exceeds u16 wire width",
+        ));
+    }
     if config.max_nodes == 0 {
         return Err(FeatureError::InvalidSchema("max_nodes must be positive"));
+    }
+    if config.max_nodes > u32::from(u16::MAX) {
+        return Err(FeatureError::InvalidSchema(
+            "max_nodes exceeds u16 subject-index width",
+        ));
     }
     if config.max_edges == 0 {
         return Err(FeatureError::InvalidSchema("max_edges must be positive"));
@@ -139,6 +149,11 @@ fn validate_config(config: &FeatureSchemaConfig) -> FeatureResult<()> {
     }
     if config.max_subjects == 0 {
         return Err(FeatureError::InvalidSchema("max_subjects must be positive"));
+    }
+    if config.max_subjects > u32::from(u8::MAX) {
+        return Err(FeatureError::InvalidSchema(
+            "max_subjects exceeds u8 wire width",
+        ));
     }
     if !config.opponent_reward_scale.is_finite() || config.opponent_reward_scale <= 0.0 {
         return Err(FeatureError::InvalidSchema(

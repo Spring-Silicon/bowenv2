@@ -135,6 +135,7 @@ fn drive_with_reuse_options(
         GumbelEpisodeContext { noise_seed: 17 },
     );
     let mut evals = 0;
+    let mut measures = 0;
     let mut pending_applies = Vec::new();
     let mut pending_evals = Vec::new();
     let mut max_pending_evals = 0;
@@ -168,9 +169,12 @@ fn drive_with_reuse_options(
                             Some(SearchWorkResult::Apply(applied))
                         }
                     }
-                    SearchWork::Measure(work) => Some(SearchWorkResult::Measure(
-                        engine.measure(work.graph, work.options).unwrap(),
-                    )),
+                    SearchWork::Measure(work) => {
+                        measures += 1;
+                        Some(SearchWorkResult::Measure(
+                            engine.measure(work.graph, work.options).unwrap(),
+                        ))
+                    }
                     SearchWork::Eval(work) => {
                         assert!(work.opponent.is_some());
                         evals += 1;
@@ -236,6 +240,7 @@ fn drive_with_reuse_options(
             SearchPoll::Done(episode) => {
                 assert!(pending_applies.is_empty());
                 assert!(pending_evals.is_empty());
+                assert_eq!(measures, 2, "only final episode graphs may be measured");
                 let handles = task.take_releasable();
                 engine
                     .release(&handles.graphs, &handles.candidates)
@@ -308,7 +313,7 @@ fn no_backtrack_reuse_fixture() -> TestEngine {
 }
 
 #[test]
-fn symmetric_search_ignores_stop_and_backs_up_adversarial_outcomes() {
+fn symmetric_search_uses_neural_values_at_terminal_leaves() {
     let engine = TestEngine::new()
         .candidates(0, [1, 2])
         .apply(0, 1, 1)
@@ -321,11 +326,18 @@ fn symmetric_search_ignores_stop_and_backs_up_adversarial_outcomes() {
     assert!(evals > 2);
     assert_eq!(episode.p1.steps.len(), 1);
     assert_eq!(episode.p2.steps.len(), 1);
-    assert_eq!(episode.p1.final_measure.scalar_reward, Some(10.0));
+    assert_eq!(episode.p1.final_measure.scalar_reward, Some(5.0));
     assert_eq!(episode.p2.final_measure.scalar_reward, Some(10.0));
+    assert!(matches!(
+        episode.p1.steps[0].action,
+        gz_search::SearchAction::Candidate(2)
+    ));
+    assert!(matches!(
+        episode.p2.steps[0].action,
+        gz_search::SearchAction::Candidate(1)
+    ));
     for actor in [&episode.p1, &episode.p2] {
         let step = &actor.steps[0];
-        assert!(matches!(step.action, gz_search::SearchAction::Candidate(1)));
         assert_eq!(step.policy_target.len(), 2);
         assert_eq!(step.legal_actions.len(), 2);
         assert!(

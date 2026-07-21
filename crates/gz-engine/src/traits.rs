@@ -38,6 +38,8 @@ pub trait GraphEngine {
         candidate: Self::Candidate,
     ) -> EngineResult<ApplyResult<Self::Graph, Self::Candidate>>;
 
+    /// Measures a terminal state. Search treats `scalar_reward` as utility
+    /// and maximizes it; cost-minimizing adapters must negate or project cost.
     fn measure(
         &mut self,
         graph: Self::Graph,

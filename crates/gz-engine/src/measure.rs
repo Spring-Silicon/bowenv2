@@ -13,6 +13,7 @@ pub struct MeasureResult<G> {
     pub measured: bool,
     pub valid: bool,
     pub latency: Option<LatencyStats>,
+    /// Terminal utility, maximized by search.
     pub scalar_reward: Option<f32>,
     pub failure: Option<MeasureFailure>,
     pub metadata: MeasureMetadata,
@@ -104,6 +105,7 @@ pub struct MeasureSummary {
     pub measured: bool,
     pub valid: bool,
     pub latency: Option<LatencyStats>,
+    /// Terminal utility, maximized by search.
     pub scalar_reward: Option<f32>,
     pub failure_code: Option<ErrorCode>,
 }

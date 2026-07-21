@@ -5,6 +5,7 @@
 pub mod contract;
 pub mod error;
 pub mod hash;
+pub mod identity;
 pub mod measure;
 pub mod metadata;
 pub mod options;
@@ -19,6 +20,7 @@ pub use hash::{
     ActionSetHash, CandidateHash, EngineId, EngineVersion, GraphHash, HexParseError,
     MeasureConfigHash, ModelVersion, SearchConfigHash,
 };
+pub use identity::EngineIdentity;
 pub use measure::{
     LatencyStats, MeasureFailure, MeasureMetadata, MeasureResult, MeasureSummary,
     MeasurementValidationError,

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const HELLO_ACK_FIXED_LEN: usize = 160;
+const HELLO_ACK_FIXED_LEN: usize = 224;
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct TestDir(PathBuf);
@@ -72,6 +72,7 @@ fn replay_serve_returns_symmetric_features_targets_and_metrics() {
         summary.rows_produced
     );
     assert_eq!(u32::from_le_bytes(ack[116..120].try_into().unwrap()), 1);
+    assert!(ack[160..224].iter().any(|byte| *byte != 0));
     let schema = decode_feature_schema_config(&ack[HELLO_ACK_FIXED_LEN..]).unwrap();
     assert_eq!(schema.max_actions, 256);
 
@@ -112,6 +113,7 @@ fn replay_serve_acks_an_initialized_empty_store() {
     assert_eq!(u64::from_le_bytes(ack[40..48].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(ack[116..120].try_into().unwrap()), 0);
     assert!(ack[120..160].iter().all(|byte| *byte == 0));
+    assert!(ack[160..224].iter().any(|byte| *byte != 0));
     assert_eq!(
         decode_feature_schema_config(&ack[HELLO_ACK_FIXED_LEN..])
             .unwrap()

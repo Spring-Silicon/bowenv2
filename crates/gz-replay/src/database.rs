@@ -1,11 +1,12 @@
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::{
     CF_EPISODES, CF_LEGACY_POLICY_ROW_INDEX, CF_LEGACY_VALUE_ROW_INDEX, CF_META, CF_ROW_INDEX,
-    CF_ROWS, META_COMPLETED_GAMES, META_CONSUMED_ROWS, META_DATA_MODE, META_FEATURE_SCHEMA,
-    META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_SCHEMA_VERSION, SCHEMA_VERSION, decode_u32,
-    decode_u64, decode_u64_key, encode_u32, encode_u64,
+    CF_ROWS, META_COMPLETED_GAMES, META_CONSUMED_ROWS, META_DATA_MODE, META_ENGINE_IDENTITY,
+    META_FEATURE_SCHEMA, META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_SCHEMA_VERSION,
+    SCHEMA_VERSION, decode_u32, decode_u64, decode_u64_key, encode_u32, encode_u64,
 };
 use crate::store::ReplayDataMode;
+use gz_engine::{ActionSetHash, EngineId, EngineIdentity, EngineVersion};
 use gz_features::FeatureSchemaConfig;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options,
@@ -175,6 +176,42 @@ pub(crate) fn read_feature_schema(db: &DB) -> ReplayResult<Option<FeatureSchemaC
 
 pub(crate) fn stored_feature_schema(config: &FeatureSchemaConfig) -> ReplayResult<Vec<u8>> {
     postcard::to_allocvec(&StoredFeatureSchemaConfig::from(config)).map_err(ReplayError::from)
+}
+
+pub(crate) fn read_engine_identity(db: &DB) -> ReplayResult<Option<EngineIdentity>> {
+    let meta = cf(db, CF_META)?;
+    db.get_cf(&meta, META_ENGINE_IDENTITY)?
+        .map(|bytes| {
+            if bytes.len() != 64 {
+                return Err(ReplayError::storage("corrupt engine identity"));
+            }
+            Ok(EngineIdentity {
+                engine_id: EngineId::from_bytes(
+                    bytes[0..16]
+                        .try_into()
+                        .map_err(|_| ReplayError::storage("corrupt engine id"))?,
+                ),
+                engine_version: EngineVersion::from_bytes(
+                    bytes[16..32]
+                        .try_into()
+                        .map_err(|_| ReplayError::storage("corrupt engine version"))?,
+                ),
+                action_set_hash: ActionSetHash::from_bytes(
+                    bytes[32..64]
+                        .try_into()
+                        .map_err(|_| ReplayError::storage("corrupt action-set hash"))?,
+                ),
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn stored_engine_identity(identity: EngineIdentity) -> [u8; 64] {
+    let mut bytes = [0; 64];
+    bytes[0..16].copy_from_slice(identity.engine_id.as_bytes());
+    bytes[16..32].copy_from_slice(identity.engine_version.as_bytes());
+    bytes[32..64].copy_from_slice(identity.action_set_hash.as_bytes());
+    bytes
 }
 
 pub(crate) fn read_data_mode(db: &DB) -> ReplayResult<Option<ReplayDataMode>> {

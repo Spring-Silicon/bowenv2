@@ -1,26 +1,29 @@
 use crate::append::{AppendSequences, EpisodeAppend, stage_episodes};
 use crate::database::{
-    ensure_schema, open_db, read_data_mode, read_feature_schema, read_meta_u64,
-    recover_next_episode_seq, recover_next_row_seq, stored_feature_schema, write_meta_u64,
+    ensure_schema, open_db, read_data_mode, read_engine_identity, read_feature_schema,
+    read_meta_u64, recover_next_episode_seq, recover_next_row_seq, stored_engine_identity,
+    stored_feature_schema, write_meta_u64,
 };
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::{
     CF_EPISODES, CF_META, CF_ROW_INDEX, CF_ROWS, META_COMPLETED_GAMES, META_CONSUMED_ROWS,
-    META_DATA_MODE, META_DELETED_FLOOR, META_EPISODES_STOPPED, META_FEATURE_SCHEMA,
-    META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_RETAINED_FLOOR, META_SYMMETRIC_BEST_COST,
-    META_SYMMETRIC_COST_MARGIN_EMA, META_SYMMETRIC_DRAW_EMA, META_SYMMETRIC_GAMES,
-    META_SYMMETRIC_LEN_MARGIN_EMA, META_SYMMETRIC_P1_COST_EMA, META_SYMMETRIC_P1_LEN_EMA,
-    META_SYMMETRIC_P1_WIN_EMA, META_SYMMETRIC_P2_COST_EMA, META_SYMMETRIC_P2_LEN_EMA,
-    META_SYMMETRIC_P2_WIN_EMA, META_TERMINAL_COST_BEST, META_TERMINAL_COST_EMA,
-    decode_episode_from_row_key, decode_step_from_row_key, encode_u64, episode_key, row_index_key,
-    row_key,
+    META_DATA_MODE, META_DELETED_FLOOR, META_ENGINE_IDENTITY, META_EPISODES_STOPPED,
+    META_FEATURE_SCHEMA, META_NEXT_EPISODE_SEQ, META_PRODUCED_ROWS, META_RETAINED_FLOOR,
+    META_SYMMETRIC_BEST_COST, META_SYMMETRIC_COST_MARGIN_EMA, META_SYMMETRIC_DRAW_EMA,
+    META_SYMMETRIC_GAMES, META_SYMMETRIC_LEN_MARGIN_EMA, META_SYMMETRIC_P1_COST_EMA,
+    META_SYMMETRIC_P1_LEN_EMA, META_SYMMETRIC_P1_WIN_EMA, META_SYMMETRIC_P2_COST_EMA,
+    META_SYMMETRIC_P2_LEN_EMA, META_SYMMETRIC_P2_WIN_EMA, META_TERMINAL_COST_BEST,
+    META_TERMINAL_COST_EMA, decode_episode_from_row_key, decode_step_from_row_key, encode_u64,
+    episode_key, row_index_key, row_key,
 };
 use crate::records::{
     ReplayEpisodeId, ReplayEpisodeRecord, ReplayRow, StoredReplayRow, validate_episode,
+    validate_episode_engine_identity,
 };
 use crate::sample::{ReplayRng, SampleConfig};
+use gz_engine::EngineIdentity;
 use gz_features::{FeatureSchema, FeatureSchemaConfig};
-use rocksdb::{DB, WriteBatch};
+use rocksdb::{DB, IteratorMode, WriteBatch};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +33,7 @@ pub struct ReplayStore {
     write_lock: Mutex<()>,
     consumed_lock: Mutex<()>,
     data_mode: Mutex<Option<ReplayDataMode>>,
+    engine_identity: Mutex<Option<EngineIdentity>>,
     next_episode_seq: AtomicU64,
     completed_games: AtomicU64,
     episodes_stopped: AtomicU64,
@@ -400,6 +404,7 @@ impl ReplayStore {
         let best_cost_bits = read_meta_u64(&db, META_TERMINAL_COST_BEST)?.unwrap_or(0);
         let symmetric_metrics = SymmetricMetricAtoms::load(&db)?;
         let data_mode = read_data_mode(&db)?;
+        let engine_identity = read_engine_identity(&db)?;
         write_meta_u64(&db, META_NEXT_EPISODE_SEQ, next_episode_seq)?;
         write_meta_u64(&db, META_PRODUCED_ROWS, produced_rows)?;
         write_meta_u64(&db, META_COMPLETED_GAMES, completed_games)?;
@@ -409,6 +414,7 @@ impl ReplayStore {
             write_lock: Mutex::new(()),
             consumed_lock: Mutex::new(()),
             data_mode: Mutex::new(data_mode),
+            engine_identity: Mutex::new(engine_identity),
             next_episode_seq: AtomicU64::new(next_episode_seq),
             completed_games: AtomicU64::new(completed_games),
             episodes_stopped: AtomicU64::new(episodes_stopped),
@@ -443,6 +449,9 @@ impl ReplayStore {
         let data_mode = self.data_mode()?;
         if data_mode.is_symmetric_selfplay() {
             return Err(ReplayError::InvalidRecord);
+        }
+        if let Some(identity) = *self.engine_identity.lock().map_err(ReplayError::storage)? {
+            validate_episode_engine_identity(record, identity)?;
         }
         validate_episode(record, rows, feature_schema_hash, data_mode)?;
 
@@ -525,6 +534,10 @@ impl ReplayStore {
             .transpose()
             .map_err(|_| ReplayError::InvalidRecord)?;
         let data_mode = self.data_mode()?;
+        if let Some(identity) = *self.engine_identity.lock().map_err(ReplayError::storage)? {
+            validate_episode_engine_identity(primary.0, identity)?;
+            validate_episode_engine_identity(secondary.0, identity)?;
+        }
         validate_episode(primary.0, primary.1, feature_schema_hash, data_mode)?;
         validate_episode(secondary.0, secondary.1, feature_schema_hash, data_mode)?;
         let symmetric_metrics = data_mode
@@ -707,6 +720,36 @@ impl ReplayStore {
         }
     }
 
+    /// Binds the store to one engine implementation and legal action domain.
+    /// Legacy stores are migrated only after every retained episode is checked.
+    pub fn ensure_engine_identity(&self, identity: EngineIdentity) -> ReplayResult<()> {
+        let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
+        let mut stored = self.engine_identity.lock().map_err(ReplayError::storage)?;
+        if let Some(current) = *stored {
+            return if current == identity {
+                Ok(())
+            } else {
+                Err(ReplayError::EngineIdentityMismatch)
+            };
+        }
+
+        let episodes = self.cf(CF_EPISODES)?;
+        for item in self.db.iterator_cf(&episodes, IteratorMode::Start) {
+            let (_, bytes) = item?;
+            let record: ReplayEpisodeRecord = postcard::from_bytes(&bytes)?;
+            validate_episode_engine_identity(&record, identity)?;
+        }
+
+        let meta = self.cf(CF_META)?;
+        self.db.put_cf(
+            &meta,
+            META_ENGINE_IDENTITY,
+            stored_engine_identity(identity),
+        )?;
+        *stored = Some(identity);
+        Ok(())
+    }
+
     pub fn ensure_data_mode(&self, mode: ReplayDataMode) -> ReplayResult<()> {
         let _guard = self.write_lock.lock().map_err(ReplayError::storage)?;
         let meta = self.cf(CF_META)?;
@@ -731,6 +774,13 @@ impl ReplayStore {
 
     pub fn feature_schema(&self) -> ReplayResult<Option<FeatureSchemaConfig>> {
         read_feature_schema(&self.db)
+    }
+
+    pub fn engine_identity(&self) -> ReplayResult<Option<EngineIdentity>> {
+        self.engine_identity
+            .lock()
+            .map(|identity| *identity)
+            .map_err(ReplayError::storage)
     }
 
     pub fn episode(&self, id: ReplayEpisodeId) -> ReplayResult<Option<ReplayEpisodeRecord>> {

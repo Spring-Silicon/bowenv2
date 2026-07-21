@@ -1,9 +1,10 @@
 use gz_engine::{
-    ActionSetHash, ApplyResult, CandidateHash, CandidateKindId, CandidateOptions, CandidateTags,
-    EngineId, EngineVersion, GraphEngine, GraphHash, MeasureOptions, MeasureResult,
-    PortableGraphId, ReplayGraphContext,
+    ApplyResult, CandidateHash, CandidateKindId, CandidateOptions, CandidateTags, GraphHash,
+    MeasureOptions, MeasureResult,
 };
 use gz_eval::{EvalOutput, EvalRequest};
+
+pub use gz_engine::EngineIdentity;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct WorkToken(u64);
@@ -122,30 +123,4 @@ pub struct ExpandedCandidate<C> {
     pub kind: CandidateKindId,
     pub tags: CandidateTags,
     pub static_prior: f32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct EngineIdentity {
-    pub engine_id: EngineId,
-    pub engine_version: EngineVersion,
-    pub action_set_hash: ActionSetHash,
-}
-
-impl EngineIdentity {
-    #[must_use]
-    pub fn from_engine<E: GraphEngine>(engine: &E) -> Self {
-        Self {
-            engine_id: engine.engine_id(),
-            engine_version: engine.engine_version(),
-            action_set_hash: engine.action_set_hash(),
-        }
-    }
-
-    #[must_use]
-    pub fn context(&self, graph_hash: GraphHash) -> ReplayGraphContext {
-        ReplayGraphContext::new(
-            PortableGraphId::new(graph_hash, self.engine_id, self.engine_version),
-            self.action_set_hash,
-        )
-    }
 }

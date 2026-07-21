@@ -1,7 +1,7 @@
 use gz_engine::{
-    ActionSetHash, CandidateHash, EngineId, EngineVersion, GraphHash, PortableCandidateRef,
-    PortableGraphId, PortableSearchActionRef, ReplayGraphContext, SearchStepRef,
-    SearchStepRefError,
+    ActionSetHash, CandidateHash, EngineId, EngineIdentity, EngineVersion, GraphHash,
+    PortableCandidateRef, PortableGraphId, PortableSearchActionRef, ReplayGraphContext,
+    SearchStepRef, SearchStepRefError,
 };
 use std::collections::{BTreeSet, HashSet};
 
@@ -11,6 +11,14 @@ fn graph(byte: u8) -> PortableGraphId {
         EngineId::from_bytes([1; 16]),
         EngineVersion::from_bytes([2; 16]),
     )
+}
+
+#[test]
+fn engine_identity_roundtrips_graph_contexts() {
+    let original = context(9);
+    let identity = EngineIdentity::from_context(original);
+
+    assert_eq!(identity.context(original.graph.graph_hash), original);
 }
 
 fn context(byte: u8) -> ReplayGraphContext {

@@ -1,8 +1,61 @@
 mod common;
 
-use common::{episode_with_feature_rows, episode_with_rows, feature_schema_config, measure};
+use common::{
+    engine_identity, episode_with_feature_rows, episode_with_rows, feature_schema_config, measure,
+};
+use gz_engine::{ActionSetHash, EngineIdentity};
 use gz_replay::{ReplayDataMode, ReplayEpisodeId, ReplayError, ReplayStore, SampleConfig};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
+
+#[test]
+fn engine_identity_persists_and_rejects_mismatches() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let identity = engine_identity();
+
+    assert_eq!(store.engine_identity().unwrap(), None);
+    store.ensure_engine_identity(identity).unwrap();
+    assert_eq!(store.engine_identity().unwrap(), Some(identity));
+
+    let mismatched = EngineIdentity {
+        action_set_hash: ActionSetHash::from_bytes([99; 32]),
+        ..identity
+    };
+    assert_eq!(
+        store.ensure_engine_identity(mismatched).unwrap_err(),
+        ReplayError::EngineIdentityMismatch
+    );
+
+    drop(store);
+    assert_eq!(
+        ReplayStore::open(dir.path())
+            .unwrap()
+            .engine_identity()
+            .unwrap(),
+        Some(identity)
+    );
+}
+
+#[test]
+fn engine_identity_migration_checks_existing_episodes() {
+    let dir = common::temp_dir();
+    let store = ReplayStore::open(dir.path()).unwrap();
+    let (record, rows) = episode_with_rows(1);
+    store.append_episode(&record, &rows).unwrap();
+
+    let mismatched = EngineIdentity {
+        action_set_hash: ActionSetHash::from_bytes([99; 32]),
+        ..engine_identity()
+    };
+    assert_eq!(
+        store.ensure_engine_identity(mismatched).unwrap_err(),
+        ReplayError::EngineIdentityMismatch
+    );
+    assert_eq!(store.engine_identity().unwrap(), None);
+
+    store.ensure_engine_identity(engine_identity()).unwrap();
+    assert_eq!(store.engine_identity().unwrap(), Some(engine_identity()));
+}
 
 #[test]
 fn append_then_read_back_episode() {

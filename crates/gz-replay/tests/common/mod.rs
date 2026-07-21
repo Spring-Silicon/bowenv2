@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use gz_engine::{
-    ActionSetHash, CandidateHash, EngineId, EngineVersion, GraphHash, MeasureConfigHash,
-    MeasureSummary, PortableCandidateRef, PortableGraphId, PortableSearchActionRef,
-    ReplayGraphContext, SearchConfigHash, SearchStepRef,
+    ActionSetHash, CandidateHash, EngineId, EngineIdentity, EngineVersion, GraphHash,
+    MeasureConfigHash, MeasureSummary, PortableCandidateRef, PortableGraphId,
+    PortableSearchActionRef, ReplayGraphContext, SearchConfigHash, SearchStepRef,
 };
 use gz_features::{
     ActionFeature, FeatureEdge, FeatureRow, FeatureSchema, FeatureSchemaConfig, PositionFeatures,
@@ -53,6 +53,10 @@ pub fn graph(byte: u8) -> PortableGraphId {
 
 pub fn context(byte: u8) -> ReplayGraphContext {
     ReplayGraphContext::new(graph(byte), ActionSetHash::from_bytes([3; 32]))
+}
+
+pub fn engine_identity() -> EngineIdentity {
+    EngineIdentity::from_context(context(0))
 }
 
 pub fn candidate_action(context: ReplayGraphContext, byte: u8) -> PortableSearchActionRef {

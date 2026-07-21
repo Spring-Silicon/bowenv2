@@ -1,9 +1,0 @@
-[package]
-name = "gz-eval-whittle"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-gz-engine = { path = "../gz-engine" }
-gz-engine-whittle = { path = "../gz-engine-whittle" }
-gz-eval = { path = "../gz-eval" }

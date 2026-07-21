@@ -27,7 +27,7 @@ from gz.trainer.driver import (
     trainer_loop_config,
 )
 from gz.trainer.loop import TrainerLoop
-from gz.trainer.publish import EmaWeights, publish_ema
+from gz.trainer.publish import EmaWeights, PublishTags, publish_ema
 from gz.trainer.sampler import SampleClient, step_seed
 from gz.trainer.telemetry import MetricsWriter, PerfWindow, WandbRun
 
@@ -137,6 +137,11 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
         initialize_value(model, "zero")
         model = model.to(config.trainer.device)
         ema = EmaWeights(model, config.trainer.ema_decay)
+        publish_tags = PublishTags(
+            engine_id=sampler.engine_id,
+            engine_version=sampler.engine_version,
+            action_set_hash=sampler.action_set_hash,
+        )
         first = publish_ema(
             config.paths.checkpoint_dir,
             ema,
@@ -145,6 +150,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
             arch=config.arch,
             training_step=0,
             run_id=config.paths.run_dir.name,
+            tags=publish_tags,
         )
         param_norm, _ = ema.norms(None)
         published_snapshot = ema.state_dict()
@@ -190,6 +196,7 @@ def run(config_path: str | Path, *, generate_first: bool = False) -> None:
                 arch=config.arch,
                 training_step=training_step,
                 run_id=config.paths.run_dir.name,
+                tags=publish_tags,
                 checkpoint_pointers=_permanent_checkpoint_pointers(
                     config.trainer,
                     training_step,

@@ -1,3 +1,4 @@
+use gz_engine::EngineIdentity;
 use gz_features::{
     ENCODING_VERSION, FeatureCollator, FeatureRow, FeatureSchema, RowTargets, decode_feature_row,
     encode_feature_schema_config, encode_training_targets, validate_feature_row_header,
@@ -9,9 +10,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const SAMPLE_PROTOCOL_VERSION: u32 = 11;
+pub const SAMPLE_PROTOCOL_VERSION: u32 = 12;
 
-const HELLO_ACK_FIXED_LEN: usize = 160;
+const HELLO_ACK_FIXED_LEN: usize = 224;
 
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const FRAME_HELLO: u8 = 1;
@@ -82,12 +83,14 @@ struct ReplaySampleServer {
     listener: UnixListener,
     store: std::sync::Arc<ReplayStore>,
     schema: FeatureSchema,
+    engine_identity: EngineIdentity,
     max_batch: NonZeroUsize,
 }
 
 struct ReplaySampleSession {
     store: std::sync::Arc<ReplayStore>,
     collator: FeatureCollator,
+    engine_identity: EngineIdentity,
     max_batch: NonZeroUsize,
 }
 
@@ -108,6 +111,10 @@ impl ReplaySampleServer {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "store was not produced by featurized selfplay".to_owned())?;
         let schema = FeatureSchema::new(schema_config).map_err(|error| error.to_string())?;
+        let engine_identity = store
+            .engine_identity()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "replay store has no engine identity".to_owned())?;
         let max_batch = NonZeroUsize::new(max_batch)
             .ok_or_else(|| "--max-batch must be greater than zero".to_owned())?;
 
@@ -120,6 +127,7 @@ impl ReplaySampleServer {
             listener,
             store,
             schema,
+            engine_identity,
             max_batch,
         })
     }
@@ -139,6 +147,7 @@ impl ReplaySampleServer {
         ReplaySampleSession {
             store: std::sync::Arc::clone(&self.store),
             collator: FeatureCollator::new(self.schema.clone(), self.max_batch),
+            engine_identity: self.engine_identity,
             max_batch: self.max_batch,
         }
     }
@@ -296,6 +305,9 @@ impl ReplaySampleSession {
         for value in symmetric {
             payload.extend_from_slice(&(value as f32).to_le_bytes());
         }
+        payload.extend_from_slice(self.engine_identity.engine_id.as_bytes());
+        payload.extend_from_slice(self.engine_identity.engine_version.as_bytes());
+        payload.extend_from_slice(self.engine_identity.action_set_hash.as_bytes());
         payload.extend_from_slice(&schema_config);
         write_frame(stream, write_buf, FRAME_HELLO_ACK, &[&payload])
             .map_err(|_| (ERROR_PROTOCOL, "failed to write HELLO_ACK"))

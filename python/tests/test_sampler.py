@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from gz.codec import FeatureSchemaConfig
-from gz.common import FeatureSchemaHash
+from gz.common import ActionSetHash, EngineId, EngineVersion, FeatureSchemaHash
 from gz.proto import read_frame, write_frame
 from gz.trainer.sampler import SAMPLE_PROTOCOL_VERSION, SampleClient, decode_ack, step_seed
 from python.tests.test_codec import SCHEMA_HASH, _layout, make_batch
@@ -35,6 +35,9 @@ def test_sample_client_handshake_and_result_owns_frame(tmp_path: Path) -> None:
 
         assert ack.feature_schema == schema_config()
         assert ack.feature_schema_hash == FeatureSchemaHash.from_bytes(SCHEMA_HASH)
+        assert ack.engine_id == EngineId.from_bytes(b"e" * 16)
+        assert ack.engine_version == EngineVersion.from_bytes(b"v" * 16)
+        assert ack.action_set_hash == ActionSetHash.from_bytes(b"a" * 32)
         assert ack.value_sign_accuracy_early_ema == 0.75
         assert ack.value_sign_accuracy_late_ema == 0.25
         assert ack.symmetric_selfplay is not None
@@ -144,6 +147,9 @@ def ack_payload(produced_rows: int) -> bytes:
         + struct.pack("<ff", 0.75, 0.25)
         + struct.pack("<I", 1)
         + struct.pack("<10f", 0.4, 0.35, 0.25, 60.0, 62.0, 2.0, 50.0, 80.0, 81.0, 1.0)
+        + b"e" * 16
+        + b"v" * 16
+        + b"a" * 32
         + schema_config().encode()
     )
 

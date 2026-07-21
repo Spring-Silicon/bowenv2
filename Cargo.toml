@@ -6,7 +6,6 @@ members = [
     "crates/gz-eval-service",
     "crates/gz-search",
     "crates/gz-eval",
-    "crates/gz-eval-whittle",
     "crates/gz-measurer",
     "crates/gz-orchestrator",
     "crates/gz-replay",

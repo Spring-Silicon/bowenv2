@@ -115,7 +115,9 @@ impl FeatureCollator {
                     action.static_prior,
                 );
                 out[layout.subject_count + row_index * layout.a + action_index] =
-                    action.subjects.len() as u8;
+                    u8::try_from(action.subjects.len()).map_err(|_| {
+                        FeatureError::InvalidEncoding("action subject count exceeds u8 wire width")
+                    })?;
                 for (subject_index, subject) in action.subjects.iter().copied().enumerate() {
                     write_u16_at(
                         out,

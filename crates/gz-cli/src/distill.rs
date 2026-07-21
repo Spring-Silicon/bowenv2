@@ -1,5 +1,5 @@
 use gz_engine::{
-    CandidateOptions, GraphEngine, GraphHash, MeasureSummary, PortableCandidateRef,
+    CandidateOptions, EngineIdentity, GraphEngine, GraphHash, MeasureSummary, PortableCandidateRef,
     PortableGraphId, PortableSearchActionRef, ReplayGraphContext, SearchStepRef,
 };
 use gz_engine_whittle::{
@@ -162,9 +162,13 @@ pub fn generate(config: DistillGenerateConfig) -> Result<DistillGenerateSummary,
     store
         .ensure_data_mode(ReplayDataMode::Standard)
         .map_err(|error| error.to_string())?;
-    let schema = worker_state(&config)?.extractor.schema().config().clone();
+    let initial = worker_state(&config)?;
+    let schema = initial.extractor.schema().config().clone();
     store
         .ensure_feature_schema(&schema)
+        .map_err(|error| error.to_string())?;
+    store
+        .ensure_engine_identity(EngineIdentity::from_engine(&initial.engine))
         .map_err(|error| error.to_string())?;
 
     let started = Instant::now();

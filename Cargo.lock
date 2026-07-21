@@ -275,15 +275,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gz-eval-whittle"
-version = "0.1.0"
-dependencies = [
- "gz-engine",
- "gz-engine-whittle",
- "gz-eval",
-]
-
-[[package]]
 name = "gz-features"
 version = "0.1.0"
 dependencies = [

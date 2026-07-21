@@ -77,6 +77,27 @@ fn schema_rejects_invalid_config() {
         FeatureSchema::new(config),
         Err(FeatureError::InvalidSchema(_))
     ));
+
+    let mut config = schema_config();
+    config.max_nodes = u32::from(u16::MAX) + 1;
+    assert!(matches!(
+        FeatureSchema::new(config),
+        Err(FeatureError::InvalidSchema(_))
+    ));
+
+    let mut config = schema_config();
+    config.action_kind_vocab_size = u32::from(u16::MAX) + 2;
+    assert!(matches!(
+        FeatureSchema::new(config),
+        Err(FeatureError::InvalidSchema(_))
+    ));
+
+    let mut config = schema_config();
+    config.max_subjects = u32::from(u8::MAX) + 1;
+    assert!(matches!(
+        FeatureSchema::new(config),
+        Err(FeatureError::InvalidSchema(_))
+    ));
 }
 
 #[test]

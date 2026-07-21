@@ -17,6 +17,7 @@ pub(crate) const META_CONSUMED_ROWS: &[u8] = b"consumed_rows";
 pub(crate) const META_RETAINED_FLOOR: &[u8] = b"retained_floor";
 pub(crate) const META_DELETED_FLOOR: &[u8] = b"deleted_floor";
 pub(crate) const META_FEATURE_SCHEMA: &[u8] = b"feature_schema";
+pub(crate) const META_ENGINE_IDENTITY: &[u8] = b"engine_identity";
 pub(crate) const META_DATA_MODE: &[u8] = b"data_mode";
 pub(crate) const META_TERMINAL_COST_EMA: &[u8] = b"terminal_cost_ema";
 pub(crate) const META_TERMINAL_COST_BEST: &[u8] = b"terminal_cost_best";

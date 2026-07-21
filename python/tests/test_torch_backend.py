@@ -44,6 +44,25 @@ def test_backend_rejects_wrong_schema(tmp_path: Path) -> None:
         backend.handshake(make_hello(view, FeatureSchemaHash.from_bytes(b"x" * 32)))
 
 
+def test_backend_rejects_wrong_engine_identity(tmp_path: Path) -> None:
+    view = fixture_view()
+    manifest = publish_random_checkpoint(tmp_path, view)
+    backend = make_backend(tmp_path)
+    hello = make_hello(view, manifest.feature_schema_hash)
+    hello = Hello(
+        protocol_version=hello.protocol_version,
+        encoding_version=hello.encoding_version,
+        feature_schema_hash=hello.feature_schema_hash,
+        batch_capacity=hello.batch_capacity,
+        engine_id=EngineId.from_bytes(b"x" * 16),
+        engine_version=hello.engine_version,
+        action_set_hash=hello.action_set_hash,
+    )
+
+    with pytest.raises(ProtocolError, match="engine identity mismatch"):
+        backend.handshake(hello)
+
+
 def test_backend_hot_swap_keeps_leased_generation_until_release(tmp_path: Path) -> None:
     view = fixture_view()
     first = publish_random_checkpoint(tmp_path, view, seed=11)
@@ -108,6 +127,28 @@ def test_backend_rejects_incompatible_latest_and_keeps_serving(
     assert "feature schema hash mismatch" in capfd.readouterr().err
 
 
+def test_backend_rejects_hot_swap_for_another_action_domain(
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    view = fixture_view()
+    first = publish_random_checkpoint(tmp_path, view, seed=11)
+    backend = make_backend(tmp_path)
+    backend.handshake(make_hello(view, first.feature_schema_hash))
+    publish_random_checkpoint(
+        tmp_path,
+        view,
+        seed=12,
+        action_set_hash=ActionSetHash.from_bytes(b"x" * 32),
+    )
+
+    backend._poll_once()
+    backend.apply_pending_swap()
+
+    assert backend.model_generation()[1] == first.model_version
+    assert "engine identity mismatch" in capfd.readouterr().err
+
+
 def test_stage_always_copies_current_opponent_board(tmp_path: Path) -> None:
     raw = bytearray((FIXTURES / "batch_expander.gzfb").read_bytes())
     view = BatchView.parse(raw)
@@ -167,6 +208,7 @@ def publish_random_checkpoint(
     *,
     seed: int = 11,
     feature_schema_hash: FeatureSchemaHash | None = None,
+    action_set_hash: ActionSetHash | None = None,
 ):
     schema = FeatureSchemaConfig(
         name="expander-test",
@@ -194,7 +236,7 @@ def publish_random_checkpoint(
         feature_schema_hash=feature_schema_hash or view.feature_schema_hash,
         engine_id=EngineId.from_bytes(b"e" * 16),
         engine_version=EngineVersion.from_bytes(b"v" * 16),
-        action_set_hash=ActionSetHash.from_bytes(b"a" * 32),
+        action_set_hash=action_set_hash or ActionSetHash.from_bytes(b"a" * 32),
         training_step=0,
         run_id="run",
     )

@@ -162,6 +162,27 @@ def test_feature_schema_config_validation() -> None:
     with pytest.raises(SchemaConfigError, match="bad schema config length"):
         FeatureSchemaConfig.decode(b"\x00\x00trailing")
 
+    valid = {
+        "name": "wire-bounds",
+        "node_vocab_size": 2,
+        "node_attr_dim": 0,
+        "edge_type_count": 1,
+        "action_kind_vocab_size": 3,
+        "max_nodes": 4,
+        "max_edges": 4,
+        "max_actions": 1,
+        "max_subjects": 1,
+        "expander_degree": 0,
+        "expander_seed": 0,
+    }
+    for field, value in (
+        ("action_kind_vocab_size", 0x1_0001),
+        ("max_nodes", 0x1_0000),
+        ("max_subjects", 0x100),
+    ):
+        with pytest.raises(SchemaConfigError, match=f"{field} out of range"):
+            FeatureSchemaConfig(**{**valid, field: value})
+
 
 def make_batch(attr_dim: int, schema_hash: bytes = SCHEMA_HASH, capacity: int = 2) -> bytes:
     b, n, e, a, s, d = capacity, 3, 2, 3, 2, attr_dim
